@@ -1,0 +1,29 @@
+{ 
+   "project_info": { 
+     "project_number": "1039523873085", 
+     "project_id": "safeko-3ca46", 
+     "storage_bucket": "safeko-3ca46.firebasestorage.app" 
+   }, 
+   "client": [ 
+     { 
+       "client_info": { 
+         "mobilesdk_app_id": "1:1039523873085:android:f22f6ff0613498410cc554", 
+         "android_client_info": { 
+           "package_name": "com.example.safeko" 
+         } 
+       }, 
+       "oauth_client": [], 
+       "api_key": [ 
+         { 
+           "current_key": "AIzaSyCUrz79YEh2rzN8icA3lvoW7exN1tDo5JM" 
+         } 
+       ], 
+       "services": { 
+         "appinvite_service": { 
+           "other_platform_oauth_client": [] 
+         } 
+       } 
+     } 
+   ], 
+   "configuration_version": "1" 
+ }

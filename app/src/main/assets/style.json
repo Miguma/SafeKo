@@ -1,0 +1,30 @@
+{
+  "version": 8,
+  "name": "Clean Map",
+  "sources": {
+    "carto-light": {
+      "type": "raster",
+      "tiles": [
+        "https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}@2x.png?auth_token=eyJhbGciOiJIUzI1NiJ9.eyJhIjoiYWNfbXE5aGY0NTAiLCJqdGkiOiJmZTdjMGNiMiJ9.-bvlFsPKLZPUMwBof2cfxWOSgEVDEgNknNpE3LJLlZc"
+      ],
+      "tileSize": 256,
+      "attribution": "&copy; OpenStreetMap, &copy; CARTO"
+    }
+  },
+  "layers": [
+    {
+      "id": "background",
+      "type": "background",
+      "paint": {
+        "background-color": "#FAFAFA"
+      }
+    },
+    {
+      "id": "carto-tiles",
+      "type": "raster",
+      "source": "carto-light",
+      "minzoom": 0,
+      "maxzoom": 20
+    }
+  ]
+}

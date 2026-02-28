@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">SafeKo</string>
+    <!-- Replace this with your Web Client ID from Firebase Console -> Authentication -> Sign-in method -> Google -> Web SDK configuration -->
+    <string name="default_web_client_id">1039523873085-n0opsnb2s9da2nqu0ebteqvc7060g1fd.apps.googleusercontent.com</string>
+</resources>
