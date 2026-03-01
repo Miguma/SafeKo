@@ -48,6 +48,7 @@ dependencies {
     implementation(libs.androidx.compose.material.icons.extended)
     implementation(libs.androidx.core.splashscreen)
     implementation(libs.androidx.navigation.compose)
+    implementation(libs.coil.compose)
     
     // Firebase
     implementation(platform(libs.firebase.bom))

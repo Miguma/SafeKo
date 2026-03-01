@@ -24,6 +24,10 @@ import android.content.Context
 import android.content.ContextWrapper
 import android.app.Activity
 
+import com.google.firebase.auth.ktx.auth
+import com.google.firebase.ktx.Firebase
+import androidx.compose.runtime.remember
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         val splashScreen = installSplashScreen()
@@ -57,7 +61,10 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             val navController = rememberNavController()
-            NavHost(navController = navController, startDestination = "welcome") {
+            val auth = remember { Firebase.auth }
+            val startDestination = if (auth.currentUser != null) "home" else "welcome"
+
+            NavHost(navController = navController, startDestination = startDestination) {
                 composable("welcome") {
                     WelcomeScreen(onGetStartedClick = { navController.navigate("onboarding") })
                 }
