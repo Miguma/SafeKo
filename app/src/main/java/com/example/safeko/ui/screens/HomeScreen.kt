@@ -34,8 +34,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Navigation
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.rounded.*
-import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material3.*
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -62,7 +62,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
@@ -97,11 +97,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import org.maplibre.android.MapLibre
-import org.maplibre.android.annotations.IconFactory
-import org.maplibre.android.annotations.Marker
-import org.maplibre.android.annotations.MarkerOptions
-import org.maplibre.android.annotations.Polyline
-import org.maplibre.android.annotations.PolylineOptions
+import org.maplibre.android.style.layers.CircleLayer
 import org.maplibre.android.camera.CameraPosition
 import org.maplibre.android.camera.CameraUpdateFactory
 import org.maplibre.android.geometry.LatLng
@@ -236,7 +232,6 @@ fun HomeScreen() {
     // State for selected location and marker
     var selectedLocation by remember { mutableStateOf<SearchResult?>(null) }
     var showLocationModal by remember { mutableStateOf(false) }
-    var selectedMarker by remember { mutableStateOf<Marker?>(null) }
     var isNavigating by remember { mutableStateOf(false) }
     var navigationSteps by remember { mutableStateOf<List<NavigationStep>>(emptyList()) }
     var currentStepIndex by remember { mutableStateOf(0) }
@@ -264,42 +259,6 @@ fun HomeScreen() {
     }
     var currentUserAddress by remember { mutableStateOf("Locating...") }
 
-    LaunchedEffect(showEditProfile) {
-        if (showEditProfile) {
-             withContext(Dispatchers.IO) {
-                 try {
-                     // We need to access mapLibreMap safely. Since we are in a LaunchedEffect, we can use the state.
-                     // However, accessing mapLibreMap inside IO might be tricky if it's not thread safe, 
-                     // but getting lastKnownLocation usually requires main thread or is just a getter.
-                     // Better to get location on Main before switching to IO for geocoding.
-                 } catch (e: Exception) {
-                     e.printStackTrace()
-                 }
-             }
-        }
-    }
-    // Better implementation for address fetching:
-    LaunchedEffect(showEditProfile) {
-        if (showEditProfile) {
-            val loc = mapLibreMap?.locationComponent?.lastKnownLocation
-            if (loc != null) {
-                withContext(Dispatchers.IO) {
-                    try {
-                        val address = PlaceSearcher.reverseGeocode(loc.latitude, loc.longitude)
-                        withContext(Dispatchers.Main) {
-                            currentUserAddress = address
-                        }
-                    } catch (e: Exception) {
-                        withContext(Dispatchers.Main) {
-                            currentUserAddress = "Location not available"
-                        }
-                    }
-                }
-            } else {
-                currentUserAddress = "Location not available"
-            }
-        }
-    }
     var currentTutorialStep by remember { mutableStateOf(0) }
     var searchButtonRect by remember { mutableStateOf<Rect?>(null) }
     var notificationsButtonRect by remember { mutableStateOf<Rect?>(null) }
@@ -367,6 +326,45 @@ fun HomeScreen() {
     var alerts by remember { mutableStateOf<Map<String, RemoteAlert>>(emptyMap()) }
     var selectedAlert by remember { mutableStateOf<RemoteAlert?>(null) }
     var showAlertDetails by remember { mutableStateOf(false) }
+
+    // Fetch address for profile when dialog opens
+    LaunchedEffect(showEditProfile) {
+        if (showEditProfile) {
+            val loc = mapLibreMap?.locationComponent?.lastKnownLocation
+            if (loc != null) {
+                withContext(Dispatchers.IO) {
+                    try {
+                        val address = PlaceSearcher.reverseGeocode(loc.latitude, loc.longitude)
+                        withContext(Dispatchers.Main) {
+                            currentUserAddress = address
+                        }
+                    } catch (e: Exception) {
+                        withContext(Dispatchers.Main) {
+                            currentUserAddress = "Location not available"
+                        }
+                    }
+                }
+            } else {
+                currentUserAddress = "Location not available"
+            }
+        }
+    }
+
+    // Update Search Result Marker on Map
+    LaunchedEffect(selectedLocation) {
+        mapLibreMap?.getStyle { style ->
+            val source = style.getSourceAs<GeoJsonSource>("search-result-source")
+            if (source != null) {
+                if (selectedLocation != null) {
+                    val point = Point.fromLngLat(selectedLocation!!.lon, selectedLocation!!.lat)
+                    val feature = Feature.fromGeometry(point)
+                    source.setGeoJson(feature)
+                } else {
+                    source.setGeoJson(FeatureCollection.fromFeatures(emptyList()))
+                }
+            }
+        }
+    }
 
     // Update Location Component Color/Visibility based on Sharing Option
     LaunchedEffect(sharingOption, mapLibreMap) {
@@ -1222,7 +1220,12 @@ fun HomeScreen() {
                         .fillMaxWidth()
                         .height(180.dp) // Increased height
                         .background(Color(0xFF2196F3)) // Brand Blue
-                        .clickable { showEditProfile = true } // Make header clickable to edit profile
+                        .clickable { 
+                            scope.launch { 
+                                drawerState.close() 
+                                showEditProfile = true 
+                            }
+                        } // Make header clickable to edit profile
                         .padding(24.dp)
                 ) {
                     Row(
@@ -1321,7 +1324,7 @@ fun HomeScreen() {
                 DrawerItem("History", Icons.Rounded.History) {}
                 DrawerItem("Incoming Updates", Icons.Rounded.Update) {}
                 DrawerItem("Settings", Icons.Rounded.Settings) {}
-                Divider(modifier = Modifier.padding(vertical = 8.dp, horizontal = 16.dp))
+                HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp, horizontal = 16.dp))
                 DrawerItem("Customer service", Icons.Rounded.SupportAgent) {}
             }
         }
@@ -1373,6 +1376,18 @@ fun HomeScreen() {
                                                 )
                                         )
 
+                                        // Add Source and Layer for Search Results
+                                        style.addSource(GeoJsonSource("search-result-source"))
+                                        style.addLayer(
+                                            CircleLayer("search-result-layer", "search-result-source")
+                                                .withProperties(
+                                                    PropertyFactory.circleColor(android.graphics.Color.BLUE),
+                                                    PropertyFactory.circleRadius(8f),
+                                                    PropertyFactory.circleStrokeColor(android.graphics.Color.WHITE),
+                                                    PropertyFactory.circleStrokeWidth(2f)
+                                                )
+                                        )
+
                                         map.uiSettings.isRotateGesturesEnabled = true
                                         map.uiSettings.isTiltGesturesEnabled = true
                                         map.uiSettings.isCompassEnabled =
@@ -1395,11 +1410,25 @@ fun HomeScreen() {
                                             }
                                         }
 
-                                        // Alert Click Listener
+                                        // Map Click Listener (Alerts & Search Results)
                                         map.addOnMapClickListener { point ->
                                             try {
                                                 val screenPoint =
                                                     map.projection.toScreenLocation(point)
+
+                                                // 1. Check Search Results
+                                                val searchFeatures = map.queryRenderedFeatures(
+                                                    screenPoint,
+                                                    "search-result-layer"
+                                                )
+                                                if (searchFeatures.isNotEmpty()) {
+                                                    if (selectedLocation != null) {
+                                                        showLocationModal = true
+                                                    }
+                                                    return@addOnMapClickListener true
+                                                }
+
+                                                // 2. Check Alerts
                                                 val features = map.queryRenderedFeatures(
                                                     screenPoint,
                                                     "alerts-layer"
@@ -1455,19 +1484,6 @@ fun HomeScreen() {
                                                 Log.e("HomeScreen", "Error handling map click", e)
                                                 false
                                             }
-                                        }
-
-                                        // Marker Click Listener (Search Results)
-                                        map.setOnMarkerClickListener { marker ->
-                                            // Search result marker
-                                            selectedMarker = marker
-                                            if (selectedLocation != null &&
-                                                marker.position.latitude == selectedLocation!!.lat &&
-                                                marker.position.longitude == selectedLocation!!.lon
-                                            ) {
-                                                showLocationModal = true
-                                            }
-                                            true
                                         }
                                     } // Close setStyle
                                 } catch (e: Exception) {
@@ -1993,6 +2009,9 @@ fun HomeScreen() {
                                 sharedPreferences.edit().putBoolean(tutorialKey, true).apply()
                             }
                         },
+                        onBack = if (currentTutorialStep > 0) {
+                            { currentTutorialStep-- }
+                        } else null,
                         onDismiss = { /* Optional: Allow dismiss on tap outside? For now, stick to buttons */ }
                     )
                 }
@@ -2118,11 +2137,6 @@ fun HomeScreen() {
                                                     15.0
                                                 )
                                             )
-                                            val marker = map.addMarker(
-                                                MarkerOptions().position(position)
-                                                    .title(result.name)
-                                            )
-                                            selectedMarker = marker
                                         }
                                     }
                                     .padding(vertical = 12.dp),
@@ -2278,7 +2292,7 @@ fun HomeScreen() {
                     }
 
                     Spacer(modifier = Modifier.height(24.dp))
-                    Divider(color = Color.LightGray.copy(alpha = 0.5f))
+                    HorizontalDivider(color = Color.LightGray.copy(alpha = 0.5f))
                     Spacer(modifier = Modifier.height(24.dp))
 
                     // Details Column (Left Aligned)
@@ -2935,7 +2949,7 @@ fun HomeScreen() {
                                         }
 
                                         Spacer(modifier = Modifier.height(16.dp))
-                                        Divider(color = Color(0xFFEEEEEE))
+                                        HorizontalDivider(color = Color(0xFFEEEEEE))
                                         Spacer(modifier = Modifier.height(16.dp))
 
                                         // User Profile + Details
@@ -3309,6 +3323,27 @@ fun HomeScreen() {
                     Spacer(modifier = Modifier.height(24.dp))
                 }
             }
+        }
+
+        // Edit Profile Dialog
+        if (showEditProfile) {
+            EditProfileDialog(
+                showDialog = showEditProfile,
+                onDismiss = { showEditProfile = false },
+                currentName = auth.currentUser?.displayName ?: "User",
+                currentEmail = auth.currentUser?.email ?: "No Email",
+                currentPhotoUrl = auth.currentUser?.photoUrl?.toString(),
+                initialPhoneNumber = userPhoneNumber,
+                currentLocation = currentUserAddress,
+                onSave = { newPhone ->
+                    userPhoneNumber = newPhone
+                    sharedPreferences.edit()
+                        .putString("user_phone_number_${auth.currentUser?.uid}", newPhone)
+                        .apply()
+                    showEditProfile = false
+                    Toast.makeText(context, "Profile Updated", Toast.LENGTH_SHORT).show()
+                }
+            )
         }
     }
 

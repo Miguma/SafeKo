@@ -29,6 +29,7 @@ fun TutorialOverlay(
     targetRect: androidx.compose.ui.geometry.Rect?,
     step: TutorialStep,
     onNext: () -> Unit,
+    onBack: (() -> Unit)? = null,
     onDismiss: () -> Unit
 ) {
     BoxWithConstraints(
@@ -132,6 +133,15 @@ fun TutorialOverlay(
                         horizontalArrangement = Arrangement.End,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
+                        if (onBack != null) {
+                            TextButton(
+                                onClick = onBack,
+                                modifier = Modifier.padding(end = 8.dp)
+                            ) {
+                                Text("Back", color = Color.Gray)
+                            }
+                        }
+
                         Button(
                             onClick = onNext,
                             shape = RoundedCornerShape(12.dp),
