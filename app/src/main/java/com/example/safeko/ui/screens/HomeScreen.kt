@@ -141,6 +141,11 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.draw.clip
 import androidx.compose.runtime.saveable.rememberSaveable
 
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.geometry.Size
+
 // Helper to find Activity
 fun Context.findActivity(): Activity? = when (this) {
     is Activity -> this
@@ -243,6 +248,105 @@ fun HomeScreen() {
     val sharedPreferences = remember { context.getSharedPreferences("safeko_prefs", Context.MODE_PRIVATE) }
     var sharingOption by remember { 
         mutableStateOf(sharedPreferences.getString("sharing_option", "Visible to others") ?: "Visible to others") 
+    }
+
+    // Tutorial State
+    val currentUserId = auth.currentUser?.uid ?: ""
+    val tutorialKey = "tutorial_completed_$currentUserId"
+    var showTutorial by remember { 
+        mutableStateOf(!sharedPreferences.getBoolean(tutorialKey, false)) 
+    }
+    
+    // Edit Profile State
+    var showEditProfile by remember { mutableStateOf(false) }
+    var userPhoneNumber by remember { 
+        mutableStateOf(sharedPreferences.getString("user_phone_number_$currentUserId", "") ?: "") 
+    }
+    var currentUserAddress by remember { mutableStateOf("Locating...") }
+
+    LaunchedEffect(showEditProfile) {
+        if (showEditProfile) {
+             withContext(Dispatchers.IO) {
+                 try {
+                     // We need to access mapLibreMap safely. Since we are in a LaunchedEffect, we can use the state.
+                     // However, accessing mapLibreMap inside IO might be tricky if it's not thread safe, 
+                     // but getting lastKnownLocation usually requires main thread or is just a getter.
+                     // Better to get location on Main before switching to IO for geocoding.
+                 } catch (e: Exception) {
+                     e.printStackTrace()
+                 }
+             }
+        }
+    }
+    // Better implementation for address fetching:
+    LaunchedEffect(showEditProfile) {
+        if (showEditProfile) {
+            val loc = mapLibreMap?.locationComponent?.lastKnownLocation
+            if (loc != null) {
+                withContext(Dispatchers.IO) {
+                    try {
+                        val address = PlaceSearcher.reverseGeocode(loc.latitude, loc.longitude)
+                        withContext(Dispatchers.Main) {
+                            currentUserAddress = address
+                        }
+                    } catch (e: Exception) {
+                        withContext(Dispatchers.Main) {
+                            currentUserAddress = "Location not available"
+                        }
+                    }
+                }
+            } else {
+                currentUserAddress = "Location not available"
+            }
+        }
+    }
+    var currentTutorialStep by remember { mutableStateOf(0) }
+    var searchButtonRect by remember { mutableStateOf<Rect?>(null) }
+    var notificationsButtonRect by remember { mutableStateOf<Rect?>(null) }
+    var alertButtonRect by remember { mutableStateOf<Rect?>(null) }
+    var sharingLocationRect by remember { mutableStateOf<Rect?>(null) }
+    var profileRect by remember { mutableStateOf<Rect?>(null) }
+    var groupButtonRect by remember { mutableStateOf<Rect?>(null) }
+    
+    val tutorialSteps = remember {
+        listOf(
+            TutorialStep(
+                id = "search",
+                title = "Search",
+                description = "Tap here to find places and get directions to your destination.",
+                stepInfo = "1/6"
+            ),
+            TutorialStep(
+                id = "group",
+                title = "Family Group",
+                description = "View your family members and their status.",
+                stepInfo = "2/6"
+            ),
+            TutorialStep(
+                id = "alert",
+                title = "Emergency Alert",
+                description = "Long press this button to send an emergency alert to your contacts.",
+                stepInfo = "3/6"
+            ),
+            TutorialStep(
+                id = "notifications",
+                title = "Notifications",
+                description = "Check here for alerts and updates from your family and community.",
+                stepInfo = "4/6"
+            ),
+            TutorialStep(
+                id = "sharing",
+                title = "Location Sharing",
+                description = "Tap to manage who can see your location.",
+                stepInfo = "5/6"
+            ),
+            TutorialStep(
+                id = "profile",
+                title = "Profile",
+                description = "Access your profile settings and logout options here.",
+                stepInfo = "6/6"
+            )
+        )
     }
 
     // Save sharing option when it changes
@@ -1116,10 +1220,15 @@ fun HomeScreen() {
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
+                        .height(180.dp) // Increased height
                         .background(Color(0xFF2196F3)) // Brand Blue
+                        .clickable { showEditProfile = true } // Make header clickable to edit profile
                         .padding(24.dp)
                 ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
+                    Row(
+                        modifier = Modifier.align(Alignment.BottomStart),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
                         val photoUrlHeader = auth.currentUser?.photoUrl?.toString()
                         if (!photoUrlHeader.isNullOrBlank()) {
                             AsyncImage(
@@ -1130,7 +1239,7 @@ fun HomeScreen() {
                                     .build(),
                                 contentDescription = "Profile",
                                 modifier = Modifier
-                                    .size(56.dp) // Reduced size
+                                    .size(72.dp) // Increased size
                                     .clip(CircleShape)
                                     .border(2.dp, Color.White, CircleShape),
                                 contentScale = ContentScale.Crop
@@ -1139,14 +1248,14 @@ fun HomeScreen() {
                             Surface(
                                 shape = CircleShape,
                                 color = Color.White,
-                                modifier = Modifier.size(56.dp) // Reduced size
+                                modifier = Modifier.size(72.dp) // Increased size
                             ) {
                                 Box(contentAlignment = Alignment.Center) {
                                     Icon(
                                         Icons.Filled.Person,
                                         contentDescription = null,
                                         tint = Color(0xFF2196F3),
-                                        modifier = Modifier.size(28.dp)
+                                        modifier = Modifier.size(36.dp)
                                     )
                                 }
                             }
@@ -1159,7 +1268,7 @@ fun HomeScreen() {
                             val firstName = displayName.split(" ").firstOrNull() ?: displayName
                             Text(
                                 text = firstName,
-                                style = MaterialTheme.typography.titleLarge,
+                                style = MaterialTheme.typography.headlineSmall, // Larger text
                                 fontWeight = FontWeight.Bold,
                                 color = Color.White
                             )
@@ -1197,7 +1306,7 @@ fun HomeScreen() {
                         icon = { Icon(icon, contentDescription = null) },
                         selected = false,
                         onClick = onClick,
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp), // Increased vertical padding
                         colors = NavigationDrawerItemDefaults.colors(
                             unselectedContainerColor = Color.Transparent,
                             unselectedIconColor = Color(0xFF5F6368),
@@ -1495,7 +1604,16 @@ fun HomeScreen() {
                                 color = Color(0xFF2B2B2B).copy(alpha = 0.9f),
                                 contentColor = Color.White,
                                 shadowElevation = 6.dp,
-                                modifier = Modifier.align(Alignment.Center)
+                                modifier = Modifier
+                                    .align(Alignment.Center)
+                                    .onGloballyPositioned { coordinates ->
+                                        val position = coordinates.positionInRoot()
+                                        val size = coordinates.size
+                                        sharingLocationRect = Rect(
+                                            offset = position,
+                                            size = Size(size.width.toFloat(), size.height.toFloat())
+                                        )
+                                    }
                             ) {
                                 Row(
                                     modifier = Modifier.padding(
@@ -1536,6 +1654,14 @@ fun HomeScreen() {
                                     .size(40.dp)
                                     .clip(CircleShape)
                                     .clickable { scope.launch { drawerState.open() } }
+                                    .onGloballyPositioned { coordinates ->
+                                        val position = coordinates.positionInRoot()
+                                        val size = coordinates.size
+                                        profileRect = Rect(
+                                            offset = position,
+                                            size = Size(size.width.toFloat(), size.height.toFloat())
+                                        )
+                                    }
                             ) {
                                 val photoUrl = auth.currentUser?.photoUrl?.toString()
                                 if (!photoUrl.isNullOrBlank()) {
@@ -1636,7 +1762,17 @@ fun HomeScreen() {
                             }
 
                             // 2. Search
-                            IconButton(onClick = { showBottomSheet = true }) {
+                            IconButton(
+                                onClick = { showBottomSheet = true },
+                                modifier = Modifier.onGloballyPositioned { coordinates ->
+                                    val position = coordinates.positionInRoot()
+                                    val size = coordinates.size
+                                    searchButtonRect = Rect(
+                                        offset = position,
+                                        size = Size(size.width.toFloat(), size.height.toFloat())
+                                    )
+                                }
+                            ) {
                                 Icon(
                                     imageVector = Icons.Rounded.Search,
                                     contentDescription = "Search",
@@ -1649,7 +1785,17 @@ fun HomeScreen() {
                             Spacer(modifier = Modifier.width(56.dp))
 
                             // 3. Notifications
-                            IconButton(onClick = { showNotifications = true }) {
+                            IconButton(
+                                onClick = { showNotifications = true },
+                                modifier = Modifier.onGloballyPositioned { coordinates ->
+                                    val position = coordinates.positionInRoot()
+                                    val size = coordinates.size
+                                    notificationsButtonRect = Rect(
+                                        offset = position,
+                                        size = Size(size.width.toFloat(), size.height.toFloat())
+                                    )
+                                }
+                            ) {
                                 // Badge logic: Check if there are any alerts
                                 Box {
                                     Icon(
@@ -1670,7 +1816,17 @@ fun HomeScreen() {
                             }
 
                             // 4. Family
-                            IconButton(onClick = { /* TODO: Family */ }) {
+                            IconButton(
+                                onClick = { /* TODO: Family */ },
+                                modifier = Modifier.onGloballyPositioned { coordinates ->
+                                    val position = coordinates.positionInRoot()
+                                    val size = coordinates.size
+                                    groupButtonRect = Rect(
+                                        offset = position,
+                                        size = Size(size.width.toFloat(), size.height.toFloat())
+                                    )
+                                }
+                            ) {
                                 Icon(
                                     imageVector = Icons.Rounded.Group, // Family/Group Icon
                                     contentDescription = "Family",
@@ -1693,6 +1849,14 @@ fun HomeScreen() {
                             .shadow(8.dp, CircleShape)
                             .clip(CircleShape)
                             .background(Color(0xFFFF9800))
+                            .onGloballyPositioned { coordinates ->
+                                val position = coordinates.positionInRoot()
+                                val size = coordinates.size
+                                alertButtonRect = Rect(
+                                    offset = position,
+                                    size = Size(size.width.toFloat(), size.height.toFloat())
+                                )
+                            }
                             .pointerInput(Unit) {
                                 awaitPointerEventScope {
                                     while (true) {
@@ -1803,6 +1967,34 @@ fun HomeScreen() {
                             modifier = Modifier.size(36.dp)
                         )
                     }
+                }
+                
+                // Tutorial Overlay
+                if (showTutorial && currentTutorialStep < tutorialSteps.size) {
+                    val currentStep = tutorialSteps[currentTutorialStep]
+                    val targetRect = when (currentStep.id) {
+                        "search" -> searchButtonRect
+                        "group" -> groupButtonRect
+                        "alert" -> alertButtonRect
+                        "notifications" -> notificationsButtonRect
+                        "sharing" -> sharingLocationRect
+                        "profile" -> profileRect
+                        else -> null
+                    }
+
+                    TutorialOverlay(
+                        targetRect = targetRect,
+                        step = currentStep,
+                        onNext = {
+                            if (currentTutorialStep < tutorialSteps.size - 1) {
+                                currentTutorialStep++
+                            } else {
+                                showTutorial = false
+                                sharedPreferences.edit().putBoolean(tutorialKey, true).apply()
+                            }
+                        },
+                        onDismiss = { /* Optional: Allow dismiss on tap outside? For now, stick to buttons */ }
+                    )
                 }
             }
         }
