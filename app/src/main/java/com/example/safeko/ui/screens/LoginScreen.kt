@@ -31,6 +31,8 @@ import com.google.android.gms.common.api.ApiException
 import com.google.firebase.auth.GoogleAuthProvider
 import com.google.firebase.auth.ktx.auth
 import com.google.firebase.ktx.Firebase
+import com.google.firebase.firestore.SetOptions
+import com.google.firebase.firestore.ktx.firestore
 import android.util.Log
 
 @Composable
@@ -61,14 +63,34 @@ fun LoginScreen(
             if (idToken != null) {
                 val credential = GoogleAuthProvider.getCredential(idToken, null)
                 auth.signInWithCredential(credential)
-                    .addOnCompleteListener { task ->
-                        if (task.isSuccessful) {
-                            onLoginSuccess()
-                        } else {
-                            Log.e("Auth", "Authentication Failed", task.exception)
-                            Toast.makeText(context, "Authentication Failed: ${task.exception?.message}", Toast.LENGTH_LONG).show()
-                        }
-                    }
+                            .addOnCompleteListener { task ->
+                                if (task.isSuccessful) {
+                                    val user = auth.currentUser
+                                    if (user != null) {
+                                        val userData = hashMapOf(
+                                            "uid" to user.uid,
+                                            "name" to (user.displayName ?: ""),
+                                            "email" to (user.email ?: ""),
+                                            "profilePhoto" to (user.photoUrl?.toString()),
+                                            "plan" to "Free"
+                                        )
+                                        Firebase.firestore.collection("users").document(user.uid)
+                                            .set(userData, SetOptions.merge())
+                                            .addOnSuccessListener {
+                                                onLoginSuccess()
+                                            }
+                                            .addOnFailureListener { e ->
+                                                Log.e("Auth", "Error saving user data", e)
+                                                onLoginSuccess()
+                                            }
+                                    } else {
+                                        onLoginSuccess()
+                                    }
+                                } else {
+                                    Log.e("Auth", "Authentication Failed", task.exception)
+                                    Toast.makeText(context, "Authentication Failed: ${task.exception?.message}", Toast.LENGTH_LONG).show()
+                                }
+                            }
             }
         } catch (e: ApiException) {
             Log.e("Auth", "Google Sign In Failed: ${e.statusCode}", e)

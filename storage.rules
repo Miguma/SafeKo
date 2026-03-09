@@ -1,0 +1,21 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    
+    // Circle Images
+    match /circle_images/{imageId} {
+      // Allow reading if authenticated
+      allow read: if request.auth != null;
+      
+      // Allow writing if authenticated, file is an image, and size is reasonable (e.g., < 5MB)
+      allow write: if request.auth != null 
+                   && request.resource.contentType.matches('image/.*')
+                   && request.resource.size < 5 * 1024 * 1024;
+    }
+    
+    // User Profile Images (Optional)
+    match /profile_images/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+  }
+}

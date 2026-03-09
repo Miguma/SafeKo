@@ -17,6 +17,7 @@ import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Phone
+import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -47,6 +48,7 @@ fun EditProfileDialog(
     currentPhotoUrl: String?,
     initialPhoneNumber: String,
     currentLocation: String,
+    onChangePhoto: () -> Unit,
     onSave: (String) -> Unit
 ) {
     if (showDialog) {
@@ -124,7 +126,7 @@ fun EditProfileDialog(
                         }
                     }
 
-                    Divider(color = Color(0xFFEEEEEE), thickness = 1.dp)
+                    HorizontalDivider(color = Color(0xFFEEEEEE), thickness = 1.dp)
 
                     // Scrollable Content
                     Column(
@@ -138,7 +140,7 @@ fun EditProfileDialog(
                         // Profile Picture
                         Box(
                             contentAlignment = Alignment.BottomEnd,
-                            modifier = Modifier.size(90.dp)
+                            modifier = Modifier.size(90.dp).clickable { onChangePhoto() }
                         ) {
                             if (!currentPhotoUrl.isNullOrBlank()) {
                                 AsyncImage(
@@ -161,27 +163,45 @@ fun EditProfileDialog(
                                     modifier = Modifier.fillMaxSize()
                                 ) {
                                     Box(contentAlignment = Alignment.Center) {
-                                        Icon(
-                                            Icons.Filled.Person,
-                                            contentDescription = null,
-                                            tint = Color.Gray,
-                                            modifier = Modifier.size(45.dp)
-                                        )
-                                    }
-                                }
+                                Icon(
+                                    Icons.Filled.Person,
+                                    contentDescription = null,
+                                    tint = Color.Gray,
+                                    modifier = Modifier.size(45.dp)
+                                )
                             }
                         }
+                    }
 
-                        Spacer(modifier = Modifier.height(12.dp))
-
-                        Text(
-                            text = "Photo from Google Account",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = Color.Gray
+                    // Edit Icon Overlay
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            .offset(x = 4.dp, y = 4.dp)
+                            .size(28.dp)
+                            .background(Color.White, CircleShape)
+                            .border(1.dp, Color.LightGray, CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            Icons.Outlined.Edit,
+                            contentDescription = "Edit Photo",
+                            tint = Color(0xFF4285F4),
+                            modifier = Modifier.size(16.dp)
                         )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                Text(
+                    text = "Tap to change photo",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color.Gray
+                )
 
                         Spacer(modifier = Modifier.height(24.dp))
-                        Divider(color = Color(0xFFEEEEEE), thickness = 1.dp)
+                        HorizontalDivider(color = Color(0xFFEEEEEE), thickness = 1.dp)
                         Spacer(modifier = Modifier.height(24.dp))
 
                         // Full Name Field (Read Only)

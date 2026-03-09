@@ -14,6 +14,13 @@ import androidx.lifecycle.lifecycleScope
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import androidx.navigation.navDeepLink
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.ui.unit.IntOffset
 import com.example.safeko.ui.screens.*
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -29,6 +36,8 @@ import com.google.firebase.ktx.Firebase
 import androidx.compose.runtime.remember
 
 class MainActivity : ComponentActivity() {
+    private var shouldHideSystemUI = true
+
     override fun onCreate(savedInstanceState: Bundle?) {
         val splashScreen = installSplashScreen()
 
@@ -38,7 +47,7 @@ class MainActivity : ComponentActivity() {
         splashScreen.setKeepOnScreenCondition { keepSplash }
         
         lifecycleScope.launch {
-            delay(3500)
+            delay(800)
             keepSplash = false
         }
         
@@ -64,7 +73,17 @@ class MainActivity : ComponentActivity() {
             val auth = remember { Firebase.auth }
             val startDestination = if (auth.currentUser != null) "home" else "welcome"
 
-            NavHost(navController = navController, startDestination = startDestination) {
+            val slideSpec = tween<IntOffset>(220)
+            val fadeSpec = tween<Float>(180)
+
+            NavHost(
+                navController = navController,
+                startDestination = startDestination,
+                enterTransition = { slideInHorizontally(slideSpec) { it / 5 } + fadeIn(fadeSpec) },
+                exitTransition = { slideOutHorizontally(slideSpec) { -it / 5 } + fadeOut(fadeSpec) },
+                popEnterTransition = { slideInHorizontally(slideSpec) { -it / 5 } + fadeIn(fadeSpec) },
+                popExitTransition = { slideOutHorizontally(slideSpec) { it / 5 } + fadeOut(fadeSpec) }
+            ) {
                 composable("welcome") {
                     WelcomeScreen(onGetStartedClick = { navController.navigate("onboarding") })
                 }
@@ -86,14 +105,50 @@ class MainActivity : ComponentActivity() {
                 composable("login") {
                     LoginScreen(
                         onLoginSuccess = { navController.navigate("home") },
-                        onFacebookClick = { 
+                        onFacebookClick = {
                             Toast.makeText(this@MainActivity, "Facebook Login Clicked", Toast.LENGTH_SHORT).show()
                         },
                         onSupportClick = { /* TODO: Implement Support */ }
                     )
                 }
                 composable("home") {
-                    HomeScreen()
+                    HomeScreen(navController)
+                }
+                composable("chat/{circleId}") { backStackEntry ->
+                    val circleId = backStackEntry.arguments?.getString("circleId")
+                    if (circleId != null) {
+                        ChatScreen(
+                            circleId = circleId,
+                            onBack = { navController.popBackStack() }
+                        )
+                    }
+                }
+                composable("profile") {
+                    ProfileScreen(
+                        auth = auth,
+                        onBack = { navController.popBackStack() },
+                        onSettings = { /* TODO: Settings */ },
+                        onLogout = {
+                            auth.signOut()
+                            navController.navigate("login") {
+                                popUpTo("welcome") { inclusive = false }
+                            }
+                        },
+                        onScanClick = { /* TODO: Scan from profile if needed, or remove */ },
+                        onPremium = { navController.navigate("premium") }
+                    )
+                }
+                composable("premium") {
+                    PremiumScreen(onBack = { navController.popBackStack() })
+                }
+                composable(
+                    "public_profile/{uid}",
+                    deepLinks = listOf(navDeepLink { uriPattern = "https://safeko-3ca46.web.app/user/{uid}" })
+                ) { backStackEntry ->
+                    val uid = backStackEntry.arguments?.getString("uid")
+                    if (uid != null) {
+                        PublicProfileScreen(uid = uid, onBack = { navController.popBackStack() })
+                    }
                 }
             }
         }
@@ -101,19 +156,39 @@ class MainActivity : ComponentActivity() {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) {
+        if (hasFocus && shouldHideSystemUI) {
             hideSystemUI()
         }
     }
 
     override fun onResume() {
         super.onResume()
-        // Hide immediately
-        hideSystemUI()
-        // And retry after a short delay to catch any system UI reappearance
-        lifecycleScope.launch {
-            delay(500)
+        if (shouldHideSystemUI) {
             hideSystemUI()
+            lifecycleScope.launch {
+                delay(500)
+                if (shouldHideSystemUI) {
+                    hideSystemUI()
+                }
+            }
+        }
+    }
+
+    fun setChatSystemBarsEnabled(enabled: Boolean) {
+        shouldHideSystemUI = !enabled
+        if (enabled) {
+            showSystemUI()
+        } else {
+            hideSystemUI()
+        }
+    }
+
+    private fun showSystemUI() {
+        WindowCompat.getInsetsController(window, window.decorView).apply {
+            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_DEFAULT
+            isAppearanceLightStatusBars = false
+            isAppearanceLightNavigationBars = false
+            show(WindowInsetsCompat.Type.systemBars())
         }
     }
 

@@ -53,6 +53,8 @@ dependencies {
     // Firebase
     implementation(platform(libs.firebase.bom))
     implementation(libs.firebase.auth)
+    implementation(libs.firebase.firestore)
+    implementation(libs.firebase.storage)
     implementation(libs.firebase.analytics)
     implementation(libs.play.services.auth)
 
@@ -62,6 +64,14 @@ dependencies {
     // MapLibre
     implementation(libs.maplibre.android.sdk)
     implementation(libs.androidx.preference.ktx)
+
+    // CameraX and ML Kit
+    implementation(libs.camera.core)
+    implementation(libs.camera.camera2)
+    implementation(libs.camera.lifecycle)
+    implementation(libs.camera.view)
+    implementation(libs.mlkit.barcode.scanning)
+    implementation(libs.zxing.core)
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
