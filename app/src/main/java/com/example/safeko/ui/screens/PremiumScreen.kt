@@ -39,13 +39,20 @@ data class SubscriptionPlan(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun PremiumScreen(
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    onVerifyPhone: () -> Unit,
+    onVerifyFace: () -> Unit
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val auth = remember { Firebase.auth }
     var currentPlanId by remember { mutableStateOf("Free") }
+    var isVerified by remember { mutableStateOf(false) }
+    var isPhoneVerified by remember { mutableStateOf(false) }
     var isLoading by remember { mutableStateOf(true) }
+    
+    var showVerificationModal by remember { mutableStateOf(false) }
+    var showFaceConfirmationDialog by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         val uid = auth.currentUser?.uid
@@ -54,6 +61,8 @@ fun PremiumScreen(
                 val snapshot = FirebaseFirestore.getInstance().collection("users").document(uid).get().await()
                 if (snapshot.exists()) {
                     currentPlanId = snapshot.getString("plan") ?: "Free"
+                    isVerified = snapshot.getBoolean("faceVerified") ?: false
+                    isPhoneVerified = snapshot.getBoolean("phoneVerified") ?: false
                 }
             } catch (e: Exception) {
                 // Handle error
@@ -163,6 +172,59 @@ fun PremiumScreen(
         },
         containerColor = Color.White
     ) { padding ->
+        
+        if (showVerificationModal) {
+            AlertDialog(
+                onDismissRequest = { showVerificationModal = false },
+                title = { Text("Verification Required", fontWeight = FontWeight.Bold) },
+                text = { Text("You must be fully verified (Face Verification) to purchase a premium plan. Please complete verification in your Profile.") },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            showVerificationModal = false
+                            if (!isPhoneVerified) {
+                                onVerifyPhone()
+                            } else {
+                                showFaceConfirmationDialog = true
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))
+                    ) {
+                        Text("Proceed verified", color = Color.White, fontWeight = FontWeight.Bold)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showVerificationModal = false }) {
+                        Text("Cancel", color = Color.Gray)
+                    }
+                }
+            )
+        }
+
+        if (showFaceConfirmationDialog) {
+            AlertDialog(
+                onDismissRequest = { showFaceConfirmationDialog = false },
+                title = { Text("Face Verification", fontWeight = FontWeight.Bold) },
+                text = { Text("Do you want to proceed and verify your face now to unlock premium features?") },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            showFaceConfirmationDialog = false
+                            onVerifyFace()
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF64B5F6))
+                    ) {
+                        Text("Proceed", color = Color.White, fontWeight = FontWeight.Bold)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showFaceConfirmationDialog = false }) {
+                        Text("Later", color = Color.Gray)
+                    }
+                }
+            )
+        }
+
         LazyColumn(
             modifier = Modifier
                 .padding(padding)
@@ -182,7 +244,11 @@ fun PremiumScreen(
             items(plans) { plan ->
                 SubscriptionCard(plan, onSelect = {
                     if (!plan.isCurrent) {
-                        updatePlan(plan.id, plan.name)
+                        if (!isVerified && plan.id != "Free") {
+                            showVerificationModal = true
+                        } else {
+                            updatePlan(plan.id, plan.name)
+                        }
                     }
                 })
             }

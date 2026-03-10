@@ -5,6 +5,7 @@ data class Circle(
     val name: String = "",
     val ownerId: String = "",
     val members: List<String> = emptyList(),
+    val memberLimit: Int = 5,
     val createdAt: Long = System.currentTimeMillis(),
     val imageUrl: String? = null
 )

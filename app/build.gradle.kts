@@ -71,6 +71,7 @@ dependencies {
     implementation(libs.camera.lifecycle)
     implementation(libs.camera.view)
     implementation(libs.mlkit.barcode.scanning)
+    implementation(libs.mlkit.face.detection)
     implementation(libs.zxing.core)
 
     testImplementation(libs.junit)

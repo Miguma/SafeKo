@@ -128,11 +128,12 @@ fun ChatScreen(
     fun sendMessage() {
         if (messageText.isBlank()) return
         val msg = Message(
-            id         = UUID.randomUUID().toString(),
-            senderId   = currentUserId,
-            senderName = currentUserName,
-            text       = messageText,
-            timestamp  = System.currentTimeMillis()
+            id               = UUID.randomUUID().toString(),
+            senderId         = currentUserId,
+            senderName       = currentUserName,
+            senderProfileUrl = currentUser?.photoUrl?.toString(),
+            text             = messageText,
+            timestamp        = System.currentTimeMillis()
         )
         Firebase.firestore.collection("circles").document(circleId)
             .collection("messages").document(msg.id).set(msg)
@@ -531,14 +532,16 @@ private fun MemberRow(
     onRemove: () -> Unit
 ) {
     var displayName by remember(uid) { mutableStateOf<String?>(null) }
+    var profileUrl by remember(uid) { mutableStateOf<String?>(null) }
 
     LaunchedEffect(uid) {
         Firebase.firestore.collection("users").document(uid).get()
             .addOnSuccessListener { doc ->
-                displayName = doc.getString("name")?.takeIf { it.isNotBlank() } ?: uid
+                displayName = doc.getString("name")?.takeIf { it.isNotBlank() } ?: "Unknown User"
+                profileUrl = doc.getString("profilePhoto")
             }
             .addOnFailureListener {
-                displayName = uid  // fallback to UID on error
+                displayName = "Unknown User"  // fallback to generic name on error
             }
     }
 
@@ -550,19 +553,30 @@ private fun MemberRow(
             .padding(horizontal = 20.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Box(
-            modifier         = Modifier
-                .size(38.dp)
-                .clip(CircleShape)
-                .background(AvatarBg),
-            contentAlignment = Alignment.Center
-        ) {
-            Text(
-                text       = name.take(1).uppercase(),
-                color      = TxtWhite,
-                fontWeight = FontWeight.Bold,
-                fontSize   = 15.sp
+        if (!profileUrl.isNullOrBlank()) {
+            AsyncImage(
+                model = profileUrl,
+                contentDescription = null,
+                modifier = Modifier
+                    .size(38.dp)
+                    .clip(CircleShape),
+                contentScale = ContentScale.Crop
             )
+        } else {
+            Box(
+                modifier         = Modifier
+                    .size(38.dp)
+                    .clip(CircleShape)
+                    .background(AvatarBg),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text       = name.take(1).uppercase(),
+                    color      = TxtWhite,
+                    fontWeight = FontWeight.Bold,
+                    fontSize   = 15.sp
+                )
+            }
         }
         Spacer(modifier = Modifier.width(12.dp))
         Column(modifier = Modifier.weight(1f)) {
@@ -581,6 +595,17 @@ private fun MemberRow(
 
 @Composable
 fun ChatBubble(message: Message, isMe: Boolean) {
+    var profileUrl by remember(message.senderId) { mutableStateOf(message.senderProfileUrl) }
+
+    if (profileUrl == null && !isMe) {
+        LaunchedEffect(message.senderId) {
+            Firebase.firestore.collection("users").document(message.senderId).get()
+                .addOnSuccessListener { doc ->
+                    profileUrl = doc.getString("profilePhoto")
+                }
+        }
+    }
+
     Row(
         modifier              = Modifier
             .fillMaxWidth()
@@ -588,20 +613,32 @@ fun ChatBubble(message: Message, isMe: Boolean) {
         horizontalArrangement = if (isMe) Arrangement.End else Arrangement.Start
     ) {
         if (!isMe) {
-            Box(
-                modifier         = Modifier
-                    .size(28.dp)
-                    .clip(CircleShape)
-                    .background(AvatarBg)
-                    .align(Alignment.Bottom),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    text       = message.senderName?.take(1)?.uppercase() ?: "?",
-                    color      = TxtWhite,
-                    fontSize   = 11.sp,
-                    fontWeight = FontWeight.SemiBold
+            if (!profileUrl.isNullOrBlank()) {
+                AsyncImage(
+                    model = profileUrl,
+                    contentDescription = null,
+                    modifier = Modifier
+                        .size(28.dp)
+                        .clip(CircleShape)
+                        .align(Alignment.Bottom),
+                    contentScale = ContentScale.Crop
                 )
+            } else {
+                Box(
+                    modifier         = Modifier
+                        .size(28.dp)
+                        .clip(CircleShape)
+                        .background(AvatarBg)
+                        .align(Alignment.Bottom),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text       = message.senderName?.take(1)?.uppercase() ?: "?",
+                        color      = TxtWhite,
+                        fontSize   = 11.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
             }
             Spacer(modifier = Modifier.width(6.dp))
         }

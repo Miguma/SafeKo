@@ -48,11 +48,13 @@ fun EditProfileDialog(
     currentPhotoUrl: String?,
     initialPhoneNumber: String,
     currentLocation: String,
+    isPhoneVerified: Boolean,
     onChangePhoto: () -> Unit,
-    onSave: (String) -> Unit
+    onSave: (String, String) -> Unit // (newName, newPhone)
 ) {
     if (showDialog) {
         var phoneNumber by remember { mutableStateOf(initialPhoneNumber) }
+        var fullName by remember { mutableStateOf(currentName) }
         
         // Use a full-screen Box with high Z-index to overlay everything
         // This avoids Window inset issues common with Dialog/Popup
@@ -204,7 +206,7 @@ fun EditProfileDialog(
                         HorizontalDivider(color = Color(0xFFEEEEEE), thickness = 1.dp)
                         Spacer(modifier = Modifier.height(24.dp))
 
-                        // Full Name Field (Read Only)
+                        // Full Name Field (Editable)
                         Column(modifier = Modifier.fillMaxWidth()) {
                             Text(
                                 text = "Full Name",
@@ -213,17 +215,16 @@ fun EditProfileDialog(
                                 modifier = Modifier.padding(bottom = 8.dp)
                             )
                             OutlinedTextField(
-                                value = currentName,
-                                onValueChange = {},
-                                readOnly = true,
-                                enabled = false,
+                                value = fullName,
+                                onValueChange = { fullName = it },
                                 modifier = Modifier.fillMaxWidth(),
                                 shape = RoundedCornerShape(12.dp),
                                 colors = OutlinedTextFieldDefaults.colors(
-                                    disabledTextColor = Color.Black,
-                                    disabledBorderColor = Color(0xFFE0E0E0),
-                                    disabledContainerColor = Color.White,
-                                    disabledLabelColor = Color.Gray
+                                    focusedBorderColor = Color(0xFF4285F4),
+                                    unfocusedBorderColor = Color(0xFFE0E0E0),
+                                    focusedContainerColor = Color.White,
+                                    unfocusedContainerColor = Color.White,
+                                    cursorColor = Color(0xFF4285F4)
                                 ),
                                 singleLine = true
                             )
@@ -285,6 +286,8 @@ fun EditProfileDialog(
                             OutlinedTextField(
                                 value = phoneNumber,
                                 onValueChange = { phoneNumber = it },
+                                readOnly = isPhoneVerified,
+                                enabled = !isPhoneVerified,
                                 modifier = Modifier.fillMaxWidth(),
                                 shape = RoundedCornerShape(12.dp),
                                 placeholder = { Text("+63 912 345 6789", color = Color.LightGray) },
@@ -295,25 +298,45 @@ fun EditProfileDialog(
                                     unfocusedBorderColor = Color(0xFFE0E0E0),
                                     focusedContainerColor = Color.White,
                                     unfocusedContainerColor = Color.White,
-                                    cursorColor = Color(0xFF4285F4)
+                                    cursorColor = Color(0xFF4285F4),
+                                    disabledTextColor = Color.Black,
+                                    disabledBorderColor = Color(0xFFE0E0E0),
+                                    disabledContainerColor = Color(0xFFF5F5F5)
                                 )
                             )
                             
                             Spacer(modifier = Modifier.height(8.dp))
                             
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Icon(
-                                    imageVector = Icons.Filled.Phone,
-                                    contentDescription = null,
-                                    tint = Color.Gray,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text(
-                                    text = "Philippine format: +63 XXX XXX XXXX",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = Color.Gray
-                                )
+                            if (isPhoneVerified) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Lock,
+                                        contentDescription = null,
+                                        tint = Color(0xFFFF9800), // Orange
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text(
+                                        text = "Semi Verified. Number cannot be changed.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = Color(0xFFFF9800)
+                                    )
+                                }
+                            } else {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Phone,
+                                        contentDescription = null,
+                                        tint = Color.Gray,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text(
+                                        text = "Philippine format: +63 XXX XXX XXXX",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = Color.Gray
+                                    )
+                                }
                             }
                         }
 
@@ -364,7 +387,7 @@ fun EditProfileDialog(
                         
                         // Save Button
                         Button(
-                            onClick = { onSave(phoneNumber) },
+                            onClick = { onSave(fullName, phoneNumber) },
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(56.dp),
@@ -389,5 +412,70 @@ fun EditProfileDialog(
                 }
             }
         }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun OtpInputDialog(
+    showDialog: Boolean,
+    onDismiss: () -> Unit,
+    onVerify: (String) -> Unit
+) {
+    if (showDialog) {
+        var otpCode by remember { mutableStateOf("") }
+        
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            title = {
+                Text(
+                    text = "Verify Phone Number",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold
+                )
+            },
+            text = {
+                Column {
+                    Text(
+                        text = "Enter the 6-digit OTP sent to your phone number.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Color.Gray
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
+                    OutlinedTextField(
+                        value = otpCode,
+                        onValueChange = { 
+                            if (it.length <= 6) { otpCode = it.filter { char -> char.isDigit() } }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp),
+                        placeholder = { Text("000000", color = Color.LightGray) },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                        singleLine = true,
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = Color(0xFF4285F4),
+                            unfocusedBorderColor = Color(0xFFE0E0E0),
+                            cursorColor = Color(0xFF4285F4)
+                        )
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = { onVerify(otpCode) },
+                    enabled = otpCode.length == 6,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4285F4)),
+                    shape = RoundedCornerShape(20.dp)
+                ) {
+                    Text("Verify")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = onDismiss) {
+                    Text("Cancel", color = Color.Gray)
+                }
+            },
+            containerColor = Color.White
+        )
     }
 }

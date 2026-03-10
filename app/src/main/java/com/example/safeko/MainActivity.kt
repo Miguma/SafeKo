@@ -130,16 +130,39 @@ class MainActivity : ComponentActivity() {
                         onSettings = { /* TODO: Settings */ },
                         onLogout = {
                             auth.signOut()
+                            
+                            // Sign out of Google to show account picker on next login
+                            val googleSignInClient = com.google.android.gms.auth.api.signin.GoogleSignIn.getClient(
+                                this@MainActivity,
+                                com.google.android.gms.auth.api.signin.GoogleSignInOptions.DEFAULT_SIGN_IN
+                            )
+                            googleSignInClient.signOut()
+                            
                             navController.navigate("login") {
                                 popUpTo("welcome") { inclusive = false }
                             }
                         },
                         onScanClick = { /* TODO: Scan from profile if needed, or remove */ },
-                        onPremium = { navController.navigate("premium") }
+                        onPremium = { navController.navigate("premium") },
+                        onVerifyFace = { navController.navigate("face_verification") }
+                    )
+                }
+                composable("face_verification") {
+                    FaceVerificationScreen(
+                        auth = auth,
+                        onBack = { navController.popBackStack() },
+                        onSuccess = { 
+                            // Pop back to profile
+                            navController.popBackStack()
+                        }
                     )
                 }
                 composable("premium") {
-                    PremiumScreen(onBack = { navController.popBackStack() })
+                    PremiumScreen(
+                        onBack = { navController.popBackStack() },
+                        onVerifyPhone = { navController.navigate("profile") },
+                        onVerifyFace = { navController.navigate("face_verification") }
+                    )
                 }
                 composable(
                     "public_profile/{uid}",

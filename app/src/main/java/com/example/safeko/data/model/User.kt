@@ -6,5 +6,8 @@ data class User(
     val email: String = "",
     var profilePhoto: String? = null,
     var verifiedStatus: Boolean = false,
-    var plan: String = "Free"
+    var plan: String = "Free",
+    var phoneNumber: String = "",
+    var phoneVerified: Boolean = false,
+    var verificationLevel: Int = 0
 )

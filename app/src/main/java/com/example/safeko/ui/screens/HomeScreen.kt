@@ -162,6 +162,13 @@ import androidx.compose.runtime.saveable.rememberSaveable
 
 import com.example.safeko.utils.RouteFetcher
 
+data class CircleMember(
+    val uid: String,
+    val name: String,
+    val profilePhoto: String?,
+    val sharedCircles: List<String>
+)
+
 // Helper to find Activity
 fun Context.findActivity(): Activity? = when (this) {
     is Activity -> this
@@ -233,6 +240,13 @@ fun HomeScreen(navController: NavController) {
                 val snapshot = Firebase.firestore.collection("users").document(uid).get().await()
                 if (snapshot.exists()) {
                     userPlan = snapshot.getString("plan") ?: "Free"
+                    
+                    // Silent Sync: If Firestore missing name but Firebase Auth has it, set it
+                    val dbName = snapshot.getString("name")
+                    val authName = auth.currentUser?.displayName
+                    if (dbName.isNullOrBlank() && !authName.isNullOrBlank()) {
+                        Firebase.firestore.collection("users").document(uid).update("name", authName)
+                    }
                 } else {
                      userPlan = "Free"
                 }
@@ -282,6 +296,7 @@ fun HomeScreen(navController: NavController) {
     var distanceToNextTurn by remember { mutableStateOf(0.0) }
     
     // Circle State
+    var showLinkJoinDialog by remember { mutableStateOf(false) }
     var isCreatingCircle by remember { mutableStateOf(false) }
     var userCircles by remember { mutableStateOf<List<Circle>>(emptyList()) }
     var selectedCircle by remember { mutableStateOf<Circle?>(null) }
@@ -3432,6 +3447,43 @@ fun HomeScreen(navController: NavController) {
         // Group Bottom Sheet
         if (showGroupSheet) {
             val groupSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = false)
+            
+            var circleMembers by remember { mutableStateOf<List<CircleMember>>(emptyList()) }
+            var isLoadingMembers by remember { mutableStateOf(false) }
+
+            LaunchedEffect(userCircles) {
+                if (userCircles.isEmpty()) {
+                    circleMembers = emptyList()
+                    return@LaunchedEffect
+                }
+                
+                isLoadingMembers = true
+                val currentUid = auth.currentUser?.uid ?: return@LaunchedEffect
+                val membersMap = mutableMapOf<String, MutableList<String>>()
+                
+                userCircles.forEach { circle ->
+                    circle.members.forEach { uid ->
+                        if (uid != currentUid) {
+                            membersMap.getOrPut(uid) { mutableListOf() }.add(circle.name)
+                        }
+                    }
+                }
+                
+                val fetchedMembers = mutableListOf<CircleMember>()
+                for ((uid, sharedNames) in membersMap) {
+                    try {
+                        val doc = Firebase.firestore.collection("users").document(uid).get().await()
+                        val name = doc.getString("name") ?: "Unknown User"
+                        val profilePhoto = doc.getString("profilePhoto")
+                        fetchedMembers.add(CircleMember(uid, name, profilePhoto, sharedNames))
+                    } catch (e: Exception) {
+                        Log.e("HomeScreen", "Error fetching member $uid", e)
+                    }
+                }
+                circleMembers = fetchedMembers.sortedBy { it.name }
+                isLoadingMembers = false
+            }
+
             ModalBottomSheet(
                 onDismissRequest = { 
                     if (isCreatingCircle) {
@@ -3443,7 +3495,7 @@ fun HomeScreen(navController: NavController) {
                 sheetState = groupSheetState,
                 containerColor = Color.White,
                 shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
-                dragHandle = { BottomSheetDefaults.DragHandle() },
+                dragHandle = { BottomSheetDefaults.DragHandle() }
             ) {
                 if (isCreatingCircle) {
                     var circleName by remember { mutableStateOf("") }
@@ -3487,6 +3539,7 @@ fun HomeScreen(navController: NavController) {
                                                     name = circleName,
                                                     ownerId = uid,
                                                     members = listOf(uid),
+                                                    memberLimit = if (userPlan == "OWL+") 10 else 5,
                                                     createdAt = System.currentTimeMillis(),
                                                     imageUrl = imageUrl
                                                 )
@@ -3623,7 +3676,7 @@ fun HomeScreen(navController: NavController) {
                                 ) {
                                     Icon(Icons.Rounded.Groups, contentDescription = null, tint = Color.Gray)
                                     Spacer(modifier = Modifier.width(16.dp))
-                                    Text("Community", modifier = Modifier.weight(1f))
+                                    Text("Duo", modifier = Modifier.weight(1f))
                                     RadioButton(selected = false, onClick = {}, colors = RadioButtonDefaults.colors(unselectedColor = Color.Gray))
                                 }
                             }
@@ -3642,6 +3695,7 @@ fun HomeScreen(navController: NavController) {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
+                        .fillMaxHeight(0.95f)
                         .padding(horizontal = 24.dp)
                         .padding(bottom = 48.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
@@ -3660,6 +3714,13 @@ fun HomeScreen(navController: NavController) {
                             modifier = Modifier.weight(1f)
                         )
                         if (isEligible) {
+                            IconButton(onClick = { showLinkJoinDialog = true; showGroupSheet = false }) {
+                                Icon(
+                                    Icons.Rounded.Link,
+                                    contentDescription = "Join by Link",
+                                    tint = Color.Gray
+                                )
+                            }
                             IconButton(onClick = { showScanner = true; showGroupSheet = false }) {
                                 Icon(
                                     Icons.Rounded.QrCodeScanner,
@@ -3690,8 +3751,16 @@ fun HomeScreen(navController: NavController) {
                             if (userCircles.isNotEmpty()) {
                                 // List User Circles
                                 LazyColumn(
-                                    modifier = Modifier.fillMaxWidth().heightIn(max = 300.dp)
+                                    modifier = Modifier.fillMaxWidth().weight(1f)
                                 ) {
+                                    item {
+                                        Text(
+                                            text = "Groups",
+                                            style = MaterialTheme.typography.titleMedium,
+                                            fontWeight = FontWeight.Bold,
+                                            modifier = Modifier.padding(bottom = 8.dp)
+                                        )
+                                    }
                                     items(userCircles) { circle ->
                                         Card(
                                             onClick = { navController.navigate("chat/${circle.id}") },
@@ -3738,6 +3807,83 @@ fun HomeScreen(navController: NavController) {
                                                     tint = Color.Gray,
                                                     modifier = Modifier.size(16.dp)
                                                 )
+                                            }
+                                        }
+                                    }
+                                    
+                                    if (circleMembers.isNotEmpty() || isLoadingMembers) {
+                                        item {
+                                            HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp), color = Color(0xFFEEEEEE))
+                                            Text(
+                                                text = "Members",
+                                                style = MaterialTheme.typography.titleMedium,
+                                                fontWeight = FontWeight.Bold,
+                                                modifier = Modifier.padding(bottom = 8.dp)
+                                            )
+                                        }
+                                        if (isLoadingMembers) {
+                                            item {
+                                                Box(modifier = Modifier.fillMaxWidth().padding(16.dp), contentAlignment = Alignment.Center) {
+                                                    CircularProgressIndicator()
+                                                }
+                                            }
+                                        } else {
+                                            items(circleMembers) { member ->
+                                                Card(
+                                                    modifier = Modifier
+                                                        .fillMaxWidth()
+                                                        .padding(vertical = 4.dp),
+                                                    shape = RoundedCornerShape(16.dp),
+                                                    colors = CardDefaults.cardColors(containerColor = Color.White),
+                                                    border = BorderStroke(1.dp, Color(0xFFEEEEEE))
+                                                ) {
+                                                    Row(
+                                                        modifier = Modifier.padding(12.dp),
+                                                        verticalAlignment = Alignment.CenterVertically
+                                                    ) {
+                                                        if (member.profilePhoto != null) {
+                                                            AsyncImage(
+                                                                model = ImageRequest.Builder(LocalContext.current)
+                                                                    .data(member.profilePhoto)
+                                                                    .crossfade(true)
+                                                                    .transformations(CircleCropTransformation())
+                                                                    .build(),
+                                                                contentDescription = "Profile Picture",
+                                                                modifier = Modifier
+                                                                    .size(40.dp)
+                                                                    .clip(CircleShape),
+                                                                contentScale = ContentScale.Crop
+                                                            )
+                                                        } else {
+                                                            Box(
+                                                                modifier = Modifier
+                                                                    .size(40.dp)
+                                                                    .background(Color(0xFFFF9800), CircleShape),
+                                                                contentAlignment = Alignment.Center
+                                                            ) {
+                                                                Text(
+                                                                    text = member.name.take(1).uppercase(),
+                                                                    color = Color.White,
+                                                                    fontWeight = FontWeight.Bold,
+                                                                    style = MaterialTheme.typography.titleMedium
+                                                                )
+                                                            }
+                                                        }
+                                                        Spacer(modifier = Modifier.width(16.dp))
+                                                        Column {
+                                                            Text(
+                                                                text = member.name,
+                                                                style = MaterialTheme.typography.titleMedium,
+                                                                fontWeight = FontWeight.Bold
+                                                            )
+                                                            Text(
+                                                                text = "In: ${member.sharedCircles.joinToString(", ")}",
+                                                                style = MaterialTheme.typography.bodySmall,
+                                                                color = Color.Gray
+                                                            )
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -3837,14 +3983,26 @@ fun HomeScreen(navController: NavController) {
                 currentPhotoUrl = auth.currentUser?.photoUrl?.toString(),
                 initialPhoneNumber = userPhoneNumber,
                 currentLocation = currentUserAddress,
+                isPhoneVerified = false, // Not using full auth flow here to save space, user should edit in Profile
                 onChangePhoto = {
                     pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
                 },
-                onSave = { newPhone ->
+                onSave = { newName, newPhone ->
                     userPhoneNumber = newPhone
                     sharedPreferences.edit()
                         .putString("user_phone_number_${auth.currentUser?.uid}", newPhone)
                         .apply()
+                        
+                    val userId = auth.currentUser?.uid
+                    if (userId != null && newName.isNotBlank() && newName != auth.currentUser?.displayName) {
+                        val profileUpdates = com.google.firebase.auth.UserProfileChangeRequest.Builder()
+                            .setDisplayName(newName)
+                            .build()
+                        auth.currentUser?.updateProfile(profileUpdates)
+                        com.google.firebase.ktx.Firebase.firestore.collection("users").document(userId)
+                            .update("name", newName)
+                    }
+
                     showEditProfile = false
                     Toast.makeText(context, "Profile Updated", Toast.LENGTH_SHORT).show()
                 }
@@ -3862,17 +4020,33 @@ fun HomeScreen(navController: NavController) {
                         val currentUserId = auth.currentUser?.uid
                         if (currentUserId != null) {
                             com.google.firebase.ktx.Firebase.firestore.collection("circles").document(circleId)
-                                .set(
-                                    mapOf("members" to com.google.firebase.firestore.FieldValue.arrayUnion(currentUserId)),
-                                    com.google.firebase.firestore.SetOptions.merge()
-                                )
-                                .addOnSuccessListener {
-                                    Toast.makeText(context, "Joined group!", Toast.LENGTH_SHORT).show()
-                                    navController.navigate("chat/$circleId")
+                                .get()
+                                .addOnSuccessListener { doc ->
+                                    if (doc.exists()) {
+                                        val members = doc.get("members") as? List<*> ?: emptyList<Any>()
+                                        val limit = doc.getLong("memberLimit")?.toInt() ?: 5 // Legacy fallback to 5
+                                        if (members.size >= limit) {
+                                            Toast.makeText(context, "This circle has reached its maximum member limit!", Toast.LENGTH_LONG).show()
+                                        } else {
+                                            com.google.firebase.ktx.Firebase.firestore.collection("circles").document(circleId)
+                                                .set(
+                                                    mapOf("members" to com.google.firebase.firestore.FieldValue.arrayUnion(currentUserId)),
+                                                    com.google.firebase.firestore.SetOptions.merge()
+                                                )
+                                                .addOnSuccessListener {
+                                                    Toast.makeText(context, "Joined group!", Toast.LENGTH_SHORT).show()
+                                                    navController.navigate("chat/$circleId")
+                                                }
+                                                .addOnFailureListener { e ->
+                                                    Toast.makeText(context, "Failed: ${e.message}", Toast.LENGTH_LONG).show()
+                                                }
+                                        }
+                                    } else {
+                                        Toast.makeText(context, "Circle not found", Toast.LENGTH_SHORT).show()
+                                    }
                                 }
-                                .addOnFailureListener { e ->
-                                    Toast.makeText(context, "Failed: ${e.message}", Toast.LENGTH_LONG).show()
-                                    android.util.Log.e("HomeScreen", "Join group failed", e)
+                                .addOnFailureListener {
+                                     Toast.makeText(context, "Failed to join: ${it.message}", Toast.LENGTH_LONG).show()
                                 }
                         }
                     } else {
@@ -3894,6 +4068,99 @@ fun HomeScreen(navController: NavController) {
                 }
             },
             onClose = { showScanner = false }
+        )
+    }
+
+    if (showLinkJoinDialog) {
+        var linkInput by remember { mutableStateOf("") }
+        var isJoining by remember { mutableStateOf(false) }
+
+        AlertDialog(
+            onDismissRequest = { showLinkJoinDialog = false },
+            title = { Text("Join Circle", fontWeight = FontWeight.Bold) },
+            text = {
+                Column {
+                    Text("Enter the group invite link to join.")
+                    Spacer(modifier = Modifier.height(16.dp))
+                    OutlinedTextField(
+                        value = linkInput,
+                        onValueChange = { linkInput = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        placeholder = { Text("https://safeko.app/join/...") },
+                        singleLine = true
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val circleIdStr = if (linkInput.contains("/join/")) {
+                            linkInput.substringAfterLast("/join/")
+                        } else {
+                            linkInput // User might just paste the ID
+                        }
+                        
+                        val parsedCircleId = circleIdStr.trim().removeSuffix("/")
+
+                        if (parsedCircleId.isNotBlank()) {
+                            isJoining = true
+                            val uid = auth.currentUser?.uid
+                            if (uid != null) {
+                                com.google.firebase.ktx.Firebase.firestore.collection("circles").document(parsedCircleId)
+                                    .get()
+                                    .addOnSuccessListener { doc ->
+                                        if (doc.exists()) {
+                                            val members = doc.get("members") as? List<*> ?: emptyList<Any>()
+                                            val limit = doc.getLong("memberLimit")?.toInt() ?: 5 // Legacy fallback
+                                            if (members.size >= limit) {
+                                                isJoining = false
+                                                Toast.makeText(context, "This circle has reached its maximum member limit!", Toast.LENGTH_LONG).show()
+                                            } else {
+                                                com.google.firebase.ktx.Firebase.firestore.collection("circles").document(parsedCircleId)
+                                                    .set(
+                                                        mapOf("members" to com.google.firebase.firestore.FieldValue.arrayUnion(uid)),
+                                                        com.google.firebase.firestore.SetOptions.merge()
+                                                    )
+                                                    .addOnSuccessListener {
+                                                        isJoining = false
+                                                        showLinkJoinDialog = false
+                                                        Toast.makeText(context, "Joined group!", Toast.LENGTH_SHORT).show()
+                                                        navController.navigate("chat/$parsedCircleId")
+                                                    }
+                                                    .addOnFailureListener { e ->
+                                                        isJoining = false
+                                                        Toast.makeText(context, "Failed: ${e.message}", Toast.LENGTH_LONG).show()
+                                                    }
+                                            }
+                                        } else {
+                                            isJoining = false
+                                            Toast.makeText(context, "Circle not found", Toast.LENGTH_SHORT).show()
+                                        }
+                                    }
+                                    .addOnFailureListener { e ->
+                                        isJoining = false
+                                        Toast.makeText(context, "Failed to join: ${e.message}", Toast.LENGTH_LONG).show()
+                                    }
+                            }
+                        } else {
+                            Toast.makeText(context, "Invalid join link", Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                    enabled = linkInput.isNotBlank() && !isJoining,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF29B6F6))
+                ) {
+                    if (isJoining) {
+                        CircularProgressIndicator(modifier = Modifier.size(24.dp), color = Color.White, strokeWidth = 2.dp)
+                    } else {
+                        Text("Join", color = Color.White)
+                    }
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showLinkJoinDialog = false }, enabled = !isJoining) {
+                    Text("Cancel", color = Color.Gray)
+                }
+            }
         )
     }
 }

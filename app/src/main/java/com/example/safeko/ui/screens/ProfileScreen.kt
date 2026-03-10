@@ -62,6 +62,8 @@ import com.google.firebase.auth.UserProfileChangeRequest
 import com.google.firebase.firestore.ktx.firestore
 import com.google.firebase.ktx.Firebase
 import com.google.firebase.storage.FirebaseStorage
+import com.example.safeko.utils.PhoneAuthManager
+import android.app.Activity
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 
@@ -73,7 +75,8 @@ fun ProfileScreen(
     onSettings: () -> Unit,
     onLogout: () -> Unit,
     onScanClick: () -> Unit,
-    onPremium: () -> Unit
+    onPremium: () -> Unit,
+    onVerifyFace: () -> Unit
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -92,6 +95,15 @@ fun ProfileScreen(
         mutableStateOf(sharedPreferences.getString("user_phone_number_$currentUserId", "") ?: "") 
     }
     val isFaceVerified = sharedPreferences.getBoolean("is_face_verified_$currentUserId", false)
+    var isPhoneVerified by remember { mutableStateOf(false) }
+
+    var showOtpDialog by remember { mutableStateOf(false) }
+    var otpCallback by remember { mutableStateOf<((String) -> Unit)?>(null) }
+
+    val activity = context as? Activity
+    val phoneAuthManager = remember(auth, activity) { 
+        activity?.let { PhoneAuthManager(auth, it) } 
+    }
     
     // Share Location Preference
     var sharingOption by remember { 
@@ -107,6 +119,12 @@ fun ProfileScreen(
                 val snapshot = Firebase.firestore.collection("users").document(uid).get().await()
                 if (snapshot.exists()) {
                     userPlan = snapshot.getString("plan") ?: "Free"
+                    val fetchedPhone = snapshot.getString("phoneNumber")
+                    if (!fetchedPhone.isNullOrBlank()) {
+                        userPhoneNumber = fetchedPhone
+                        sharedPreferences.edit().putString("user_phone_number_$currentUserId", userPhoneNumber).apply()
+                    }
+                    isPhoneVerified = snapshot.getBoolean("phoneVerified") ?: false
                 } else {
                      userPlan = "Free"
                 }
@@ -149,6 +167,11 @@ fun ProfileScreen(
                             .build()
                         
                         auth.currentUser?.updateProfile(profileUpdates)?.await()
+                        
+                        // Update Firestore users collection
+                        Firebase.firestore.collection("users").document(userId)
+                            .update("profilePhoto", downloadUrl.toString())
+                            .await()
                         
                         // Update State
                         currentPhotoUrl = downloadUrl
@@ -251,15 +274,77 @@ fun ProfileScreen(
             currentPhotoUrl = currentPhotoUrl?.toString(),
             initialPhoneNumber = userPhoneNumber,
             currentLocation = "Location not available", // Simplified for now
+            isPhoneVerified = isPhoneVerified,
             onChangePhoto = {
                 pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
             },
-            onSave = { newPhone ->
-                userPhoneNumber = newPhone
-                sharedPreferences.edit().putString("user_phone_number_$currentUserId", newPhone).apply()
-                showEditProfile = false
-                Toast.makeText(context, "Profile updated", Toast.LENGTH_SHORT).show()
+            onSave = { newName, rawPhone ->
+                val userId = auth.currentUser?.uid
+                if (userId != null && newName.isNotBlank() && newName != auth.currentUser?.displayName) {
+                    val profileUpdates = com.google.firebase.auth.UserProfileChangeRequest.Builder()
+                        .setDisplayName(newName)
+                        .build()
+                    auth.currentUser?.updateProfile(profileUpdates)
+                    com.google.firebase.ktx.Firebase.firestore.collection("users").document(userId)
+                        .update("name", newName)
+                }
+
+                // Format phone number to E.164 format (+63...)
+                var newPhone = rawPhone.replace(Regex("[^\\d+]"), "")
+                if (newPhone.startsWith("0")) {
+                    newPhone = "+63" + newPhone.substring(1)
+                } else if (!newPhone.startsWith("+")) {
+                    newPhone = "+63$newPhone"
+                }
+
+                if (newPhone != userPhoneNumber && newPhone.isNotBlank()) {
+                    if (phoneAuthManager != null) {
+                        Toast.makeText(context, "Sending OTP...", Toast.LENGTH_SHORT).show()
+                        phoneAuthManager.initiateOTP(newPhone, object : PhoneAuthManager.PhoneAuthCallback {
+                            override fun onCodeSent() {
+                                showOtpDialog = true
+                                otpCallback = { code ->
+                                    phoneAuthManager.verifyOTP(code, this)
+                                    showOtpDialog = false
+                                }
+                            }
+                            override fun onVerificationComplete() {
+                                // Often handled automatically by Play Services, 
+                                // avoiding manual entry.
+                            }
+                            override fun onVerificationFailed(exception: Exception) {
+                                Toast.makeText(context, "Verification failed: ${exception.message}", Toast.LENGTH_LONG).show()
+                                showOtpDialog = false
+                            }
+                            override fun onOtpInvalid() {
+                                Toast.makeText(context, "Invalid OTP code", Toast.LENGTH_SHORT).show()
+                            }
+                            override fun onSuccess() {
+                                userPhoneNumber = newPhone
+                                isPhoneVerified = true
+                                sharedPreferences.edit().putString("user_phone_number_$currentUserId", newPhone).apply()
+                                showEditProfile = false
+                                Toast.makeText(context, "Phone number verified!", Toast.LENGTH_SHORT).show()
+                            }
+                        })
+                    } else {
+                        Toast.makeText(context, "Error initializing phone auth", Toast.LENGTH_SHORT).show()
+                    }
+                } else {
+                    userPhoneNumber = newPhone
+                    sharedPreferences.edit().putString("user_phone_number_$currentUserId", newPhone).apply()
+                    showEditProfile = false
+                    Toast.makeText(context, "Profile updated", Toast.LENGTH_SHORT).show()
+                }
             }
+        )
+    }
+    
+    if (showOtpDialog && otpCallback != null) {
+        OtpInputDialog(
+            showDialog = showOtpDialog,
+            onDismiss = { showOtpDialog = false },
+            onVerify = { code -> otpCallback?.invoke(code) }
         )
     }
     
@@ -387,14 +472,6 @@ fun ProfileScreen(
                     fontWeight = FontWeight.Bold
                 )
 
-                Spacer(modifier = Modifier.height(4.dp))
-
-                Text(
-                    text = if (userPhoneNumber.isNotBlank()) userPhoneNumber else (auth.currentUser?.email ?: ""),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = Color.Gray
-                )
-                
                 Spacer(modifier = Modifier.height(12.dp))
 
                 // Verified Badge
@@ -419,6 +496,34 @@ fun ProfileScreen(
                                 text = "Verified Account",
                                 style = MaterialTheme.typography.labelMedium,
                                 color = Color(0xFF1B5E20),
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                }
+                
+                if (isPhoneVerified && !isFaceVerified) {
+                    Surface(
+                        shape = RoundedCornerShape(50),
+                        color = Color(0xFFFFF3E0), // Light Orange
+                        modifier = Modifier.height(32.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.padding(horizontal = 12.dp)
+                        ) {
+                            Icon(
+                                Icons.Rounded.VerifiedUser,
+                                contentDescription = null,
+                                tint = Color(0xFFFF9800), // Orange
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = "Semi Verified",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = Color(0xFFE65100), // Dark Orange
                                 fontWeight = FontWeight.Bold
                             )
                         }
@@ -458,7 +563,13 @@ fun ProfileScreen(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(horizontal = 16.dp, vertical = 8.dp)
-                        .clickable { showEditProfile = true },
+                        .clickable { 
+                            if (!isPhoneVerified) {
+                                Toast.makeText(context, "Please verify your phone number first", Toast.LENGTH_SHORT).show()
+                            } else {
+                                onVerifyFace() 
+                            }
+                        },
                     shape = RoundedCornerShape(16.dp),
                     color = Color(0xFFFFEBF0) // Light Pink
                 ) {
@@ -508,7 +619,13 @@ fun ProfileScreen(
                 modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp)
             )
 
-            ProfileMenuItem("Edit Profile", Icons.Outlined.Person) { showEditProfile = true }
+            ProfileMenuItem("Edit Profile", Icons.Outlined.Person) {
+                if (!isFaceVerified) {
+                    Toast.makeText(context, "You must be fully verified to edit your profile", Toast.LENGTH_SHORT).show()
+                } else {
+                    showEditProfile = true
+                }
+            }
             
             ProfileMenuItem("Premium", Icons.Rounded.Star) { 
                 onPremium() 
