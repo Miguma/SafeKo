@@ -15,12 +15,6 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navDeepLink
-import androidx.compose.animation.core.tween
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.slideInHorizontally
-import androidx.compose.animation.slideOutHorizontally
-import androidx.compose.ui.unit.IntOffset
 import com.example.safeko.ui.screens.*
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -32,6 +26,7 @@ import android.content.ContextWrapper
 import android.app.Activity
 
 import com.google.firebase.auth.ktx.auth
+import com.google.firebase.firestore.ktx.firestore
 import com.google.firebase.ktx.Firebase
 import androidx.compose.runtime.remember
 
@@ -47,7 +42,7 @@ class MainActivity : ComponentActivity() {
         splashScreen.setKeepOnScreenCondition { keepSplash }
         
         lifecycleScope.launch {
-            delay(800)
+            delay(3500)
             keepSplash = false
         }
         
@@ -73,17 +68,7 @@ class MainActivity : ComponentActivity() {
             val auth = remember { Firebase.auth }
             val startDestination = if (auth.currentUser != null) "home" else "welcome"
 
-            val slideSpec = tween<IntOffset>(220)
-            val fadeSpec = tween<Float>(180)
-
-            NavHost(
-                navController = navController,
-                startDestination = startDestination,
-                enterTransition = { slideInHorizontally(slideSpec) { it / 5 } + fadeIn(fadeSpec) },
-                exitTransition = { slideOutHorizontally(slideSpec) { -it / 5 } + fadeOut(fadeSpec) },
-                popEnterTransition = { slideInHorizontally(slideSpec) { -it / 5 } + fadeIn(fadeSpec) },
-                popExitTransition = { slideOutHorizontally(slideSpec) { it / 5 } + fadeOut(fadeSpec) }
-            ) {
+            NavHost(navController = navController, startDestination = startDestination) {
                 composable("welcome") {
                     WelcomeScreen(onGetStartedClick = { navController.navigate("onboarding") })
                 }
@@ -104,11 +89,103 @@ class MainActivity : ComponentActivity() {
                 }
                 composable("login") {
                     LoginScreen(
-                        onLoginSuccess = { navController.navigate("home") },
-                        onFacebookClick = {
-                            Toast.makeText(this@MainActivity, "Facebook Login Clicked", Toast.LENGTH_SHORT).show()
+                        onLoginSuccess = { userEmail ->
+                            if (userEmail == "superadmin@test.com") {
+                                navController.navigate("admin_dashboard") {
+                                    popUpTo("login") { inclusive = true }
+                                }
+                            } else {
+                                // Check if user is an LGU admin in Firestore
+                                val firestore = Firebase.firestore
+                                val auth = Firebase.auth
+                                val currentUser = auth.currentUser
+                                
+                                if (currentUser != null) {
+                                    firestore.collection("users").document(currentUser.uid).get()
+                                        .addOnSuccessListener { doc ->
+                                            val role = doc.getString("role") ?: "user"
+                                            if (role == "lgu_admin") {
+                                                // LGU Admins go to home, but we'll adapt home for them
+                                                navController.navigate("home") {
+                                                    popUpTo("login") { inclusive = true }
+                                                }
+                                            } else {
+                                                navController.navigate("home") {
+                                                    popUpTo("login") { inclusive = true }
+                                                }
+                                            }
+                                        }
+                                        .addOnFailureListener {
+                                            navController.navigate("home") {
+                                                popUpTo("login") { inclusive = true }
+                                            }
+                                        }
+                                } else {
+                                    navController.navigate("home") {
+                                        popUpTo("login") { inclusive = true }
+                                    }
+                                }
+                            }
+                        },
+                        onSignUpClick = {
+                            navController.navigate("signup")
                         },
                         onSupportClick = { /* TODO: Implement Support */ }
+                    )
+                }
+                composable("signup") {
+                    SignUpScreen(
+                        onSignUpSuccess = { navController.navigate("home") },
+                        onSignInClick = { navController.navigate("login") }
+                    )
+                }
+                composable("admin_dashboard") {
+                    AdminDashboardScreenNew(
+                        onLogout = {
+                            navController.navigate("login") {
+                                popUpTo("admin_dashboard") { inclusive = true }
+                            }
+                        },
+                        onSeeMoreUsers = {
+                            navController.navigate("all_users")
+                        },
+                        onViewDailyAnalytics = {
+                            navController.navigate("daily_analytics")
+                        },
+                        onViewUserGrowth = {
+                            navController.navigate("user_growth")
+                        },
+                        onManageAdmins = {
+                            navController.navigate("manage_admins")
+                        }
+                    )
+                }
+                composable("daily_analytics") {
+                    DailyRevenueAnalyticsScreen(
+                        onBack = {
+                            navController.popBackStack()
+                        }
+                    )
+                }
+                composable("user_growth") {
+                    UserGrowthAnalyticsScreen(
+                        onBack = {
+                            navController.popBackStack()
+                        }
+                    )
+                }
+                composable("manage_admins") {
+                    AdminManagementScreen(
+                        onBack = {
+                            navController.popBackStack()
+                        }
+                    )
+                }
+                composable("all_users") {
+                    AllUsersScreen(
+                        onBack = {
+                            navController.popBackStack()
+                        }
                     )
                 }
                 composable("home") {
@@ -130,38 +207,20 @@ class MainActivity : ComponentActivity() {
                         onSettings = { /* TODO: Settings */ },
                         onLogout = {
                             auth.signOut()
-                            
-                            // Sign out of Google to show account picker on next login
-                            val googleSignInClient = com.google.android.gms.auth.api.signin.GoogleSignIn.getClient(
-                                this@MainActivity,
-                                com.google.android.gms.auth.api.signin.GoogleSignInOptions.DEFAULT_SIGN_IN
-                            )
-                            googleSignInClient.signOut()
-                            
                             navController.navigate("login") {
                                 popUpTo("welcome") { inclusive = false }
                             }
                         },
                         onScanClick = { /* TODO: Scan from profile if needed, or remove */ },
                         onPremium = { navController.navigate("premium") },
-                        onVerifyFace = { navController.navigate("face_verification") }
-                    )
-                }
-                composable("face_verification") {
-                    FaceVerificationScreen(
-                        auth = auth,
-                        onBack = { navController.popBackStack() },
-                        onSuccess = { 
-                            // Pop back to profile
-                            navController.popBackStack()
-                        }
+                        onVerifyFace = { /* TODO: Face verification */ }
                     )
                 }
                 composable("premium") {
                     PremiumScreen(
                         onBack = { navController.popBackStack() },
-                        onVerifyPhone = { navController.navigate("profile") },
-                        onVerifyFace = { navController.navigate("face_verification") }
+                        onVerifyPhone = { /* TODO: Phone verification */ },
+                        onVerifyFace = { /* TODO: Face verification */ }
                     )
                 }
                 composable(

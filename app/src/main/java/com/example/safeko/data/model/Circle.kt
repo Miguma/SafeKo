@@ -6,6 +6,7 @@ data class Circle(
     val ownerId: String = "",
     val members: List<String> = emptyList(),
     val memberLimit: Int = 5,
+    val type: String = "Group", // "Group" (legacy "Duo" is unsupported)
     val createdAt: Long = System.currentTimeMillis(),
     val imageUrl: String? = null
 )

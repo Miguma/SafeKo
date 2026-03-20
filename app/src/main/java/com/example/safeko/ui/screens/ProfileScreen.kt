@@ -112,6 +112,7 @@ fun ProfileScreen(
 
     // Plan State
     var userPlan by remember { mutableStateOf("Loading...") }
+    var userRole by remember { mutableStateOf("user") }
     LaunchedEffect(Unit) {
         val uid = auth.currentUser?.uid
         if (uid != null) {
@@ -119,6 +120,7 @@ fun ProfileScreen(
                 val snapshot = Firebase.firestore.collection("users").document(uid).get().await()
                 if (snapshot.exists()) {
                     userPlan = snapshot.getString("plan") ?: "Free"
+                    userRole = snapshot.getString("role") ?: "user"
                     val fetchedPhone = snapshot.getString("phoneNumber")
                     if (!fetchedPhone.isNullOrBlank()) {
                         userPhoneNumber = fetchedPhone
@@ -565,7 +567,8 @@ fun ProfileScreen(
                         .padding(horizontal = 16.dp, vertical = 8.dp)
                         .clickable { 
                             if (!isPhoneVerified) {
-                                Toast.makeText(context, "Please verify your phone number first", Toast.LENGTH_SHORT).show()
+                                Toast.makeText(context, "Please verify your phone number in Edit Profile first", Toast.LENGTH_LONG).show()
+                                showEditProfile = true
                             } else {
                                 onVerifyFace() 
                             }
@@ -620,15 +623,13 @@ fun ProfileScreen(
             )
 
             ProfileMenuItem("Edit Profile", Icons.Outlined.Person) {
-                if (!isFaceVerified) {
-                    Toast.makeText(context, "You must be fully verified to edit your profile", Toast.LENGTH_SHORT).show()
-                } else {
-                    showEditProfile = true
-                }
+                showEditProfile = true
             }
             
-            ProfileMenuItem("Premium", Icons.Rounded.Star) { 
-                onPremium() 
+            if (userRole == "user") {
+                ProfileMenuItem("Premium", Icons.Rounded.Star) { 
+                    onPremium() 
+                }
             }
             ProfileMenuItem("What's new", Icons.Rounded.NewReleases) { 
                 Toast.makeText(context, "What's new feature coming soon", Toast.LENGTH_SHORT).show() 

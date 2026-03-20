@@ -213,7 +213,21 @@ fun ChatScreen(
             contentPadding      = PaddingValues(vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            items(messages, key = { it.id }) { msg ->
+            items(
+                count = messages.size,
+                key = { index -> messages[index].id }
+            ) { index ->
+                val msg = messages[index]
+                val showHeader = if (index == 0) {
+                    true
+                } else {
+                    (msg.timestamp - messages[index - 1].timestamp) > 3600000L
+                }
+
+                if (showHeader && msg.timestamp > 0) {
+                    ChatDateHeader(timestamp = msg.timestamp)
+                }
+
                 ChatBubble(msg, isMe = msg.senderId == currentUserId)
             }
         }
@@ -293,7 +307,8 @@ fun ChatScreen(
         ModalBottomSheet(
             onDismissRequest = { showOptions = false },
             containerColor   = SheetBg,
-            tonalElevation   = 0.dp
+            tonalElevation   = 0.dp,
+            dragHandle = { BottomSheetDefaults.DragHandle() }
         ) {
             Column(
                 modifier = Modifier
@@ -444,7 +459,8 @@ fun ChatScreen(
         ModalBottomSheet(
             onDismissRequest = { showMembers = false },
             containerColor   = SheetBg,
-            tonalElevation   = 0.dp
+            tonalElevation   = 0.dp,
+            dragHandle = { BottomSheetDefaults.DragHandle() }
         ) {
             Column(
                 modifier = Modifier
@@ -593,9 +609,43 @@ private fun MemberRow(
 
 // ── Message bubble ────────────────────────────────────────────
 
+fun formatDateHeader(timestamp: Long): String {
+    if (timestamp == 0L) return ""
+    val msgCal = java.util.Calendar.getInstance().apply { timeInMillis = timestamp }
+    val nowCal = java.util.Calendar.getInstance()
+    val timeStr = java.text.SimpleDateFormat("h:mm a", java.util.Locale.getDefault()).format(msgCal.time)
+    val isSameYear = msgCal.get(java.util.Calendar.YEAR) == nowCal.get(java.util.Calendar.YEAR)
+    val isSameWeek = isSameYear && msgCal.get(java.util.Calendar.WEEK_OF_YEAR) == nowCal.get(java.util.Calendar.WEEK_OF_YEAR)
+    return if (isSameWeek) {
+        val dayStr = java.text.SimpleDateFormat("EEE", java.util.Locale.getDefault()).format(msgCal.time).uppercase()
+        "$dayStr AT $timeStr"
+    } else if (isSameYear) {
+        val dateStr = java.text.SimpleDateFormat("MMM d", java.util.Locale.getDefault()).format(msgCal.time).uppercase()
+        "$dateStr AT $timeStr"
+    } else {
+        val dateStr = java.text.SimpleDateFormat("MMM d, yyyy", java.util.Locale.getDefault()).format(msgCal.time).uppercase()
+        "$dateStr AT $timeStr"
+    }
+}
+
+@Composable
+fun ChatDateHeader(timestamp: Long) {
+    Text(
+        text = formatDateHeader(timestamp),
+        color = TxtMuted,
+        fontSize = 11.sp,
+        fontWeight = FontWeight.Medium,
+        textAlign = TextAlign.Center,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 16.dp, bottom = 8.dp)
+    )
+}
+
 @Composable
 fun ChatBubble(message: Message, isMe: Boolean) {
     var profileUrl by remember(message.senderId) { mutableStateOf(message.senderProfileUrl) }
+    var showTimestamp by remember { mutableStateOf(false) }
 
     if (profileUrl == null && !isMe) {
         LaunchedEffect(message.senderId) {
@@ -662,7 +712,13 @@ fun ChatBubble(message: Message, isMe: Boolean) {
                     bottomStart = 18.dp,
                     bottomEnd   = 18.dp
                 ),
-                modifier = Modifier.widthIn(max = 260.dp)
+                modifier = Modifier
+                    .widthIn(max = 260.dp)
+                    .clickable(
+                        interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                        indication = null,
+                        onClick = { showTimestamp = !showTimestamp }
+                    )
             ) {
                 Text(
                     text     = message.text,
@@ -672,7 +728,7 @@ fun ChatBubble(message: Message, isMe: Boolean) {
                 )
             }
 
-            if (message.timestamp > 0) {
+            if (showTimestamp && message.timestamp > 0) {
                 Text(
                     text     = java.text.SimpleDateFormat("h:mm a", java.util.Locale.getDefault())
                                    .format(java.util.Date(message.timestamp)),

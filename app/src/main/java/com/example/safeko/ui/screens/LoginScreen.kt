@@ -8,9 +8,16 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -23,6 +30,9 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import com.example.safeko.R
 import com.google.android.gms.auth.api.signin.GoogleSignIn
@@ -37,12 +47,22 @@ import android.util.Log
 
 @Composable
 fun LoginScreen(
-    onLoginSuccess: () -> Unit,
-    onFacebookClick: () -> Unit,
+    onLoginSuccess: (String) -> Unit,
+    onSignUpClick: () -> Unit,
     onSupportClick: () -> Unit
 ) {
     val context = LocalContext.current
     val auth = Firebase.auth
+    val firestore = Firebase.firestore
+    
+    var email by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
+    var showPasswordField by remember { mutableStateOf(false) }
+    var isPasswordVisible by remember { mutableStateOf(false) }
+    var isLoading by remember { mutableStateOf(false) }
+    
+    // Check if this is a superadmin login attempt
+    val isSuperAdminEmail = email == "superadmin@test.com"
     
     // Configure Google Sign In
     val gso = remember {
@@ -69,22 +89,22 @@ fun LoginScreen(
                                     if (user != null) {
                                         val userData = hashMapOf(
                                             "uid" to user.uid,
-                                            "name" to (user.displayName ?: ""),
+                                            "fullName" to (user.displayName ?: ""),
                                             "email" to (user.email ?: ""),
-                                            "profilePhoto" to (user.photoUrl?.toString()),
-                                            "plan" to "Free"
+                                            "role" to "user",
+                                            "profilePhoto" to (user.photoUrl?.toString())
                                         )
                                         Firebase.firestore.collection("users").document(user.uid)
                                             .set(userData, SetOptions.merge())
                                             .addOnSuccessListener {
-                                                onLoginSuccess()
+                                                onLoginSuccess(user.email ?: "")
                                             }
                                             .addOnFailureListener { e ->
                                                 Log.e("Auth", "Error saving user data", e)
-                                                onLoginSuccess()
+                                                onLoginSuccess(user.email ?: "")
                                             }
                                     } else {
-                                        onLoginSuccess()
+                                        onLoginSuccess(auth.currentUser?.email ?: "")
                                     }
                                 } else {
                                     Log.e("Auth", "Authentication Failed", task.exception)
@@ -118,8 +138,8 @@ fun LoginScreen(
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .weight(0.55f) // Increase weight to push everything down
-                .padding(16.dp)
+                .weight(0.40f) // Increased weight to push things down a bit
+                .padding(top = 24.dp, start = 8.dp, end = 8.dp, bottom = 8.dp) // Added top padding
         ) {
             // This is a placeholder for the image frames collage
             // You can replace these Boxes with your actual Image composables later
@@ -131,8 +151,8 @@ fun LoginScreen(
             Box(
                 modifier = Modifier
                     .graphicsLayer { translationY = floatingOffset }
-                    .size(140.dp)
-                    .offset(x = (-20).dp, y = 20.dp)
+                    .size(100.dp)
+                    .offset(x = (-15).dp, y = 10.dp)
                     .clip(RoundedCornerShape(16.dp))
                     .background(Color.LightGray)
                     .border(2.dp, Color.White, RoundedCornerShape(16.dp))
@@ -151,9 +171,9 @@ fun LoginScreen(
             Box(
                 modifier = Modifier
                     .graphicsLayer { translationY = floatingOffset }
-                    .size(120.dp)
+                    .size(80.dp)
                     .align(Alignment.TopEnd)
-                    .offset(x = 20.dp, y = 60.dp)
+                    .offset(x = 15.dp, y = 40.dp)
                     .clip(RoundedCornerShape(16.dp))
                     .background(Color.LightGray)
                     .border(2.dp, Color.White, RoundedCornerShape(16.dp))
@@ -172,9 +192,9 @@ fun LoginScreen(
             Box(
                 modifier = Modifier
                     .graphicsLayer { translationY = floatingOffset }
-                    .size(140.dp)
+                    .size(100.dp)
                     .align(Alignment.BottomStart)
-                    .offset(x = (-10).dp, y = (-50).dp)
+                    .offset(x = (-10).dp, y = (-30).dp)
                     .clip(RoundedCornerShape(16.dp))
                     .background(Color.LightGray)
                     .border(2.dp, Color.White, RoundedCornerShape(16.dp))
@@ -193,9 +213,9 @@ fun LoginScreen(
             Box(
                 modifier = Modifier
                     .graphicsLayer { translationY = floatingOffset }
-                    .size(140.dp)
+                    .size(100.dp)
                     .align(Alignment.BottomEnd)
-                    .offset(x = 10.dp, y = (-30).dp)
+                    .offset(x = 10.dp, y = (-15).dp)
                     .clip(RoundedCornerShape(16.dp))
                     .background(Color.LightGray)
                     .border(2.dp, Color.White, RoundedCornerShape(16.dp))
@@ -214,7 +234,7 @@ fun LoginScreen(
             Box(
                 modifier = Modifier
                     .graphicsLayer { translationY = floatingOffset }
-                    .fillMaxWidth(0.4f)
+                    .fillMaxWidth(0.30f)
                     .aspectRatio(0.7f)
                     .align(Alignment.Center)
             ) {
@@ -233,9 +253,9 @@ fun LoginScreen(
             // Center Bottom Icon Frame (Owl/Logo placeholder)
             Box(
                 modifier = Modifier
-                    .size(120.dp)
+                    .size(80.dp)
                     .align(Alignment.BottomCenter)
-                    .offset(y = 60.dp) // Push logo down further to overlap properly
+                    .offset(y = 40.dp) // Push logo down further to overlap properly
                     .clip(CircleShape)
                     .background(Color.White)
             ) {
@@ -255,89 +275,338 @@ fun LoginScreen(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .weight(0.45f) // Decrease weight to balance
-                .padding(horizontal = 24.dp),
+                .weight(0.60f) 
+                .padding(horizontal = 24.dp, vertical = 8.dp)
+                .verticalScroll(rememberScrollState()),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Top
         ) {
-            Spacer(modifier = Modifier.height(40.dp)) // Add positive spacer to push text down
+            Spacer(modifier = Modifier.height(12.dp))
             
             Text(
-                text = "You’re never off the map",
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold,
-                color = Color.DarkGray
+                text = "You're never off the map",
+                style = MaterialTheme.typography.headlineMedium, // Slightly larger
+                fontWeight = FontWeight.ExtraBold, // Extra bold for impact
+                color = Color.Black
             )
             Text(
                 text = "Safety, right where you are",
-                style = MaterialTheme.typography.bodyMedium,
-                color = Color.Gray
+                style = MaterialTheme.typography.bodyMedium, // Slightly larger
+                color = Color(0xFF757575),
+                modifier = Modifier.padding(top = 4.dp)
             )
 
             Spacer(modifier = Modifier.height(24.dp))
 
-            // Google Button
-            OutlinedButton(
-                onClick = { launcher.launch(googleSignInClient.signInIntent) },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(50.dp),
-                shape = RoundedCornerShape(25.dp),
-                border = BorderStroke(1.dp, Color.LightGray)
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    // Google Icon
-                    Image(
-                        painter = painterResource(id = R.drawable.googleicontrans),
-                        contentDescription = "Google Icon",
-                        modifier = Modifier.size(24.dp)
-                    )
-                    Spacer(modifier = Modifier.width(12.dp))
-                    Text(text = "Continue with Google", color = Color.Black)
-                }
-            }
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            // Facebook Button
-            OutlinedButton(
-                onClick = onFacebookClick,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(50.dp),
-                shape = RoundedCornerShape(25.dp),
-                border = BorderStroke(1.dp, Color.LightGray)
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    // Facebook Icon
-                    Image(
-                        painter = painterResource(id = R.drawable.fbicon),
-                        contentDescription = "Facebook Icon",
-                        modifier = Modifier.size(24.dp)
-                    )
-                    Spacer(modifier = Modifier.width(12.dp))
-                    Text(text = "Continue with Facebook", color = Color.Black)
-                }
-            }
-
-            Spacer(modifier = Modifier.weight(1f))
-
-            // Footer Support Text
-            TextButton(onClick = onSupportClick) {
-                Text(
-                    text = "Can’t sign in? Please Contact ",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = Color.Gray
+            OutlinedTextField(
+                value = email,
+                onValueChange = { email = it.trim() },
+                modifier = Modifier.fillMaxWidth(),
+                placeholder = { Text("Email", color = Color(0xFFBDBDBD)) },
+                shape = RoundedCornerShape(12.dp), // More rounded
+                singleLine = true,
+                enabled = !showPasswordField,
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = Color(0xFF2962FF),
+                    unfocusedBorderColor = Color(0xFFE0E0E0)
                 )
+            )
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // Show password field for superadmin or registered users
+            if (isSuperAdminEmail) {
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    placeholder = { Text("Enter password", color = Color(0xFFBDBDBD)) },
+                    shape = RoundedCornerShape(12.dp),
+                    singleLine = true,
+                    visualTransformation = if (isPasswordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                    trailingIcon = {
+                        val icon = if (isPasswordVisible) Icons.Filled.VisibilityOff else Icons.Filled.Visibility
+                        IconButton(onClick = { isPasswordVisible = !isPasswordVisible }) {
+                            Icon(imageVector = icon, contentDescription = null, tint = Color(0xFF9E9E9E), modifier = Modifier.size(20.dp))
+                        }
+                    },
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = Color(0xFF2962FF),
+                        unfocusedBorderColor = Color(0xFFE0E0E0)
+                    )
+                )
+            } else if (showPasswordField) {
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    placeholder = { Text("Enter password", color = Color(0xFFBDBDBD)) },
+                    shape = RoundedCornerShape(12.dp),
+                    singleLine = true,
+                    visualTransformation = if (isPasswordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                    trailingIcon = {
+                        val icon = if (isPasswordVisible) Icons.Filled.VisibilityOff else Icons.Filled.Visibility
+                        IconButton(onClick = { isPasswordVisible = !isPasswordVisible }) {
+                            Icon(imageVector = icon, contentDescription = null, tint = Color(0xFF9E9E9E), modifier = Modifier.size(20.dp))
+                        }
+                    },
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = Color(0xFF2962FF),
+                        unfocusedBorderColor = Color(0xFFE0E0E0)
+                    )
+                )
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            Button(
+                onClick = {
+                    if (isSuperAdminEmail) {
+                        // Superadmin password login
+                        if (email.isBlank() || password.isBlank()) {
+                            Toast.makeText(context, "Please enter email and password", Toast.LENGTH_SHORT).show()
+                            return@Button
+                        }
+                        
+                        // Check hardcoded superadmin credentials
+                        if (password == "admin123") {
+                            isLoading = true
+                            Log.d("LoginScreen", "Attempting superadmin login: $email")
+                            // Authenticate with Firebase Auth
+                            auth.signInWithEmailAndPassword(email, password)
+                                .addOnCompleteListener { task ->
+                                    if (task.isSuccessful) {
+                                        Log.d("LoginScreen", "Superadmin auth successful, UID: ${auth.currentUser?.uid}")
+                                        val uid = auth.currentUser?.uid ?: "superadmin"
+                                        
+                                        // Create/update Firestore record for superadmin
+                                        val superadminData = hashMapOf(
+                                            "uid" to uid,
+                                            "fullName" to "Super Administrator",
+                                            "email" to email,
+                                            "role" to "superadmin",
+                                            "name" to "Super Administrator",
+                                            "createdAt" to System.currentTimeMillis()
+                                        )
+                                        Log.d("LoginScreen", "Saving superadmin to Firestore: $superadminData")
+                                        
+                                        firestore.collection("users")
+                                            .document(uid)
+                                            .set(superadminData, SetOptions.merge())
+                                            .addOnSuccessListener {
+                                                Log.d("LoginScreen", "✓ Superadmin data saved successfully")
+                                                isLoading = false
+                                                Toast.makeText(context, "Superadmin logged in successfully", Toast.LENGTH_SHORT).show()
+                                                onLoginSuccess(email)
+                                            }
+                                            .addOnFailureListener { error ->
+                                                Log.e("LoginScreen", "✗ Failed to save superadmin data: ${error.message}", error)
+                                                isLoading = false
+                                                Toast.makeText(context, "Error saving superadmin data: ${error.message}", Toast.LENGTH_SHORT).show()
+                                            }
+                                    } else {
+                                        Log.e("LoginScreen", "✗ Auth failed: ${task.exception?.message}")
+                                        isLoading = false
+                                        Toast.makeText(context, "Invalid superadmin credentials: ${task.exception?.message}", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                        } else {
+                            Toast.makeText(context, "Invalid password", Toast.LENGTH_SHORT).show()
+                        }
+                    } else if (!showPasswordField) {
+                        // Regular user: Check if email exists in database
+                        if (email.isBlank()) {
+                            Toast.makeText(context, "Please enter your email", Toast.LENGTH_SHORT).show()
+                            return@Button
+                        }
+                        
+                        isLoading = true
+                        // Check if email exists in users collection
+                        firestore.collection("users")
+                            .limit(1) // Just need to check existence
+                            .get()
+                            .addOnSuccessListener { _ ->
+                                // We have read access to the collection, now check the email
+                                firestore.collection("users")
+                                    .whereEqualTo("email", email)
+                                    .get()
+                                    .addOnSuccessListener { documents ->
+                                        isLoading = false
+                                        if (documents.isEmpty) {
+                                            // Email not found
+                                            Toast.makeText(context, "Email not found, please sign up", Toast.LENGTH_SHORT).show()
+                                            onSignUpClick()
+                                        } else {
+                                            // Email found, show password field
+                                            showPasswordField = true
+                                            password = ""
+                                        }
+                                    }
+                                    .addOnFailureListener { e ->
+                                        isLoading = false
+                                        Toast.makeText(context, "Error: ${e.message}", Toast.LENGTH_SHORT).show()
+                                    }
+                            }
+                            .addOnFailureListener { e ->
+                                // If we get permission denied here, it's likely a rules issue with collection-level queries
+                                // Fallback: Allow login attempt anyway, or handle specifically
+                                Log.w("LoginScreen", "Initial collection check failed: ${e.message}")
+                                
+                                // Alternative: Since we can't search THE WHOLE collection without a filter sometimes,
+                                // we just let the user try to log in with password if the first email check fails 
+                                // because of a simple 'PERMISSION_DENIED' on a filtered query.
+                                showPasswordField = true 
+                                isLoading = false
+                            }
+                    } else {
+                        // Regular user: Verify password
+                        if (password.isBlank()) {
+                            Toast.makeText(context, "Please enter password", Toast.LENGTH_SHORT).show()
+                            return@Button
+                        }
+                        
+                        isLoading = true
+                        auth.signInWithEmailAndPassword(email, password)
+                            .addOnCompleteListener { task ->
+                                isLoading = false
+                                if (task.isSuccessful) {
+                                    onLoginSuccess(email)
+                                } else {
+                                    Toast.makeText(context, "Invalid password", Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                            .addOnFailureListener { e ->
+                                isLoading = false
+                                Toast.makeText(context, "Login failed: ${e.message}", Toast.LENGTH_SHORT).show()
+                            }
+                    }
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(54.dp), // Slightly taller
+                shape = RoundedCornerShape(27.dp), // Pill shaped
+                enabled = !isLoading,
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2962FF))
+            ) {
                 Text(
-                    text = "Customer Support",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF4FC3F7),
+                    text = if (isSuperAdminEmail) {
+                        if (isLoading) "Signing in..." else "Sign In"
+                    } else if (!showPasswordField) {
+                        if (isLoading) "Checking email..." else "Continue"
+                    } else {
+                        if (isLoading) "Signing in..." else "Sign In"
+                    },
+                    color = Color.White,
+                    style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold
                 )
             }
-            
+
             Spacer(modifier = Modifier.height(16.dp))
+
+            // Add Sign Up Option for regular users only
+            if (!showPasswordField && !isSuperAdminEmail) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Don't have an account? ",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Color(0xFF757575)
+                    )
+                    Text(
+                        text = "Sign up",
+                        modifier = Modifier.clickable { onSignUpClick() },
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Color(0xFF03A9F4),
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+            }
+
+            // Back button when showing Password or for superadmin
+            if (showPasswordField || isSuperAdminEmail) {
+                TextButton(onClick = {
+                    showPasswordField = false
+                    password = ""
+                    email = ""
+                }, modifier = Modifier.padding(bottom = 12.dp)) {
+                    Text(text = "← Back to Email", color = Color(0xFF2962FF), fontWeight = FontWeight.Bold)
+                }
+            }
+
+            // Show divider and Google only for regular users (not when showing password)
+            if (!isSuperAdminEmail && !showPasswordField) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    HorizontalDivider(modifier = Modifier.weight(1f), color = Color(0xFFEEEEEE), thickness = 1.dp)
+                    Text(text = "OR", color = Color(0xFFBDBDBD), modifier = Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.bodySmall)
+                    HorizontalDivider(modifier = Modifier.weight(1f), color = Color(0xFFEEEEEE), thickness = 1.dp)
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // Google Button
+                OutlinedButton(
+                    onClick = { 
+                        googleSignInClient.signOut().addOnCompleteListener {
+                            launcher.launch(googleSignInClient.signInIntent)
+                        }
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(54.dp),
+                    shape = RoundedCornerShape(27.dp),
+                    border = BorderStroke(1.dp, Color(0xFFE0E0E0))
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Image(
+                            painter = painterResource(id = R.drawable.googleicontrans),
+                            contentDescription = "Google Icon",
+                            modifier = Modifier.size(24.dp)
+                        )
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Text(
+                            text = "Continue with Google", 
+                            color = Color.Black,
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(24.dp))
+            }
+
+            // Footer Support Text (only for regular users)
+            if (!isSuperAdminEmail) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Can't sign in? ",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Color(0xFF757575)
+                    )
+                    Text(
+                        text = "Customer Support",
+                        modifier = Modifier.clickable { onSupportClick() },
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Color(0xFF03A9F4),
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+            
+            Spacer(modifier = Modifier.height(32.dp))
         }
     }
 }

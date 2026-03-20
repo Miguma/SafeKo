@@ -82,6 +82,7 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -93,6 +94,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.compose.ui.window.DialogWindowProvider
 import coil.compose.AsyncImage
+import coil.imageLoader
 import coil.request.ImageRequest
 import coil.transform.CircleCropTransformation
 import androidx.compose.ui.layout.ContentScale
@@ -113,6 +115,10 @@ import com.google.firebase.firestore.ktx.firestore
 import com.google.firebase.ktx.Firebase
 import com.google.firebase.storage.FirebaseStorage
 import com.google.firebase.auth.UserProfileChangeRequest
+import com.google.firebase.database.DataSnapshot
+import com.google.firebase.database.DatabaseError
+import com.google.firebase.database.FirebaseDatabase
+import com.google.firebase.database.ValueEventListener
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -166,8 +172,23 @@ data class CircleMember(
     val uid: String,
     val name: String,
     val profilePhoto: String?,
-    val sharedCircles: List<String>
+    val sharedCircles: List<String>,
+    val lastLat: Double? = null,
+    val lastLon: Double? = null,
+    val lastActive: Long? = null
 )
+
+fun formatLastActive(timestamp: Long?): String {
+    if (timestamp == null || timestamp == 0L) return "Never seen"
+    val diffMs = System.currentTimeMillis() - timestamp
+    val diffMin = diffMs / 60_000
+    return when {
+        diffMin < 2   -> "Online now"
+        diffMin < 60  -> "${diffMin}m ago"
+        diffMin < 1440 -> "${diffMin / 60}h ago"
+        else          -> "${diffMin / 1440}d ago"
+    }
+}
 
 // Helper to find Activity
 fun Context.findActivity(): Activity? = when (this) {
@@ -229,31 +250,45 @@ fun HomeScreen(navController: NavController) {
     val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
     val keyboardController = LocalSoftwareKeyboardController.current
+
+    // Updated to Asia Southeast 1 (Singapore)
+    val rtdbBaseUrl = "https://safeko-3ca46-default-rtdb.asia-southeast1.firebasedatabase.app"
+
     val auth = remember { Firebase.auth }
 
-    // User Plan State
+    // User Plan State — real-time listener so downgrades take effect immediately
     var userPlan by remember { mutableStateOf("Loading...") }
-    LaunchedEffect(Unit) {
+    var userRole by remember { mutableStateOf("user") }
+    var userDepartment by remember { mutableStateOf("") }
+    var showGlobalOverview by remember { mutableStateOf(false) }
+
+    DisposableEffect(Unit) {
         val uid = auth.currentUser?.uid
-        if (uid != null) {
-             try {
-                val snapshot = Firebase.firestore.collection("users").document(uid).get().await()
-                if (snapshot.exists()) {
-                    userPlan = snapshot.getString("plan") ?: "Free"
-                    
-                    // Silent Sync: If Firestore missing name but Firebase Auth has it, set it
-                    val dbName = snapshot.getString("name")
-                    val authName = auth.currentUser?.displayName
-                    if (dbName.isNullOrBlank() && !authName.isNullOrBlank()) {
-                        Firebase.firestore.collection("users").document(uid).update("name", authName)
+        val registration = if (uid != null) {
+            Firebase.firestore.collection("users").document(uid)
+                .addSnapshotListener { snapshot, _ ->
+                    if (snapshot != null && snapshot.exists()) {
+                        userPlan = snapshot.getString("plan") ?: "Free"
+                        userRole = snapshot.getString("role") ?: "user"
+                        userDepartment = snapshot.getString("department") ?: ""
+
+                        // Auto-grant OWL+ to Admins and LGUs
+                        if ((userRole == "admin" || userRole == "superadmin" || userRole == "lgu_admin") && userPlan != "OWL+") {
+                            userPlan = "OWL+"
+                        }
+
+                        // Silent Sync: If Firestore missing name but Firebase Auth has it, set it
+                        val dbName = snapshot.getString("name")
+                        val authName = Firebase.auth.currentUser?.displayName
+                        if (dbName.isNullOrBlank() && !authName.isNullOrBlank()) {
+                            Firebase.firestore.collection("users").document(uid).update("name", authName)
+                        }
+                    } else {
+                        userPlan = "Free"
                     }
-                } else {
-                     userPlan = "Free"
                 }
-            } catch (e: Exception) {
-                userPlan = "Error"
-            }
-        }
+        } else null
+        onDispose { registration?.remove() }
     }
 
     // Service Binding
@@ -299,6 +334,7 @@ fun HomeScreen(navController: NavController) {
     var showLinkJoinDialog by remember { mutableStateOf(false) }
     var isCreatingCircle by remember { mutableStateOf(false) }
     var userCircles by remember { mutableStateOf<List<Circle>>(emptyList()) }
+    var ownedGroupCount by remember { mutableIntStateOf(0) }
     var selectedCircle by remember { mutableStateOf<Circle?>(null) }
     
     LaunchedEffect(Unit) {
@@ -314,7 +350,15 @@ fun HomeScreen(navController: NavController) {
                      .addSnapshotListener { snapshot, e ->
                          if (e != null) return@addSnapshotListener
                          if (snapshot != null) {
-                             userCircles = snapshot.toObjects(Circle::class.java)
+                             val allCircles = snapshot.toObjects(Circle::class.java)
+                             var gCount = 0
+                             for (c in allCircles) {
+                                 if (c.ownerId == uid) {
+                                     if (c.type != "Duo") gCount++
+                                 }
+                             }
+                             ownedGroupCount = gCount
+                             userCircles = allCircles.filter { circle -> circle.type != "Duo" }
                          }
                      }
              } catch (e: Exception) {
@@ -329,6 +373,68 @@ fun HomeScreen(navController: NavController) {
     var alerts by remember { mutableStateOf<Map<String, RemoteAlert>>(emptyMap()) }
     var selectedAlert by remember { mutableStateOf<RemoteAlert?>(null) }
     var showAlertDetails by remember { mutableStateOf(false) }
+
+    // Unified Alert listener (Realtime)
+    LaunchedEffect(userRole, userDepartment) {
+        val database = FirebaseDatabase.getInstance(rtdbBaseUrl)
+        val alertsRef = database.getReference("alerts")
+
+        val listener = object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                val newAlerts = mutableMapOf<String, RemoteAlert>()
+                for (alertSnapshot in snapshot.children) {
+                    val id = alertSnapshot.key ?: continue
+                    val type = alertSnapshot.child("type").getValue(String::class.java) ?: ""
+                    
+                    // Filter alerts for LGU Admins
+                    if (userRole == "lgu_admin") {
+                        val isRelevant = when (userDepartment) {
+                            "Firestation", "Fire" -> type == "Fire Emergency"
+                            "Rescue" -> type == "Emergency Rescue" || type == "Road Accident"
+                            "Medical" -> type == "Emergency Rescue"
+                            else -> true
+                        }
+                        if (!isRelevant) continue
+                    }
+
+                    val lat = alertSnapshot.child("lat").getValue(Double::class.java) ?: 0.0
+                    val lon = alertSnapshot.child("lon").getValue(Double::class.java) ?: 0.0
+                    val status = alertSnapshot.child("status").getValue(String::class.java) ?: "pending"
+                    val userName = alertSnapshot.child("userName").getValue(String::class.java)
+                    val userPhotoUrl = alertSnapshot.child("userPhotoUrl").getValue(String::class.java)
+                    val userId = alertSnapshot.child("userId").getValue(String::class.java)
+                    val timestamp = alertSnapshot.child("timestamp").getValue(Long::class.java) ?: 0L
+                    val address = alertSnapshot.child("address").getValue(String::class.java) ?: ""
+                    val photoBase64 = alertSnapshot.child("photoBase64").getValue(String::class.java) ?: ""
+                    val details = alertSnapshot.child("details").getValue(String::class.java) ?: ""
+                    val phoneNumber = alertSnapshot.child("phoneNumber").getValue(String::class.java) ?: ""
+                    val notes = alertSnapshot.child("notes").getValue(String::class.java) ?: ""
+
+                    newAlerts[id] = RemoteAlert(
+                        id = id,
+                        type = type,
+                        lat = lat,
+                        lon = lon,
+                        status = status,
+                        userName = userName,
+                        userPhotoUrl = userPhotoUrl,
+                        userId = userId,
+                        timestamp = timestamp,
+                        address = address,
+                        photoBase64 = photoBase64,
+                        details = details,
+                        notes = notes
+                    )
+                }
+                alerts = newAlerts
+            }
+
+            override fun onCancelled(error: DatabaseError) {
+                Log.e("HomeScreen", "Alerts listener cancelled", error.toException())
+            }
+        }
+        alertsRef.addValueEventListener(listener)
+    }
 
     // Sync with Service
     val serviceIsNavigating by navigationService?.isNavigating?.collectAsState(initial = false) ?: mutableStateOf(false)
@@ -716,6 +822,14 @@ fun HomeScreen(navController: NavController) {
     // Sync is handled by LaunchedEffect above.
 
 
+    // Circle Members - global state fetched in background every 15 seconds
+    var circleMembers by remember { mutableStateOf<List<CircleMember>>(emptyList()) }
+    var isLoadingMembers by remember { mutableStateOf(false) }
+
+    // Member Tap Popup State
+    var selectedMemberOnMap by remember { mutableStateOf<CircleMember?>(null) }
+    var selectedMemberAddress by remember { mutableStateOf("") }
+
     // Bottom Sheet State
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     var showBottomSheet by remember { mutableStateOf(false) }
@@ -891,9 +1005,6 @@ fun HomeScreen(navController: NavController) {
         }
     }
 
-    // Updated to Asia Southeast 1 (Singapore)
-    val rtdbBaseUrl = "https://safeko-3ca46-default-rtdb.asia-southeast1.firebasedatabase.app"
-
     // Helper to get Bitmap from Drawable resource
     fun getBitmap(resId: Int): Bitmap {
         val drawable = ContextCompat.getDrawable(context, resId)
@@ -907,6 +1018,65 @@ fun HomeScreen(navController: NavController) {
             drawable.setBounds(0, 0, canvas.width, canvas.height)
             drawable.draw(canvas)
             b
+        }
+    }
+
+    // Helper to create smooth colored dot bitmaps for alert markers
+    fun createColoredDot(color: Int, size: Int = 64): Bitmap {
+        val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        val radius = size / 2f
+
+        val glowPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+        glowPaint.shader = android.graphics.RadialGradient(
+            radius,
+            radius,
+            radius,
+            intArrayOf(
+                android.graphics.Color.argb(80, android.graphics.Color.red(color), android.graphics.Color.green(color), android.graphics.Color.blue(color)),
+                android.graphics.Color.TRANSPARENT
+            ),
+            floatArrayOf(0.0f, 1.0f),
+            android.graphics.Shader.TileMode.CLAMP
+        )
+        canvas.drawCircle(radius, radius, radius, glowPaint)
+
+        val ringPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+        ringPaint.style = android.graphics.Paint.Style.STROKE
+        ringPaint.strokeWidth = size * 0.08f
+        ringPaint.color = android.graphics.Color.WHITE
+        canvas.drawCircle(radius, radius, radius * 0.55f, ringPaint)
+
+        val dotPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+        dotPaint.color = color
+        canvas.drawCircle(radius, radius, radius * 0.42f, dotPaint)
+
+        return bitmap
+    }
+
+    suspend fun markAlertResolved(alertId: String, token: String?) {
+        withContext(Dispatchers.IO) {
+            val authParam = if (token != null) "?auth=$token" else ""
+            val url = URL("$rtdbBaseUrl/alerts/$alertId.json$authParam")
+            val connection = (url.openConnection() as HttpURLConnection).apply {
+                requestMethod = "PATCH"
+                connectTimeout = 5000
+                readTimeout = 5000
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json")
+            }
+
+            try {
+                val payload = JSONObject()
+                    .put("status", "resolved")
+                    .put("resolvedAt", System.currentTimeMillis())
+                connection.outputStream.use { it.write(payload.toString().toByteArray()) }
+                connection.inputStream.close()
+            } catch (e: Exception) {
+                Log.e("HomeScreen", "Failed to auto-resolve alert $alertId", e)
+            } finally {
+                connection.disconnect()
+            }
         }
     }
 
@@ -954,7 +1124,15 @@ fun HomeScreen(navController: NavController) {
                     val userName = obj.optString("userName", null)
                     val userPhotoUrl = obj.optString("userPhotoUrl", null)
                     val timestamp = obj.optLong("timestamp", 0L)
-                    val status = obj.optString("status", "active")
+                    var status = obj.optString("status", "active")
+                    val maxAgeMs = 24L * 60L * 60L * 1000L
+                    if (timestamp > 0L && status != "resolved") {
+                        val ageMs = System.currentTimeMillis() - timestamp
+                        if (ageMs >= maxAgeMs) {
+                            markAlertResolved(id, token)
+                            status = "resolved"
+                        }
+                    }
 
                     if (type.isNotBlank() && !lat.isNaN() && !lon.isNaN()) {
                         result[id] = RemoteAlert(
@@ -990,29 +1168,199 @@ fun HomeScreen(navController: NavController) {
         }
     }
 
-    // Polling Alerts
-    LaunchedEffect(Unit) {
+    // Background loop: fetch circle member profiles & locations every 15 seconds
+    // Free-tier users cannot see other users on the map — members list stays empty.
+    LaunchedEffect(userCircles, userPlan) {
+        while (true) {
+            if (userPlan == "Free" || userPlan == "Loading...") {
+                // Free plan: clear any existing markers and skip fetching
+                circleMembers = emptyList()
+            } else if (userCircles.isEmpty()) {
+                circleMembers = emptyList()
+            } else {
+                isLoadingMembers = circleMembers.isEmpty() // show spinner only on first load
+                val currentUid = auth.currentUser?.uid
+                if (currentUid != null) {
+                    val membersMap = mutableMapOf<String, MutableList<String>>()
+                    userCircles.forEach { circle ->
+                        circle.members.forEach { uid ->
+                            if (uid != currentUid) {
+                                membersMap.getOrPut(uid) { mutableListOf() }.add(circle.name)
+                            }
+                        }
+                    }
+                    val fetchedMembers = mutableListOf<CircleMember>()
+                    for ((uid, sharedNames) in membersMap) {
+                        try {
+                            val doc = withContext(Dispatchers.IO) {
+                                Firebase.firestore.collection("users").document(uid).get().await()
+                            }
+                            val name = doc.getString("name") ?: "Unknown User"
+                            val profilePhoto = doc.getString("profilePhoto")
+                            val lastLat = doc.getDouble("lastLat")
+                            val lastLon = doc.getDouble("lastLon")
+                            val lastActive = doc.getLong("lastActive")
+                            fetchedMembers.add(CircleMember(uid, name, profilePhoto, sharedNames, lastLat, lastLon, lastActive))
+                        } catch (e: Exception) {
+                            Log.e("HomeScreen", "Error fetching member $uid", e)
+                        }
+                    }
+                    circleMembers = fetchedMembers.sortedBy { it.name }
+                }
+                isLoadingMembers = false
+            }
+            delay(15_000)
+        }
+    }
+
+    // Background loop: upload own location and lastActive to Firestore every 15 seconds
+    LaunchedEffect(isMapReady) {
+        if (!isMapReady) return@LaunchedEffect
+        while (true) {
+            delay(15_000)
+            val currentUid = auth.currentUser?.uid ?: continue
+            val loc = mapLibreMap?.locationComponent?.lastKnownLocation ?: continue
+            try {
+                withContext(Dispatchers.IO) {
+                    Firebase.firestore.collection("users").document(currentUid)
+                        .update(
+                            mapOf(
+                                "lastLat" to loc.latitude,
+                                "lastLon" to loc.longitude,
+                                "lastActive" to System.currentTimeMillis()
+                            )
+                        ).await()
+                }
+            } catch (e: Exception) {
+                Log.e("HomeScreen", "Error uploading own location", e)
+            }
+        }
+    }
+
+    // Polling Alerts (Filter for LGU Admin)
+    LaunchedEffect(userRole, userDepartment) {
         while (true) {
             val fetchedAlerts = fetchAlerts()
             
+            // Filter alerts for LGU Admins
+            val filteredAlerts = if (userRole == "lgu_admin") {
+                fetchedAlerts.filter { (_, alert) ->
+                    when (userDepartment) {
+                        "Firestation", "Fire" -> alert.type == "Fire Emergency"
+                        "Rescue" -> alert.type == "Emergency Rescue" || alert.type == "Road Accident"
+                        "Medical" -> alert.type == "Emergency Rescue"
+                        else -> true
+                    }
+                }
+            } else {
+                fetchedAlerts
+            }
+
             // Perform comparison on background thread
             val hasChanged = withContext(Dispatchers.Default) {
-                fetchedAlerts != alerts
+                filteredAlerts != alerts
             }
 
             if (hasChanged) {
-                alerts = fetchedAlerts
+                alerts = filteredAlerts
             }
 
             delay(5000)
         }
     }
 
+    // Update Map Markers when circle members change or map becomes ready
+    LaunchedEffect(circleMembers, isMapReady) {
+        if (!isMapReady) return@LaunchedEffect
+
+        // Build features and load profile images on IO
+        val features = withContext(Dispatchers.IO) {
+            circleMembers
+                .filter { it.lastLat != null && it.lastLon != null }
+                .map { member ->
+                    // Load and crop profile photo to a circle
+                    val iconKey = "member-icon-${member.uid}"
+                    val photoBitmap: Bitmap? = if (member.profilePhoto != null) {
+                        try {
+                            val request = ImageRequest.Builder(context)
+                                .data(member.profilePhoto)
+                                .allowHardware(false)
+                                .size(56, 56)
+                                .build()
+                            val result = context.imageLoader.execute(request)
+                            (result.drawable as? android.graphics.drawable.BitmapDrawable)?.bitmap
+                        } catch (e: Exception) {
+                            null
+                        }
+                    } else null
+
+                    // Create circular bitmap with border
+                    val size = 56
+                    val output = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+                    val canvas = Canvas(output)
+                    val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+                    val borderPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+                    borderPaint.color = android.graphics.Color.WHITE
+                    val centerF = size / 2f
+                    val radiusF = centerF
+                    canvas.drawCircle(centerF, centerF, radiusF, borderPaint)
+
+                    if (photoBitmap != null) {
+                        val scaledBitmap = Bitmap.createScaledBitmap(photoBitmap, size - 8, size - 8, true)
+                        val innerPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+                        val shader = android.graphics.BitmapShader(
+                            scaledBitmap,
+                            android.graphics.Shader.TileMode.CLAMP,
+                            android.graphics.Shader.TileMode.CLAMP
+                        )
+                        innerPaint.shader = shader
+                        canvas.drawCircle(centerF, centerF, radiusF - 4, innerPaint)
+                    } else {
+                        // Fallback: colored circle with initial letter
+                        paint.color = android.graphics.Color.parseColor("#FF9800")
+                        canvas.drawCircle(centerF, centerF, radiusF - 4, paint)
+                        val textPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+                        textPaint.color = android.graphics.Color.WHITE
+                        textPaint.textSize = 36f
+                        textPaint.textAlign = android.graphics.Paint.Align.CENTER
+                        textPaint.typeface = android.graphics.Typeface.DEFAULT_BOLD
+                        val textY = centerF - (textPaint.descent() + textPaint.ascent()) / 2
+                        canvas.drawText(member.name.take(1).uppercase(), centerF, textY, textPaint)
+                    }
+
+                    Triple(member, iconKey, output)
+                }
+        }
+
+        mapLibreMap?.getStyle { style ->
+            val featureList = mutableListOf<Feature>()
+            for ((member, iconKey, bitmap) in features) {
+                // Register icon image (replace if already exists)
+                if (style.getImage(iconKey) == null) {
+                    style.addImage(iconKey, bitmap)
+                } else {
+                    style.removeImage(iconKey)
+                    style.addImage(iconKey, bitmap)
+                }
+                val point = Point.fromLngLat(member.lastLon!!, member.lastLat!!)
+                val feature = Feature.fromGeometry(point)
+                feature.addStringProperty("uid", member.uid)
+                feature.addStringProperty("name", member.name)
+                feature.addStringProperty("member-icon", iconKey)
+                featureList.add(feature)
+            }
+            val source = style.getSourceAs<GeoJsonSource>("members-source")
+            source?.setGeoJson(FeatureCollection.fromFeatures(featureList))
+        }
+    }
+
     // Update Map Markers when alerts change or map becomes ready
     LaunchedEffect(alerts, isMapReady) {
-        if (isMapReady && alerts.isNotEmpty()) {
+        if (!isMapReady) return@LaunchedEffect
+
+        val features = if (alerts.isNotEmpty()) {
             // Prepare features on background thread
-            val features = withContext(Dispatchers.Default) {
+            withContext(Dispatchers.Default) {
                 alerts.values.filter { it.status != "resolved" }.map { alert ->
                     val point = Point.fromLngLat(alert.lon, alert.lat)
                     val feature = Feature.fromGeometry(point)
@@ -1030,13 +1378,13 @@ fun HomeScreen(navController: NavController) {
                     feature
                 }
             }
+        } else {
+            emptyList()
+        }
 
-            mapLibreMap?.getStyle { style ->
-                val source = style.getSourceAs<GeoJsonSource>("alerts-source")
-                if (source != null) {
-                    source.setGeoJson(FeatureCollection.fromFeatures(features))
-                }
-            }
+        mapLibreMap?.getStyle { style ->
+            val source = style.getSourceAs<GeoJsonSource>("alerts-source")
+            source?.setGeoJson(FeatureCollection.fromFeatures(features))
         }
     }
 
@@ -1242,7 +1590,7 @@ fun HomeScreen(navController: NavController) {
         }
     }
 
-    fun updateAlert(id: String, details: String, photoBase64: String?) {
+    fun updateAlert(id: String, details: String, photoBase64: String?, phoneNumber: String = "") {
         scope.launch(Dispatchers.IO) {
             val token = try {
                 auth.currentUser?.getIdToken(false)?.await()?.token
@@ -1255,6 +1603,7 @@ fun HomeScreen(navController: NavController) {
             val body = JSONObject().apply {
                 if (details.isNotBlank()) put("details", details)
                 if (!photoBase64.isNullOrBlank()) put("photoBase64", photoBase64)
+                if (phoneNumber.isNotBlank()) put("phoneNumber", phoneNumber)
             }.toString()
 
             val url = URL("$rtdbBaseUrl/alerts/$id.json$authParam")
@@ -1376,28 +1725,30 @@ fun HomeScreen(navController: NavController) {
                                         context.assets.open("style_3d.json").bufferedReader()
                                             .use { it.readText() }
                                     map.setStyle(Style.Builder().fromJson(styleJson)) { style ->
-                                        // Add Images for SymbolLayer
+                                        // Add Images for SymbolLayer - Use colored dots for alerts
                                         style.addImage(
                                             "icon-fire",
-                                            getBitmap(com.example.safeko.R.drawable.ic_fire_emergency)
+                                            createColoredDot(android.graphics.Color.parseColor("#FF6F00"), 64) // Orange for Fire
                                         )
                                         style.addImage(
                                             "icon-accident",
-                                            getBitmap(com.example.safeko.R.drawable.ic_road_accident)
+                                            createColoredDot(android.graphics.Color.parseColor("#F9A825"), 72) // Darker amber for better contrast
                                         )
                                         style.addImage(
                                             "icon-rescue",
-                                            getBitmap(com.example.safeko.R.drawable.ic_emergency_rescue)
+                                            createColoredDot(android.graphics.Color.parseColor("#E53935"), 64) // Red for Medical
                                         )
-
                                         // Add Source and Layer for Alerts
                                         style.addSource(GeoJsonSource("alerts-source"))
                                         style.addLayer(
                                             SymbolLayer("alerts-layer", "alerts-source")
                                                 .withProperties(
                                                     PropertyFactory.iconImage("{icon-image}"),
-                                                    PropertyFactory.iconAnchor(Property.ICON_ANCHOR_BOTTOM),
+                                                    PropertyFactory.iconAnchor(Property.ICON_ANCHOR_CENTER),
                                                     PropertyFactory.iconAllowOverlap(true),
+                                                    PropertyFactory.iconIgnorePlacement(true),
+                                                    PropertyFactory.iconRotationAlignment(Property.ICON_ROTATION_ALIGNMENT_VIEWPORT),
+                                                    PropertyFactory.iconPitchAlignment(Property.ICON_PITCH_ALIGNMENT_VIEWPORT),
                                                     PropertyFactory.iconSize(1.0f)
                                                 )
                                         )
@@ -1411,6 +1762,21 @@ fun HomeScreen(navController: NavController) {
                                                     PropertyFactory.circleRadius(8f),
                                                     PropertyFactory.circleStrokeColor(android.graphics.Color.WHITE),
                                                     PropertyFactory.circleStrokeWidth(2f)
+                                                )
+                                        )
+
+                                        // Add Source and Layer for Circle Members (profile photos)
+                                        style.addSource(GeoJsonSource("members-source"))
+                                        style.addLayer(
+                                            SymbolLayer("members-layer", "members-source")
+                                                .withProperties(
+                                                    PropertyFactory.iconImage("{member-icon}"),
+                                                    PropertyFactory.iconSize(1.0f),
+                                                    PropertyFactory.iconAllowOverlap(true),
+                                                    PropertyFactory.iconIgnorePlacement(true),
+                                                    PropertyFactory.iconRotationAlignment(Property.ICON_ROTATION_ALIGNMENT_VIEWPORT),
+                                                    PropertyFactory.iconPitchAlignment(Property.ICON_PITCH_ALIGNMENT_VIEWPORT),
+                                                    PropertyFactory.iconAnchor(Property.ICON_ANCHOR_CENTER)
                                                 )
                                         )
 
@@ -1442,7 +1808,33 @@ fun HomeScreen(navController: NavController) {
                                                 val screenPoint =
                                                     map.projection.toScreenLocation(point)
 
-                                                // 1. Check Search Results
+                                                // 1. Check Member Markers
+                                                val memberFeatures = map.queryRenderedFeatures(
+                                                    screenPoint,
+                                                    "members-layer"
+                                                )
+                                                if (memberFeatures.isNotEmpty()) {
+                                                    val uid = memberFeatures[0].getStringProperty("uid")
+                                                    val tappedMember = circleMembers.find { it.uid == uid }
+                                                    if (tappedMember != null) {
+                                                        selectedMemberOnMap = tappedMember
+                                                        selectedMemberAddress = "Fetching location..."
+                                                        // Reverse-geocode on background
+                                                        scope.launch {
+                                                            val addr = try {
+                                                                if (tappedMember.lastLat != null && tappedMember.lastLon != null) {
+                                                                    PlaceSearcher.reverseGeocode(tappedMember.lastLat, tappedMember.lastLon)
+                                                                } else ""
+                                                            } catch (e: Exception) { "" }
+                                                            selectedMemberAddress = if (addr.isNotBlank()) addr
+                                                            else if (tappedMember.lastLat != null) "${tappedMember.lastLat}, ${tappedMember.lastLon}"
+                                                            else "Location unknown"
+                                                        }
+                                                    }
+                                                    return@addOnMapClickListener true
+                                                }
+
+                                                // 2. Check Search Results
                                                 val searchFeatures = map.queryRenderedFeatures(
                                                     screenPoint,
                                                     "search-result-layer"
@@ -1825,10 +2217,26 @@ fun HomeScreen(navController: NavController) {
                                 )
                             }
 
-                            // Spacer for Floating Alert Button
-                            Spacer(modifier = Modifier.width(56.dp))
+                            // 3. Admin Overview (Admin Only)
+                            if (userRole == "admin" || userRole == "superadmin" || userRole == "lgu_admin") {
+                                IconButton(
+                                    onClick = { showGlobalOverview = true }
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.Dashboard,
+                                        contentDescription = "Admin Overview",
+                                        tint = Color.Gray,
+                                        modifier = Modifier.size(28.dp)
+                                    )
+                                }
+                            }
 
-                            // 3. Notifications
+                            // Spacer for Floating Alert Button (only for non-admins)
+                            if (userRole != "lgu_admin" && userRole != "superadmin" && userRole != "admin") {
+                                Spacer(modifier = Modifier.width(56.dp))
+                            }
+
+                            // 4. Notifications
                             IconButton(
                                 onClick = { showNotifications = true },
                                 modifier = Modifier.onGloballyPositioned { coordinates ->
@@ -1859,9 +2267,19 @@ fun HomeScreen(navController: NavController) {
                                 }
                             }
 
-                            // 4. Family
+                            // 5. Family
                             IconButton(
-                                onClick = { showGroupSheet = true },
+                                onClick = {
+                                    if (userPlan == "Free") {
+                                        Toast.makeText(
+                                            context,
+                                            "Map tracking is a premium feature. Upgrade your plan to see members on the map.",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                    } else {
+                                        showGroupSheet = true
+                                    }
+                                },
                                 modifier = Modifier.onGloballyPositioned { coordinates ->
                                     val position = coordinates.positionInRoot()
                                     val size = coordinates.size
@@ -1874,7 +2292,7 @@ fun HomeScreen(navController: NavController) {
                                 Icon(
                                     imageVector = Icons.Rounded.Group, // Family/Group Icon
                                     contentDescription = "Family",
-                                    tint = Color.Gray,
+                                    tint = if (userPlan == "Free") Color(0xFFBDBDBD) else Color.Gray,
                                     modifier = Modifier.size(28.dp)
                                 )
                             }
@@ -1884,132 +2302,134 @@ fun HomeScreen(navController: NavController) {
                     // Center Floating Alert Button (Overlapping)
                     val buttonScale = remember { Animatable(1f) }
 
-                    Box(
-                        modifier = Modifier
-                            .align(Alignment.BottomCenter)
-                            .offset(y = (-36).dp)
-                            .scale(buttonScale.value)
-                            .size(72.dp)
-                            .shadow(8.dp, CircleShape)
-                            .clip(CircleShape)
-                            .background(Color(0xFFFF9800))
-                            .onGloballyPositioned { coordinates ->
-                                val position = coordinates.positionInRoot()
-                                val size = coordinates.size
-                                alertButtonRect = Rect(
-                                    offset = position,
-                                    size = Size(size.width.toFloat(), size.height.toFloat())
-                                )
-                            }
-                            .pointerInput(Unit) {
-                                awaitPointerEventScope {
-                                    while (true) {
-                                        val down = awaitFirstDown(requireUnconsumed = false)
-                                        
-                                        // Start bloating animation
-                                        val animationJob = scope.launch {
-                                            buttonScale.animateTo(
-                                                targetValue = 1.5f, // Bloat to 150%
-                                                animationSpec = tween(durationMillis = 500, easing = LinearEasing)
-                                            )
-                                        }
+                    if (userRole != "lgu_admin" && userRole != "superadmin") {
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .offset(y = (-36).dp)
+                                .scale(buttonScale.value)
+                                .size(72.dp)
+                                .shadow(8.dp, CircleShape)
+                                .clip(CircleShape)
+                                .background(Color(0xFFFF9800))
+                                .onGloballyPositioned { coordinates ->
+                                    val position = coordinates.positionInRoot()
+                                    val size = coordinates.size
+                                    alertButtonRect = Rect(
+                                        offset = position,
+                                        size = Size(size.width.toFloat(), size.height.toFloat())
+                                    )
+                                }
+                                .pointerInput(Unit) {
+                                    awaitPointerEventScope {
+                                        while (true) {
+                                            val down = awaitFirstDown(requireUnconsumed = false)
+                                            
+                                            // Start bloating animation
+                                            val animationJob = scope.launch {
+                                                buttonScale.animateTo(
+                                                    targetValue = 1.5f, // Bloat to 150%
+                                                    animationSpec = tween(durationMillis = 500, easing = LinearEasing)
+                                                )
+                                            }
 
-                                        // Wait for long press only
-                                        try {
-                                            withTimeout(500) {
-                                                // If user lifts finger before timeout, it's a tap - IGNORE IT
-                                                val up = waitForUpOrCancellation()
-                                                if (up != null) {
-                                                    // Tap detected - Cancel animation and revert
-                                                    animationJob.cancel()
-                                                    scope.launch { 
-                                                        buttonScale.animateTo(1f, spring(stiffness = Spring.StiffnessLow)) 
+                                            // Wait for long press only
+                                            try {
+                                                withTimeout(500) {
+                                                    // If user lifts finger before timeout, it's a tap - IGNORE IT
+                                                    val up = waitForUpOrCancellation()
+                                                    if (up != null) {
+                                                        // Tap detected - Cancel animation and revert
+                                                        animationJob.cancel()
+                                                        scope.launch { 
+                                                            buttonScale.animateTo(1f, spring(stiffness = Spring.StiffnessLow)) 
+                                                        }
                                                     }
                                                 }
-                                            }
-                                        } catch (e: Exception) {
-                                            // Timeout reached -> Long Press detected
-                                            showRadialMenu = true
-                                            
-                                            // Reset scale
-                                            scope.launch { 
-                                                buttonScale.animateTo(1f, spring(stiffness = Spring.StiffnessLow)) 
-                                            }
-                                            // Start tracking drag
-                                            var dragging = true
-                                            while (dragging) {
-                                                val event = awaitPointerEvent()
-                                                val change = event.changes.firstOrNull()
-                                                if (change != null) {
-                                                    if (change.pressed) {
-                                                        // Dragging
-                                                        val position = change.position
-                                                        val centerX = size.width / 2
-                                                        val centerY = size.height / 2
-                                                        val dx = position.x - centerX
-                                                        val dy = position.y - centerY
-                                                        val dist = sqrt(dx * dx + dy * dy)
+                                            } catch (e: Exception) {
+                                                // Timeout reached -> Long Press detected
+                                                showRadialMenu = true
+                                                
+                                                // Reset scale
+                                                scope.launch { 
+                                                    buttonScale.animateTo(1f, spring(stiffness = Spring.StiffnessLow)) 
+                                                }
+                                                // Start tracking drag
+                                                var dragging = true
+                                                while (dragging) {
+                                                    val event = awaitPointerEvent()
+                                                    val change = event.changes.firstOrNull()
+                                                    if (change != null) {
+                                                        if (change.pressed) {
+                                                            // Dragging
+                                                            val position = change.position
+                                                            val centerX = size.width / 2
+                                                            val centerY = size.height / 2
+                                                            val dx = position.x - centerX
+                                                            val dy = position.y - centerY
+                                                            val dist = sqrt(dx * dx + dy * dy)
 
-                                                        // Threshold to leave center (e.g. 20% of width)
-                                                        if (dist > size.width * 0.4f) {
-                                                            // Calculate angle
-                                                            var angle = Math.toDegrees(
-                                                                atan2(
-                                                                    dy.toDouble(),
-                                                                    dx.toDouble()
+                                                            // Threshold to leave center (e.g. 20% of width)
+                                                            if (dist > size.width * 0.4f) {
+                                                                // Calculate angle
+                                                                var angle = Math.toDegrees(
+                                                                    atan2(
+                                                                        dy.toDouble(),
+                                                                        dx.toDouble()
+                                                                    )
                                                                 )
-                                                            )
-                                                            if (angle < 0) angle += 360.0
+                                                                if (angle < 0) angle += 360.0
 
-                                                            // Map angle to options
-                                                            // Fire: 210 (Left-ish)
-                                                            // Rescue: 270 (Top)
-                                                            // Accident: 330 (Right-ish)
+                                                                // Map angle to options
+                                                                // Fire: 210 (Left-ish)
+                                                                // Rescue: 270 (Top)
+                                                                // Accident: 330 (Right-ish)
 
-                                                            radialSelection = when {
-                                                                angle >= 180 && angle < 240 -> "Fire"
-                                                                angle >= 240 && angle < 300 -> "Rescue"
-                                                                angle >= 300 || angle < 0 -> "Accident" // 330 area
-                                                                else -> null
+                                                                radialSelection = when {
+                                                                    angle >= 180 && angle < 240 -> "Fire"
+                                                                    angle >= 240 && angle < 300 -> "Rescue"
+                                                                    angle >= 300 || angle < 0 -> "Accident" // 330 area
+                                                                    else -> null
+                                                                }
+                                                            } else {
+                                                                radialSelection = null
                                                             }
                                                         } else {
-                                                            radialSelection = null
-                                                        }
-                                                    } else {
-                                                        // Up
-                                                        dragging = false
-                                                        if (radialSelection != null) {
-                                                            // Execute selection
-                                                            val alertType = when (radialSelection) {
-                                                                "Rescue" -> "Emergency Rescue"
-                                                                "Fire" -> "Fire Emergency"
-                                                                "Accident" -> "Road Accident"
-                                                                else -> null
+                                                            // Up
+                                                            dragging = false
+                                                            if (radialSelection != null) {
+                                                                // Execute selection
+                                                                val alertType = when (radialSelection) {
+                                                                    "Rescue" -> "Emergency Rescue"
+                                                                    "Fire" -> "Fire Emergency"
+                                                                    "Accident" -> "Road Accident"
+                                                                    else -> null
+                                                                }
+                                                                if (alertType != null) {
+                                                                    sendAlert(alertType)
+                                                                }
+                                                                showRadialMenu = false
+                                                                radialSelection = null
+                                                            } else {
+                                                                // Released at center or outside selection zones
+                                                                showRadialMenu = false
                                                             }
-                                                            if (alertType != null) {
-                                                                sendAlert(alertType)
-                                                            }
-                                                            showRadialMenu = false
-                                                            radialSelection = null
-                                                        } else {
-                                                            // Released at center or outside selection zones
-                                                            showRadialMenu = false
                                                         }
                                                     }
                                                 }
                                             }
                                         }
                                     }
-                                }
-                            },
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.Warning,
-                            contentDescription = "Alert",
-                            tint = Color.White,
-                            modifier = Modifier.size(36.dp)
-                        )
+                                },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.Warning,
+                                contentDescription = "Alert",
+                                tint = Color.White,
+                                modifier = Modifier.size(36.dp)
+                            )
+                        }
                     }
                 }
                 
@@ -2236,220 +2656,552 @@ fun HomeScreen(navController: NavController) {
             )
         }
 
+        // Member On Map Popup
+        if (selectedMemberOnMap != null) {
+            val member = selectedMemberOnMap!!
+            Dialog(onDismissRequest = { selectedMemberOnMap = null }) {
+                Surface(
+                    shape = RoundedCornerShape(24.dp),
+                    color = Color.White,
+                    shadowElevation = 16.dp
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(24.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        // Profile Photo
+                        Box(
+                            modifier = Modifier
+                                .size(80.dp)
+                                .background(Color(0xFFEEEEEE), CircleShape),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            if (member.profilePhoto != null) {
+                                AsyncImage(
+                                    model = ImageRequest.Builder(LocalContext.current)
+                                        .data(member.profilePhoto)
+                                        .crossfade(true)
+                                        .transformations(CircleCropTransformation())
+                                        .build(),
+                                    contentDescription = "Profile",
+                                    modifier = Modifier
+                                        .size(80.dp)
+                                        .clip(CircleShape),
+                                    contentScale = ContentScale.Crop
+                                )
+                            } else {
+                                Box(
+                                    modifier = Modifier
+                                        .size(80.dp)
+                                        .background(Color(0xFFFF9800), CircleShape),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        text = member.name.take(1).uppercase(),
+                                        color = Color.White,
+                                        fontWeight = FontWeight.Bold,
+                                        style = MaterialTheme.typography.headlineMedium
+                                    )
+                                }
+                            }
+
+                            // Online indicator dot
+                            val isOnlineNow = (member.lastActive ?: 0L) > System.currentTimeMillis() - 120_000L
+                            if (isOnlineNow) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(18.dp)
+                                        .align(Alignment.BottomEnd)
+                                        .background(Color(0xFF4CAF50), CircleShape)
+                                        .border(2.dp, Color.White, CircleShape)
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        // Name
+                        Text(
+                            text = member.name,
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = Color(0xFF1A1A2E)
+                        )
+
+                        Spacer(modifier = Modifier.height(4.dp))
+
+                        // Last active
+                        Text(
+                            text = formatLastActive(member.lastActive),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if ((member.lastActive ?: 0L) > System.currentTimeMillis() - 120_000L)
+                                Color(0xFF4CAF50) else Color.Gray
+                        )
+
+                        Spacer(modifier = Modifier.height(16.dp))
+                        HorizontalDivider(color = Color(0xFFEEEEEE))
+                        Spacer(modifier = Modifier.height(16.dp))
+
+                        // Last seen address
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Rounded.LocationOn,
+                                contentDescription = null,
+                                tint = Color(0xFF29B6F6),
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = if (selectedMemberAddress.isBlank()) "Location unknown" else selectedMemberAddress,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = Color(0xFF555555),
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(24.dp))
+
+                        // Buttons
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            // Cancel
+                            OutlinedButton(
+                                onClick = { selectedMemberOnMap = null },
+                                modifier = Modifier.weight(1f).height(48.dp),
+                                shape = RoundedCornerShape(24.dp),
+                                border = BorderStroke(1.dp, Color(0xFFDDDDDD))
+                            ) {
+                                Text("Cancel", color = Color.Gray, fontWeight = FontWeight.SemiBold)
+                            }
+
+                            // Navigate
+                            Button(
+                                onClick = {
+                                    val destLat = member.lastLat
+                                    val destLon = member.lastLon
+                                    if (destLat != null && destLon != null) {
+                                        selectedMemberOnMap = null
+                                        // Start navigation to member's last location
+                                        scope.launch {
+                                            val currentLocation = mapLibreMap?.locationComponent?.lastKnownLocation
+                                            if (currentLocation != null) {
+                                                isNavigating = true
+                                                navigationSteps = emptyList()
+                                                currentStepIndex = 0
+                                                val (points, steps) = com.example.safeko.utils.RouteFetcher.fetchRoute(
+                                                    LatLng(currentLocation.latitude, currentLocation.longitude),
+                                                    LatLng(destLat, destLon)
+                                                )
+                                                navigationSteps = steps
+
+                                                // Draw route on map
+                                                if (points.isNotEmpty()) {
+                                                    val coords = points.map { Point.fromLngLat(it.longitude, it.latitude) }
+                                                    mapLibreMap?.getStyle { style ->
+                                                        val geojson = FeatureCollection.fromFeature(
+                                                            Feature.fromGeometry(LineString.fromLngLats(coords))
+                                                        ).toJson()
+                                                        val src = style.getSourceAs<GeoJsonSource>("route-source")
+                                                        if (src != null) {
+                                                            src.setGeoJson(geojson)
+                                                        } else {
+                                                            style.addSource(GeoJsonSource("route-source", geojson))
+                                                            style.addLayer(LineLayer("route-layer", "route-source")
+                                                                .withProperties(
+                                                                    PropertyFactory.lineColor(android.graphics.Color.BLUE),
+                                                                    PropertyFactory.lineWidth(5f),
+                                                                    PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+                                                                    PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
+                                                                    PropertyFactory.lineGradient(
+                                                                        Expression.interpolate(Expression.linear(), Expression.lineProgress(),
+                                                                            Expression.stop(0f, Expression.color(android.graphics.Color.BLUE)),
+                                                                            Expression.stop(1f, Expression.color(android.graphics.Color.BLUE))
+                                                                        )
+                                                                    )
+                                                                ))
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                Toast.makeText(context, "Waiting for your location...", Toast.LENGTH_SHORT).show()
+                                            }
+                                        }
+                                    } else {
+                                        Toast.makeText(context, "Member location not available", Toast.LENGTH_SHORT).show()
+                                    }
+                                },
+                                modifier = Modifier.weight(1f).height(48.dp),
+                                shape = RoundedCornerShape(24.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF29B6F6))
+                            ) {
+                                Icon(Icons.Rounded.Navigation, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Navigate", fontWeight = FontWeight.Bold, color = Color.White)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Alert Details Modal
         if (showAlertDetails && selectedAlert != null) {
             ModalBottomSheet(
                 onDismissRequest = { showAlertDetails = false },
                 containerColor = Color.White,
-                shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp)
+                shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
+                dragHandle = { BottomSheetDefaults.DragHandle() }
             ) {
                 val alert = selectedAlert!!
+                val currentUserId = auth.currentUser?.uid
+                val isOwner = alert.userId != null && alert.userId == currentUserId
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(start = 24.dp, end = 24.dp, bottom = 48.dp),
+                        .padding(start = 20.dp, end = 20.dp, bottom = 40.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    // Header with Profile Picture
-                    if (!alert.userPhotoUrl.isNullOrBlank()) {
-                        AsyncImage(
-                            model = ImageRequest.Builder(LocalContext.current)
-                                .data(alert.userPhotoUrl)
-                                .crossfade(true)
-                                .transformations(CircleCropTransformation())
-                                .build(),
-                            contentDescription = "User Profile",
+                    // Address (moved under alert type)
+                    var displayAddress by remember { mutableStateOf(alert.address) }
+
+                    LaunchedEffect(alert.id, alert.address) {
+                        if (displayAddress.isBlank()) {
+                            withContext(Dispatchers.IO) {
+                                try {
+                                    val address =
+                                        PlaceSearcher.reverseGeocode(alert.lat, alert.lon)
+                                    if (address.isNotBlank()) {
+                                        withContext(Dispatchers.Main) {
+                                            displayAddress = address
+                                        }
+                                    }
+                                } catch (e: Exception) {
+                                    e.printStackTrace()
+                                }
+                            }
+                        }
+                    }
+
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        color = Color(0xFFF7F7F7),
+                        shape = RoundedCornerShape(16.dp)
+                    ) {
+                        Row(
                             modifier = Modifier
-                                .size(80.dp)
-                                .clip(CircleShape)
-                                .background(Color.LightGray),
-                            contentScale = ContentScale.Crop
-                        )
-                    } else {
-                        Image(
-                            imageVector = Icons.Filled.Person,
-                            contentDescription = "User Profile",
-                            modifier = Modifier
-                                .size(80.dp)
-                                .clip(CircleShape)
-                                .background(Color.LightGray)
-                                .padding(16.dp),
-                            contentScale = ContentScale.Fit
-                        )
+                                .fillMaxWidth()
+                                .padding(14.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            if (!alert.userPhotoUrl.isNullOrBlank()) {
+                                AsyncImage(
+                                    model = ImageRequest.Builder(LocalContext.current)
+                                        .data(alert.userPhotoUrl)
+                                        .crossfade(true)
+                                        .transformations(CircleCropTransformation())
+                                        .build(),
+                                    contentDescription = "User Profile",
+                                    modifier = Modifier
+                                        .size(64.dp)
+                                        .clip(CircleShape)
+                                        .background(Color.LightGray),
+                                    contentScale = ContentScale.Crop
+                                )
+                            } else {
+                                Image(
+                                    imageVector = Icons.Filled.Person,
+                                    contentDescription = "User Profile",
+                                    modifier = Modifier
+                                        .size(64.dp)
+                                        .clip(CircleShape)
+                                        .background(Color.LightGray)
+                                        .padding(12.dp),
+                                    contentScale = ContentScale.Fit
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.width(12.dp))
+
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = alert.userName ?: "Unknown User",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.Bold
+                                )
+
+                                Spacer(modifier = Modifier.height(4.dp))
+
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    val (icon, color) = when (alert.type) {
+                                        "Fire Emergency" -> Icons.Rounded.LocalFireDepartment to Color(
+                                            0xFFFF5722
+                                        )
+
+                                        "Road Accident" -> Icons.Rounded.CarCrash to Color(0xFFFFC107)
+                                        "Emergency Rescue" -> Icons.Rounded.MedicalServices to Color.Red
+                                        else -> Icons.Rounded.Warning to Color.Red
+                                    }
+
+                                    Icon(
+                                        imageVector = icon,
+                                        contentDescription = null,
+                                        tint = color,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+
+                                    Spacer(modifier = Modifier.width(6.dp))
+
+                                    Text(
+                                        text = alert.type,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = Color.Gray
+                                    )
+                                }
+
+                                Spacer(modifier = Modifier.height(6.dp))
+
+                                Row(verticalAlignment = Alignment.Top) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.LocationOn,
+                                        contentDescription = null,
+                                        tint = Color.Gray,
+                                        modifier = Modifier
+                                            .size(16.dp)
+                                            .padding(top = 2.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = displayAddress.ifBlank { "Lat: ${alert.lat}, Lon: ${alert.lon}" },
+                                        style = MaterialTheme.typography.bodySmall,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+                        }
                     }
 
                     Spacer(modifier = Modifier.height(12.dp))
-
-                    // User Name
-                    Text(
-                        text = alert.userName ?: "Unknown User",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold
-                    )
-
-                    Spacer(modifier = Modifier.height(4.dp))
-
-                    // Alert Type with Icon
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        val (icon, color) = when (alert.type) {
-                            "Fire Emergency" -> Icons.Rounded.LocalFireDepartment to Color(
-                                0xFFFF5722
-                            )
-
-                            "Road Accident" -> Icons.Rounded.CarCrash to Color(0xFFFFC107)
-                            "Emergency Rescue" -> Icons.Rounded.MedicalServices to Color.Red
-                            else -> Icons.Rounded.Warning to Color.Red
-                        }
-
-                        Icon(
-                            imageVector = icon,
-                            contentDescription = null,
-                            tint = color,
-                            modifier = Modifier.size(20.dp)
-                        )
-
-                        Spacer(modifier = Modifier.width(8.dp))
-
-                        Text(
-                            text = alert.type,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = Color.Gray
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.height(24.dp))
                     HorizontalDivider(color = Color.LightGray.copy(alpha = 0.5f))
-                    Spacer(modifier = Modifier.height(24.dp))
+                    Spacer(modifier = Modifier.height(12.dp))
 
                     // Details Column (Left Aligned)
                     Column(modifier = Modifier.fillMaxWidth()) {
-                        // Additional Notes
-                        Text(
-                            text = "Additional Notes",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = Color.Gray,
-                            modifier = Modifier.padding(bottom = 8.dp)
-                        )
-
-                        Surface(
-                            color = Color(0xFFF5F5F5),
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            val displayText = remember(alert.notes, alert.details) {
-                                buildString {
-                                    if (alert.notes.isNotBlank()) append(alert.notes)
-                                    if (alert.notes.isNotBlank() && alert.details.isNotBlank()) append(
-                                        "\n\n"
-                                    )
-                                    if (alert.details.isNotBlank()) append(alert.details)
-                                }.ifBlank { "No additional notes provided." }
+                        if (isOwner) {
+                            var phoneNumberText by remember(alert.id) {
+                                mutableStateOf(userPhoneNumber)
+                            }
+                            var localDetailsText by remember(alert.id) {
+                                mutableStateOf(alert.details)
                             }
 
                             Text(
-                                text = displayText,
-                                style = MaterialTheme.typography.bodyLarge,
-                                modifier = Modifier.padding(16.dp)
-                            )
-                        }
-
-                        // Attached Photo
-                        if (alert.photoBase64.isNotBlank()) {
-                            Spacer(modifier = Modifier.height(16.dp))
-                            Text(
-                                text = "Attached Photo",
-                                style = MaterialTheme.typography.bodyMedium,
+                                text = "Contact",
+                                style = MaterialTheme.typography.bodySmall,
                                 color = Color.Gray,
-                                modifier = Modifier.padding(bottom = 8.dp)
+                                modifier = Modifier.padding(bottom = 6.dp)
                             )
 
-                            val imageBitmap = remember(alert.photoBase64) {
-                                try {
-                                    val decodedBytes =
-                                        Base64.decode(alert.photoBase64, Base64.DEFAULT)
-                                    BitmapFactory.decodeByteArray(
-                                        decodedBytes,
-                                        0,
-                                        decodedBytes.size
-                                    )?.asImageBitmap()
-                                } catch (e: Exception) {
-                                    null
-                                }
-                            }
+                            Surface(
+                                modifier = Modifier.fillMaxWidth(),
+                                color = Color(0xFFF7F7F7),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Column(modifier = Modifier.padding(12.dp)) {
+                                    Text(
+                                        text = "Phone Number *",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = Color.Gray,
+                                        modifier = Modifier.padding(bottom = 6.dp)
+                                    )
 
-                            if (imageBitmap != null) {
-                                Box(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .height(200.dp)
-                                        .clip(RoundedCornerShape(12.dp))
-                                        .background(Color.Gray)
-                                ) {
-                                    androidx.compose.foundation.Image(
-                                        bitmap = imageBitmap,
-                                        contentDescription = "Attached Photo",
-                                        contentScale = ContentScale.Crop,
-                                        modifier = Modifier.fillMaxSize()
+                                    OutlinedTextField(
+                                        value = phoneNumberText,
+                                        onValueChange = { phoneNumberText = it },
+                                        modifier = Modifier.fillMaxWidth(),
+                                        placeholder = { Text("+63 912 345 6789", color = Color.LightGray) },
+                                        singleLine = true,
+                                        shape = RoundedCornerShape(10.dp),
+                                        colors = OutlinedTextFieldDefaults.colors(
+                                            focusedBorderColor = Color(0xFFE0E0E0),
+                                            unfocusedBorderColor = Color(0xFFE0E0E0),
+                                            focusedContainerColor = Color.White,
+                                            unfocusedContainerColor = Color.White
+                                        )
                                     )
                                 }
                             }
-                        }
 
-                        Spacer(modifier = Modifier.height(24.dp))
+                            Spacer(modifier = Modifier.height(10.dp))
 
-                        // Address
-                        var displayAddress by remember { mutableStateOf(alert.address) }
+                            Text(
+                                text = "Details (Optional)",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color.Gray,
+                                modifier = Modifier.padding(bottom = 6.dp)
+                            )
 
-                        LaunchedEffect(alert.id, alert.address) {
-                            if (displayAddress.isBlank()) {
-                                withContext(Dispatchers.IO) {
+                            OutlinedTextField(
+                                value = localDetailsText,
+                                onValueChange = { localDetailsText = it },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(100.dp),
+                                placeholder = { Text("Describe the situation...", color = Color.LightGray) },
+                                maxLines = 4,
+                                shape = RoundedCornerShape(12.dp),
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedBorderColor = Color(0xFFE0E0E0),
+                                    unfocusedBorderColor = Color(0xFFE0E0E0),
+                                    focusedContainerColor = Color(0xFFF7F7F7),
+                                    unfocusedContainerColor = Color(0xFFF7F7F7)
+                                )
+                            )
+
+                            if (alert.photoBase64.isNotBlank()) {
+                                Spacer(modifier = Modifier.height(12.dp))
+                                val imageBitmap = remember(alert.photoBase64) {
                                     try {
-                                        val address =
-                                            PlaceSearcher.reverseGeocode(alert.lat, alert.lon)
-                                        if (address.isNotBlank()) {
-                                            withContext(Dispatchers.Main) {
-                                                displayAddress = address
-                                            }
-                                        }
+                                        val decodedBytes =
+                                            Base64.decode(alert.photoBase64, Base64.DEFAULT)
+                                        BitmapFactory.decodeByteArray(
+                                            decodedBytes,
+                                            0,
+                                            decodedBytes.size
+                                        )?.asImageBitmap()
                                     } catch (e: Exception) {
-                                        e.printStackTrace()
+                                        null
+                                    }
+                                }
+
+                                if (imageBitmap != null) {
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .height(84.dp)
+                                            .clip(RoundedCornerShape(12.dp))
+                                            .background(Color(0xFFEDEDED))
+                                    ) {
+                                        androidx.compose.foundation.Image(
+                                            bitmap = imageBitmap,
+                                            contentDescription = "Attached Photo",
+                                            contentScale = ContentScale.Crop,
+                                            modifier = Modifier.fillMaxSize()
+                                        )
                                     }
                                 }
                             }
-                        }
 
-                        Row(verticalAlignment = Alignment.Top) {
-                            Icon(
-                                imageVector = Icons.Rounded.LocationOn,
-                                contentDescription = null,
-                                tint = Color.Gray,
-                                modifier = Modifier
-                                    .size(20.dp)
-                                    .padding(top = 2.dp)
+                            Spacer(modifier = Modifier.height(10.dp))
+
+                            Text(
+                                text = "Photos (Optional)",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color.Gray,
+                                modifier = Modifier.padding(bottom = 6.dp)
                             )
-                            Spacer(modifier = Modifier.width(12.dp))
-                            Column {
-                                Text(
-                                    text = "Address",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = Color.Gray,
-                                    modifier = Modifier.padding(bottom = 4.dp)
-                                )
-                                Text(
-                                    text = displayAddress.ifBlank { "Lat: ${alert.lat}, Lon: ${alert.lon}" },
-                                    style = MaterialTheme.typography.bodyLarge
-                                )
+
+                            if (capturedBitmap != null) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(104.dp)
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .background(Color(0xFFEDEDED))
+                                ) {
+                                    androidx.compose.foundation.Image(
+                                        bitmap = capturedBitmap!!.asImageBitmap(),
+                                        contentDescription = "Captured Image",
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                    IconButton(
+                                        onClick = {
+                                            val photoFile = createImageFile(context)
+                                            capturedImageUri = FileProvider.getUriForFile(
+                                                context,
+                                                "${context.packageName}.fileprovider",
+                                                photoFile
+                                            )
+                                            cameraLauncher.launch(capturedImageUri!!)
+                                        },
+                                        modifier = Modifier
+                                            .align(Alignment.TopEnd)
+                                            .padding(8.dp)
+                                            .background(Color.Black.copy(alpha = 0.5f), CircleShape)
+                                    ) {
+                                        Icon(
+                                            Icons.Rounded.PhotoCamera,
+                                            contentDescription = "Retake",
+                                            tint = Color.White
+                                        )
+                                    }
+                                }
+                            } else {
+                                OutlinedButton(
+                                    onClick = {
+                                        try {
+                                            val photoFile = createImageFile(context)
+                                            val uri = FileProvider.getUriForFile(
+                                                context,
+                                                "${context.packageName}.fileprovider",
+                                                photoFile
+                                            )
+                                            capturedImageUri = uri
+                                            cameraLauncher.launch(uri)
+                                        } catch (e: Exception) {
+                                            e.printStackTrace()
+                                            Toast.makeText(
+                                                context,
+                                                "Cannot open camera: ${e.message}",
+                                                Toast.LENGTH_SHORT
+                                            ).show()
+                                        }
+                                    },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    shape = RoundedCornerShape(12.dp),
+                                    colors = ButtonDefaults.outlinedButtonColors(
+                                        containerColor = Color(0xFFF7F7F7)
+                                    )
+                                ) {
+                                    Icon(Icons.Rounded.PhotoCamera, contentDescription = null)
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text("Upload")
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(12.dp))
+
+                            Button(
+                                onClick = {
+                                    var photoBase64: String? = null
+                                    if (capturedBitmap != null) {
+                                        val outputStream = ByteArrayOutputStream()
+                                        capturedBitmap!!.compress(
+                                            Bitmap.CompressFormat.JPEG,
+                                            70,
+                                            outputStream
+                                        )
+                                        val byteArray = outputStream.toByteArray()
+                                        photoBase64 = Base64.encodeToString(byteArray, Base64.DEFAULT)
+                                    }
+                                    updateAlert(alert.id, localDetailsText, photoBase64, phoneNumberText)
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(12.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = Color.Black)
+                            ) {
+                                Text("Submit Details")
                             }
                         }
+
                     }
 
                     Spacer(modifier = Modifier.height(32.dp))
-
-                    // Owner Actions
-                    val currentUserId = auth.currentUser?.uid
-                    val isOwner = alert.userId != null && alert.userId == currentUserId
 
                     // Navigation Button (Only for non-owners)
                     if (!isOwner) {
@@ -2561,37 +3313,15 @@ fun HomeScreen(navController: NavController) {
                         }
                     }
 
-                    if (isOwner) {
+                    if (isOwner && alert.status != "resolved") {
                         Spacer(modifier = Modifier.height(12.dp))
-                        OutlinedButton(
-                            onClick = {
-                                showAlertDetails = false
-                                showAddDetails = true
-                                detailsText = ""
-                                capturedBitmap = null
-                                capturedImageUri = null
-                            },
+                        Button(
+                            onClick = { resolveAlert(alert.id) },
                             modifier = Modifier.fillMaxWidth(),
-                            shape = RoundedCornerShape(12.dp)
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))
                         ) {
-                            Text("Add Details / Upload Photo")
-                        }
-
-                        // Resolve Alert Button
-                        if (alert.status != "resolved") {
-                            Spacer(modifier = Modifier.height(12.dp))
-                            Button(
-                                onClick = { resolveAlert(alert.id) },
-                                modifier = Modifier.fillMaxWidth(),
-                                shape = RoundedCornerShape(12.dp),
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = Color(
-                                        0xFF4CAF50
-                                    )
-                                )
-                            ) {
-                                Text("Resolve Alert")
-                            }
+                            Text("Resolve Alert")
                         }
                     }
                 }
@@ -2603,7 +3333,8 @@ fun HomeScreen(navController: NavController) {
             ModalBottomSheet(
                 onDismissRequest = { showAddDetails = false },
                 containerColor = Color.White,
-                shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp)
+                shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
+                dragHandle = { BottomSheetDefaults.DragHandle() }
             ) {
                 val alert = selectedAlert!!
                 Column(
@@ -2806,9 +3537,22 @@ fun HomeScreen(navController: NavController) {
                         }
                     }
 
-                    val displayedAlerts = remember(alerts, showResolvedAlerts) {
-                        alerts.values.filter {
-                            if (showResolvedAlerts) it.status == "resolved" else it.status != "resolved"
+                    val displayedAlerts = remember(alerts, showResolvedAlerts, userRole, userDepartment) {
+                        alerts.values.filter { alert ->
+                            val statusMatch = if (showResolvedAlerts) alert.status == "resolved" else alert.status != "resolved"
+                            if (!statusMatch) return@filter false
+
+                            // Filter alerts for LGU Admins in the notifications list
+                            if (userRole == "lgu_admin") {
+                                when (userDepartment) {
+                                    "Firestation", "Fire" -> alert.type == "Fire Emergency"
+                                    "Rescue" -> alert.type == "Emergency Rescue" || alert.type == "Road Accident"
+                                    "Medical" -> alert.type == "Emergency Rescue"
+                                    else -> true
+                                }
+                            } else {
+                                true
+                            }
                         }.sortedByDescending { it.timestamp }
                     }
 
@@ -3337,7 +4081,8 @@ fun HomeScreen(navController: NavController) {
                 onDismissRequest = { showSharingSheet = false },
                 containerColor = Color.White,
                 contentColor = Color.Black,
-                shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp)
+                shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
+                dragHandle = { BottomSheetDefaults.DragHandle() }
             ) {
                 Column(
                     modifier = Modifier
@@ -3447,42 +4192,6 @@ fun HomeScreen(navController: NavController) {
         // Group Bottom Sheet
         if (showGroupSheet) {
             val groupSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = false)
-            
-            var circleMembers by remember { mutableStateOf<List<CircleMember>>(emptyList()) }
-            var isLoadingMembers by remember { mutableStateOf(false) }
-
-            LaunchedEffect(userCircles) {
-                if (userCircles.isEmpty()) {
-                    circleMembers = emptyList()
-                    return@LaunchedEffect
-                }
-                
-                isLoadingMembers = true
-                val currentUid = auth.currentUser?.uid ?: return@LaunchedEffect
-                val membersMap = mutableMapOf<String, MutableList<String>>()
-                
-                userCircles.forEach { circle ->
-                    circle.members.forEach { uid ->
-                        if (uid != currentUid) {
-                            membersMap.getOrPut(uid) { mutableListOf() }.add(circle.name)
-                        }
-                    }
-                }
-                
-                val fetchedMembers = mutableListOf<CircleMember>()
-                for ((uid, sharedNames) in membersMap) {
-                    try {
-                        val doc = Firebase.firestore.collection("users").document(uid).get().await()
-                        val name = doc.getString("name") ?: "Unknown User"
-                        val profilePhoto = doc.getString("profilePhoto")
-                        fetchedMembers.add(CircleMember(uid, name, profilePhoto, sharedNames))
-                    } catch (e: Exception) {
-                        Log.e("HomeScreen", "Error fetching member $uid", e)
-                    }
-                }
-                circleMembers = fetchedMembers.sortedBy { it.name }
-                isLoadingMembers = false
-            }
 
             ModalBottomSheet(
                 onDismissRequest = { 
@@ -3534,12 +4243,14 @@ fun HomeScreen(navController: NavController) {
                                             val circleId = UUID.randomUUID().toString()
                                             
                                             val createCircle = { imageUrl: String? ->
+                                                val limit = if (userPlan == "OWL+") 10 else 5
                                                 val newCircle = Circle(
                                                     id = circleId,
                                                     name = circleName,
                                                     ownerId = uid,
                                                     members = listOf(uid),
-                                                    memberLimit = if (userPlan == "OWL+") 10 else 5,
+                                                    memberLimit = limit,
+                                                    type = "Group",
                                                     createdAt = System.currentTimeMillis(),
                                                     imageUrl = imageUrl
                                                 )
@@ -3654,35 +4365,7 @@ fun HomeScreen(navController: NavController) {
 
                         Spacer(modifier = Modifier.height(24.dp))
                         
-                        Surface(
-                            color = Color(0xFFF5F5F5),
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Column {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth().padding(16.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Icon(Icons.Rounded.Group, contentDescription = null, tint = Color.Gray)
-                                    Spacer(modifier = Modifier.width(16.dp))
-                                    Text("Group", modifier = Modifier.weight(1f))
-                                    Icon(Icons.Rounded.CheckCircle, contentDescription = null, tint = Color(0xFF29B6F6))
-                                }
-                                HorizontalDivider(color = Color.White)
-                                Row(
-                                    modifier = Modifier.fillMaxWidth().padding(16.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Icon(Icons.Rounded.Groups, contentDescription = null, tint = Color.Gray)
-                                    Spacer(modifier = Modifier.width(16.dp))
-                                    Text("Duo", modifier = Modifier.weight(1f))
-                                    RadioButton(selected = false, onClick = {}, colors = RadioButtonDefaults.colors(unselectedColor = Color.Gray))
-                                }
-                            }
-                        }
-                        
-                         Text(
+                        Text(
                             text = "Members must be added directly or join through an invite link.",
                             style = MaterialTheme.typography.bodySmall,
                             color = Color.Gray,
@@ -3690,7 +4373,7 @@ fun HomeScreen(navController: NavController) {
                         )
                     }
                 } else {
-                val isEligible = userPlan == "Duo" || userPlan == "Premium" || userPlan == "OWL+"
+                val isEligible = userPlan == "Premium" || userPlan == "OWL+"
 
                 Column(
                     modifier = Modifier
@@ -3713,7 +4396,7 @@ fun HomeScreen(navController: NavController) {
                             fontWeight = FontWeight.Bold,
                             modifier = Modifier.weight(1f)
                         )
-                        if (isEligible) {
+                        if (isEligible || userRole == "lgu_admin" || userRole == "admin" || userRole == "superadmin") {
                             IconButton(onClick = { showLinkJoinDialog = true; showGroupSheet = false }) {
                                 Icon(
                                     Icons.Rounded.Link,
@@ -3728,12 +4411,26 @@ fun HomeScreen(navController: NavController) {
                                     tint = Color.Gray
                                 )
                             }
-                            IconButton(onClick = { isCreatingCircle = true }) {
-                                Icon(
-                                    Icons.Rounded.Add,
-                                    contentDescription = "Create circle",
-                                    tint = Color(0xFF29B6F6)
-                                )
+                            val canCreateCircle = when (userPlan) {
+                                "Premium", "OWL+" -> ownedGroupCount == 0
+                                else -> false
+                            }
+                            if ( canCreateCircle ) {
+                                IconButton(onClick = { isCreatingCircle = true }) {
+                                    Icon(
+                                        Icons.Rounded.Add,
+                                        contentDescription = "Create circle",
+                                        tint = Color(0xFF29B6F6)
+                                    )
+                                }
+                            } else {
+                                IconButton(onClick = { Toast.makeText(context, "You can only create 1 group max.", Toast.LENGTH_SHORT).show() }) {
+                                    Icon(
+                                        Icons.Rounded.Add,
+                                        contentDescription = "Create circle",
+                                        tint = Color.LightGray
+                                    )
+                                }
                             }
                         }
                     }
@@ -3747,7 +4444,7 @@ fun HomeScreen(navController: NavController) {
                     ) {
                         if (userPlan == "Loading...") {
                             CircularProgressIndicator()
-                        } else if (isEligible) {
+                        } else if (isEligible || userRole == "lgu_admin" || userRole == "admin" || userRole == "superadmin") {
                             if (userCircles.isNotEmpty()) {
                                 // List User Circles
                                 LazyColumn(
@@ -3774,18 +4471,29 @@ fun HomeScreen(navController: NavController) {
                                                 modifier = Modifier.padding(16.dp),
                                                 verticalAlignment = Alignment.CenterVertically
                                             ) {
-                                                Box(
-                                                    modifier = Modifier
-                                                        .size(48.dp)
-                                                        .background(Color(0xFF29B6F6), CircleShape),
-                                                    contentAlignment = Alignment.Center
-                                                ) {
-                                                    Text(
-                                                        text = circle.name.take(1).uppercase(),
-                                                        color = Color.White,
-                                                        fontWeight = FontWeight.Bold,
-                                                        style = MaterialTheme.typography.titleMedium
+                                                if (!circle.imageUrl.isNullOrBlank()) {
+                                                    AsyncImage(
+                                                        model = circle.imageUrl,
+                                                        contentDescription = null,
+                                                        modifier = Modifier
+                                                            .size(48.dp)
+                                                            .clip(CircleShape),
+                                                        contentScale = ContentScale.Crop
                                                     )
+                                                } else {
+                                                    Box(
+                                                        modifier = Modifier
+                                                            .size(48.dp)
+                                                            .background(Color(0xFF29B6F6), CircleShape),
+                                                        contentAlignment = Alignment.Center
+                                                    ) {
+                                                        Text(
+                                                            text = circle.name.take(1).uppercase(),
+                                                            color = Color.White,
+                                                            fontWeight = FontWeight.Bold,
+                                                            style = MaterialTheme.typography.titleMedium
+                                                        )
+                                                    }
                                                 }
                                                 Spacer(modifier = Modifier.width(16.dp))
                                                 Column {
@@ -3881,6 +4589,12 @@ fun HomeScreen(navController: NavController) {
                                                                 style = MaterialTheme.typography.bodySmall,
                                                                 color = Color.Gray
                                                             )
+                                                            Text(
+                                                                text = "Last active: ${formatLastActive(member.lastActive)}",
+                                                                style = MaterialTheme.typography.bodySmall,
+                                                                color = if ((member.lastActive ?: 0L) > System.currentTimeMillis() - 120_000L)
+                                                                    Color(0xFF4CAF50) else Color.Gray
+                                                            )
                                                         }
                                                     }
                                                 }
@@ -3898,22 +4612,30 @@ fun HomeScreen(navController: NavController) {
                                     color = Color.Gray
                                 )
                                 Text(
-                                    text = "Create a circle to add channels like Family or Duo.",
+                                    text = "Create a circle to add a Family channel.",
                                     style = MaterialTheme.typography.bodyMedium,
                                     color = Color.Gray,
                                     textAlign = TextAlign.Center
                                 )
                                 Spacer(modifier = Modifier.height(24.dp))
                                 
+                                val canCreateCircle = when (userPlan) {
+                                    "Premium", "OWL+" -> ownedGroupCount == 0
+                                    else -> false
+                                }
                                 Button(
                                     onClick = {
-                                         isCreatingCircle = true
+                                        if (canCreateCircle) {
+                                            isCreatingCircle = true
+                                        } else {
+                                            Toast.makeText(context, "You reached your group creation limits.", Toast.LENGTH_SHORT).show()
+                                        }
                                     },
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .height(56.dp),
                                     shape = RoundedCornerShape(16.dp),
-                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF29B6F6))
+                                    colors = ButtonDefaults.buttonColors(containerColor = if (canCreateCircle) Color(0xFF29B6F6) else Color.LightGray)
                                 ) {
                                     Icon(Icons.Rounded.GroupAdd, contentDescription = null)
                                     Spacer(modifier = Modifier.width(8.dp))
@@ -3940,7 +4662,7 @@ fun HomeScreen(navController: NavController) {
                             )
                             Spacer(modifier = Modifier.height(8.dp))
                             Text(
-                                text = "Upgrade to Duo, Premium or OWL+ to create and join circles.",
+                                text = "Upgrade to Premium or OWL+ to create and join circles.",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = Color.Gray,
                                 textAlign = TextAlign.Center
@@ -3972,6 +4694,184 @@ fun HomeScreen(navController: NavController) {
             }
         }
 
+
+        // Admin Overview Bottom Sheet (Admin Only)
+        if (showGlobalOverview && (userRole == "admin" || userRole == "superadmin" || userRole == "lgu_admin")) {
+            val overviewSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = false)
+            var totalAlerts by remember { mutableStateOf(0) }
+            var activeAlerts by remember { mutableStateOf(0) }
+
+            LaunchedEffect(Unit) {
+                scope.launch {
+                    try {
+                        val alertsResult = Firebase.firestore.collection("alerts").get().await()
+                        var alertCount = 0
+                        var activeCount = 0
+
+                        for (alertDoc in alertsResult) {
+                            alertCount++
+                            val status = alertDoc.getString("status") ?: "active"
+                            if (status == "active" || status.isEmpty()) {
+                                activeCount++
+                            }
+                        }
+
+                        totalAlerts = alertCount
+                        activeAlerts = activeCount
+                    } catch (e: Exception) {
+                        Log.e("GlobalOverview", "Error fetching alerts: ${e.message}")
+                        totalAlerts = 0
+                        activeAlerts = 0
+                    }
+                }
+            }
+
+            ModalBottomSheet(
+                onDismissRequest = { showGlobalOverview = false },
+                sheetState = overviewSheetState,
+                containerColor = Color.White,
+                shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
+                dragHandle = { BottomSheetDefaults.DragHandle() }
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(24.dp)
+                ) {
+                    // Title
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 20.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Dashboard,
+                            contentDescription = null,
+                            tint = Color(0xFF1565C0),
+                            modifier = Modifier.size(28.dp)
+                        )
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Text(
+                            text = "Admin Overview",
+                            style = MaterialTheme.typography.headlineMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.Black
+                        )
+                    }
+
+                    // Statistics Cards
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 20.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        // Total Alerts Card
+                        Card(
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(100.dp),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFFE8F5E9))
+                        ) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(12.dp),
+                                verticalArrangement = Arrangement.Center,
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                Text(
+                                    text = totalAlerts.toString(),
+                                    style = MaterialTheme.typography.headlineSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color(0xFF2E7D32)
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = "Total Alerts",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = Color.Gray
+                                )
+                            }
+                        }
+
+                        // Active Alerts Card
+                        Card(
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(100.dp),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF3E0))
+                        ) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(12.dp),
+                                verticalArrangement = Arrangement.Center,
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                Text(
+                                    text = activeAlerts.toString(),
+                                    style = MaterialTheme.typography.headlineSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color(0xFFF57C00)
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = "Active Alerts",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = Color.Gray
+                                )
+                            }
+                        }
+                    }
+
+                    // Recent Activity Section
+                    Text(
+                        text = "Recent Activity",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(bottom = 12.dp)
+                    )
+
+                    // Activity Placeholder
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(120.dp),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFFF5F5F5))
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize(),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.BarChart,
+                                    contentDescription = null,
+                                    tint = Color.Gray,
+                                    modifier = Modifier.size(40.dp)
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Text(
+                                    text = "No recent activity",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = Color.Gray
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(24.dp))
+                }
+            }
+        }
 
         // Edit Profile Dialog
         if (showEditProfile) {
@@ -4025,14 +4925,17 @@ fun HomeScreen(navController: NavController) {
                                     if (doc.exists()) {
                                         val members = doc.get("members") as? List<*> ?: emptyList<Any>()
                                         val limit = doc.getLong("memberLimit")?.toInt() ?: 5 // Legacy fallback to 5
-                                        if (members.size >= limit) {
+                                        val type = doc.getString("type") ?: "Group"
+
+                                        if (type == "Duo") {
+                                            Toast.makeText(context, "This circle type is no longer supported.", Toast.LENGTH_LONG).show()
+                                        } else if (userPlan != "Premium" && userPlan != "OWL+") {
+                                            Toast.makeText(context, "Upgrade to Premium to join family circles.", Toast.LENGTH_LONG).show()
+                                        } else if (members.size >= limit) {
                                             Toast.makeText(context, "This circle has reached its maximum member limit!", Toast.LENGTH_LONG).show()
                                         } else {
                                             com.google.firebase.ktx.Firebase.firestore.collection("circles").document(circleId)
-                                                .set(
-                                                    mapOf("members" to com.google.firebase.firestore.FieldValue.arrayUnion(currentUserId)),
-                                                    com.google.firebase.firestore.SetOptions.merge()
-                                                )
+                                                .update("members", com.google.firebase.firestore.FieldValue.arrayUnion(currentUserId))
                                                 .addOnSuccessListener {
                                                     Toast.makeText(context, "Joined group!", Toast.LENGTH_SHORT).show()
                                                     navController.navigate("chat/$circleId")
@@ -4112,15 +5015,20 @@ fun HomeScreen(navController: NavController) {
                                         if (doc.exists()) {
                                             val members = doc.get("members") as? List<*> ?: emptyList<Any>()
                                             val limit = doc.getLong("memberLimit")?.toInt() ?: 5 // Legacy fallback
-                                            if (members.size >= limit) {
+                                            val type = doc.getString("type") ?: "Group"
+
+                                            if (type == "Duo") {
+                                                isJoining = false
+                                                Toast.makeText(context, "This circle type is no longer supported.", Toast.LENGTH_LONG).show()
+                                            } else if (userPlan != "Premium" && userPlan != "OWL+") {
+                                                isJoining = false
+                                                Toast.makeText(context, "Upgrade to Premium to join family circles.", Toast.LENGTH_LONG).show()
+                                            } else if (members.size >= limit) {
                                                 isJoining = false
                                                 Toast.makeText(context, "This circle has reached its maximum member limit!", Toast.LENGTH_LONG).show()
                                             } else {
                                                 com.google.firebase.ktx.Firebase.firestore.collection("circles").document(parsedCircleId)
-                                                    .set(
-                                                        mapOf("members" to com.google.firebase.firestore.FieldValue.arrayUnion(uid)),
-                                                        com.google.firebase.firestore.SetOptions.merge()
-                                                    )
+                                                    .update("members", com.google.firebase.firestore.FieldValue.arrayUnion(uid))
                                                     .addOnSuccessListener {
                                                         isJoining = false
                                                         showLinkJoinDialog = false

@@ -49,6 +49,7 @@ fun PremiumScreen(
     var currentPlanId by remember { mutableStateOf("Free") }
     var isVerified by remember { mutableStateOf(false) }
     var isPhoneVerified by remember { mutableStateOf(false) }
+    var userRole by remember { mutableStateOf<String?>(null) }
     var isLoading by remember { mutableStateOf(true) }
     
     var showVerificationModal by remember { mutableStateOf(false) }
@@ -61,6 +62,7 @@ fun PremiumScreen(
                 val snapshot = FirebaseFirestore.getInstance().collection("users").document(uid).get().await()
                 if (snapshot.exists()) {
                     currentPlanId = snapshot.getString("plan") ?: "Free"
+                    userRole = snapshot.getString("role")
                     isVerified = snapshot.getBoolean("faceVerified") ?: false
                     isPhoneVerified = snapshot.getBoolean("phoneVerified") ?: false
                 }
@@ -71,12 +73,34 @@ fun PremiumScreen(
         isLoading = false
     }
 
+    // Auto-dismiss for LGU/Admin
+    LaunchedEffect(userRole) {
+        if (userRole == "lgu_admin" || userRole == "admin" || userRole == "superadmin") {
+            onBack()
+            Toast.makeText(context, "Subscription management is for users only.", Toast.LENGTH_SHORT).show()
+        }
+    }
+
     fun updatePlan(newPlanId: String, newPlanName: String) {
         val uid = auth.currentUser?.uid ?: return
         scope.launch {
             try {
+                val updateData = mutableMapOf<String, Any>("plan" to newPlanId)
+                
+                // Add purchase date and expiry if upgrading to Premium or OWL+
+                if (newPlanId == "Premium" || newPlanId == "OWL+") {
+                    val now = System.currentTimeMillis()
+                    val thirtyDaysLater = now + (30L * 24 * 60 * 60 * 1000) // 30 days in milliseconds
+                    updateData["purchaseDate"] = now
+                    updateData["planExpiryDate"] = thirtyDaysLater
+                } else if (newPlanId == "Free") {
+                    // Remove plan expiry for Free tier using FieldValue.delete()
+                    updateData["purchaseDate"] = com.google.firebase.firestore.FieldValue.delete()
+                    updateData["planExpiryDate"] = com.google.firebase.firestore.FieldValue.delete()
+                }
+                
                 FirebaseFirestore.getInstance().collection("users").document(uid)
-                    .set(mapOf("plan" to newPlanId), com.google.firebase.firestore.SetOptions.merge())
+                    .set(updateData, com.google.firebase.firestore.SetOptions.merge())
                     .await()
                 currentPlanId = newPlanId
                 Toast.makeText(context, "Plan updated to $newPlanName", Toast.LENGTH_SHORT).show()
@@ -102,21 +126,6 @@ fun PremiumScreen(
             buttonText = if (currentPlanId == "Free") "Current Plan" else "Downgrade to Free",
             color = Color(0xFF757575), // Grey
             isCurrent = currentPlanId == "Free"
-        ),
-        SubscriptionPlan(
-            id = "Duo",
-            name = "Duo Plan",
-            price = "₱59",
-            subtitle = "For two people who want to track each other (couples, best friends, etc.).",
-            features = listOf(
-                "2 users can track each other’s location",
-                "Real-time map tracking",
-                "No SMS alerts",
-                "No email notifications"
-            ),
-            buttonText = if (currentPlanId == "Duo") "Current Plan" else "Get Duo",
-            color = Color(0xFF64B5F6), // Light Blue
-            isCurrent = currentPlanId == "Duo"
         ),
         SubscriptionPlan(
             id = "Premium",
