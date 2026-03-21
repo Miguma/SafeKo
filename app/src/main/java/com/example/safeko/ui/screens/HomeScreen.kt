@@ -4,6 +4,8 @@ import android.Manifest
 import android.app.Activity
 import android.content.ComponentName
 import android.content.Context
+import android.content.ClipboardManager
+import android.content.ClipData
 import android.content.ContextWrapper
 import android.content.Intent
 import android.content.ServiceConnection
@@ -38,6 +40,9 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Navigation
 import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.Schedule
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.material3.HorizontalDivider
@@ -105,6 +110,7 @@ import android.view.Window
 import com.example.safeko.model.SearchResult
 import com.example.safeko.ui.components.QRCodeScanner
 import com.example.safeko.utils.PlaceSearcher
+import com.example.safeko.utils.QRCodeUtils
 import com.example.safeko.services.NavigationService
 import com.example.safeko.model.NavigationStep
 import com.example.safeko.model.RemoteAlert
@@ -243,6 +249,15 @@ fun ForceImmersiveMode() {
     }
 }
 
+// LGU Approval State - must be before HomeScreen composable
+sealed class LguApprovalState {
+    data object Idle : LguApprovalState()
+    data object Processing : LguApprovalState()
+    data object Waiting : LguApprovalState()
+    data class Success(val message: String = "") : LguApprovalState()
+    data class Error(val message: String) : LguApprovalState()
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HomeScreen(navController: NavController) {
@@ -260,7 +275,35 @@ fun HomeScreen(navController: NavController) {
     var userPlan by remember { mutableStateOf("Loading...") }
     var userRole by remember { mutableStateOf("user") }
     var userDepartment by remember { mutableStateOf("") }
+    var userLgcId by remember { mutableStateOf("") }
     var showGlobalOverview by remember { mutableStateOf(false) }
+
+    // Co-Admin Invite State
+    var showCoAdminInvite by remember { mutableStateOf(false) }
+    var showQrDialog by remember { mutableStateOf(false) }
+    var showQrScanner by remember { mutableStateOf(false) }
+    var coAdminInviteQR by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
+    var coAdminInviteToken by remember { mutableStateOf<String?>(null) }
+    var coAdminDeepLink by remember { mutableStateOf<String?>(null) }
+    
+    // LGU Membership Confirmation Modal
+    var showLguConfirmationModal by remember { mutableStateOf(false) }
+    var pendingInviteToken by remember { mutableStateOf<String?>(null) }
+    var pendingInviteLgcId by remember { mutableStateOf<String?>(null) }
+    
+    // LGU Approval Waiting Modal State
+    var showLguApprovalWaitingModal by remember { mutableStateOf(false) }
+    var lguApprovalProcessingState by remember { mutableStateOf<LguApprovalState>(LguApprovalState.Idle) }
+    var lguApprovalMessage by remember { mutableStateOf("") }
+    var pendingLguRequestId by remember { mutableStateOf<String?>(null) }
+
+    // Pending Co-Admin Requests State
+    var pendingCoAdmins by remember { mutableStateOf<List<Map<String, Any>>>(emptyList()) }
+    var loadingPendingRequests by remember { mutableStateOf(false) }
+
+    // Co-Admin List State
+    var coAdminsList by remember { mutableStateOf<List<Map<String, Any>>>(emptyList()) }
+    var loadingCoAdmins by remember { mutableStateOf(false) }
 
     DisposableEffect(Unit) {
         val uid = auth.currentUser?.uid
@@ -271,6 +314,7 @@ fun HomeScreen(navController: NavController) {
                         userPlan = snapshot.getString("plan") ?: "Free"
                         userRole = snapshot.getString("role") ?: "user"
                         userDepartment = snapshot.getString("department") ?: ""
+                        userLgcId = snapshot.getString("lgc_id") ?: ""
 
                         // Auto-grant OWL+ to Admins and LGUs
                         if ((userRole == "admin" || userRole == "superadmin" || userRole == "lgu_admin") && userPlan != "OWL+") {
@@ -281,7 +325,8 @@ fun HomeScreen(navController: NavController) {
                         val dbName = snapshot.getString("name")
                         val authName = Firebase.auth.currentUser?.displayName
                         if (dbName.isNullOrBlank() && !authName.isNullOrBlank()) {
-                            Firebase.firestore.collection("users").document(uid).update("name", authName)
+                            Firebase.firestore.collection("users").document(uid)
+                                .update("name", authName)
                         }
                     } else {
                         userPlan = "Free"
@@ -289,6 +334,14 @@ fun HomeScreen(navController: NavController) {
                 }
         } else null
         onDispose { registration?.remove() }
+    }
+
+    // Auto-show admin overview when user becomes lgu_admin (after QR approval)
+    LaunchedEffect(userRole) {
+        if ((userRole == "admin" || userRole == "superadmin" || userRole == "lgu_admin") && !showGlobalOverview) {
+            Log.d("HomeScreen", "User role is admin/superadmin/lgu_admin, automatically showing admin overview. userRole: $userRole")
+            showGlobalOverview = true
+        }
     }
 
     // Service Binding
@@ -329,42 +382,42 @@ fun HomeScreen(navController: NavController) {
     var navigationSteps by remember { mutableStateOf<List<NavigationStep>>(emptyList()) }
     var currentStepIndex by remember { mutableStateOf(0) }
     var distanceToNextTurn by remember { mutableStateOf(0.0) }
-    
+
     // Circle State
     var showLinkJoinDialog by remember { mutableStateOf(false) }
     var isCreatingCircle by remember { mutableStateOf(false) }
     var userCircles by remember { mutableStateOf<List<Circle>>(emptyList()) }
     var ownedGroupCount by remember { mutableIntStateOf(0) }
     var selectedCircle by remember { mutableStateOf<Circle?>(null) }
-    
+
     LaunchedEffect(Unit) {
-         val uid = auth.currentUser?.uid
-         if (uid != null) {
-              try {
-                 // Listen for circles where user is a member or owner
-                 // Simplified for now: just getting circles where user is owner or member
-                 // Since we don't have composite indexes yet, we might need to query carefully or just owner for MVP
-                 // Or we can query by "members" array-contains
-                 Firebase.firestore.collection("circles")
-                     .whereArrayContains("members", uid)
-                     .addSnapshotListener { snapshot, e ->
-                         if (e != null) return@addSnapshotListener
-                         if (snapshot != null) {
-                             val allCircles = snapshot.toObjects(Circle::class.java)
-                             var gCount = 0
-                             for (c in allCircles) {
-                                 if (c.ownerId == uid) {
-                                     if (c.type != "Duo") gCount++
-                                 }
-                             }
-                             ownedGroupCount = gCount
-                             userCircles = allCircles.filter { circle -> circle.type != "Duo" }
-                         }
-                     }
-             } catch (e: Exception) {
-                 // Handle error
-             }
-         }
+        val uid = auth.currentUser?.uid
+        if (uid != null) {
+            try {
+                // Listen for circles where user is a member or owner
+                // Simplified for now: just getting circles where user is owner or member
+                // Since we don't have composite indexes yet, we might need to query carefully or just owner for MVP
+                // Or we can query by "members" array-contains
+                Firebase.firestore.collection("circles")
+                    .whereArrayContains("members", uid)
+                    .addSnapshotListener { snapshot, e ->
+                        if (e != null) return@addSnapshotListener
+                        if (snapshot != null) {
+                            val allCircles = snapshot.toObjects(Circle::class.java)
+                            var gCount = 0
+                            for (c in allCircles) {
+                                if (c.ownerId == uid) {
+                                    if (c.type != "Duo") gCount++
+                                }
+                            }
+                            ownedGroupCount = gCount
+                            userCircles = allCircles.filter { circle -> circle.type != "Duo" }
+                        }
+                    }
+            } catch (e: Exception) {
+                // Handle error
+            }
+        }
     }
 
     // Map State
@@ -385,7 +438,7 @@ fun HomeScreen(navController: NavController) {
                 for (alertSnapshot in snapshot.children) {
                     val id = alertSnapshot.key ?: continue
                     val type = alertSnapshot.child("type").getValue(String::class.java) ?: ""
-                    
+
                     // Filter alerts for LGU Admins
                     if (userRole == "lgu_admin") {
                         val isRelevant = when (userDepartment) {
@@ -399,15 +452,20 @@ fun HomeScreen(navController: NavController) {
 
                     val lat = alertSnapshot.child("lat").getValue(Double::class.java) ?: 0.0
                     val lon = alertSnapshot.child("lon").getValue(Double::class.java) ?: 0.0
-                    val status = alertSnapshot.child("status").getValue(String::class.java) ?: "pending"
+                    val status =
+                        alertSnapshot.child("status").getValue(String::class.java) ?: "pending"
                     val userName = alertSnapshot.child("userName").getValue(String::class.java)
-                    val userPhotoUrl = alertSnapshot.child("userPhotoUrl").getValue(String::class.java)
+                    val userPhotoUrl =
+                        alertSnapshot.child("userPhotoUrl").getValue(String::class.java)
                     val userId = alertSnapshot.child("userId").getValue(String::class.java)
-                    val timestamp = alertSnapshot.child("timestamp").getValue(Long::class.java) ?: 0L
+                    val timestamp =
+                        alertSnapshot.child("timestamp").getValue(Long::class.java) ?: 0L
                     val address = alertSnapshot.child("address").getValue(String::class.java) ?: ""
-                    val photoBase64 = alertSnapshot.child("photoBase64").getValue(String::class.java) ?: ""
+                    val photoBase64 =
+                        alertSnapshot.child("photoBase64").getValue(String::class.java) ?: ""
                     val details = alertSnapshot.child("details").getValue(String::class.java) ?: ""
-                    val phoneNumber = alertSnapshot.child("phoneNumber").getValue(String::class.java) ?: ""
+                    val phoneNumber =
+                        alertSnapshot.child("phoneNumber").getValue(String::class.java) ?: ""
                     val notes = alertSnapshot.child("notes").getValue(String::class.java) ?: ""
 
                     newAlerts[id] = RemoteAlert(
@@ -437,14 +495,28 @@ fun HomeScreen(navController: NavController) {
     }
 
     // Sync with Service
-    val serviceIsNavigating by navigationService?.isNavigating?.collectAsState(initial = false) ?: mutableStateOf(false)
-    val serviceSteps by navigationService?.navigationSteps?.collectAsState(initial = emptyList()) ?: mutableStateOf(emptyList())
-    val serviceCurrentStepIndex by navigationService?.currentStepIndex?.collectAsState(initial = 0) ?: mutableStateOf(0)
-    val serviceDistance by navigationService?.distanceToNextTurn?.collectAsState(initial = 0.0) ?: mutableStateOf(0.0)
-    val serviceRoutePoints by navigationService?.routePoints?.collectAsState(initial = emptyList()) ?: mutableStateOf(emptyList())
-    val serviceRemainingRoutePoints by navigationService?.remainingRoutePoints?.collectAsState(initial = emptyList()) ?: mutableStateOf(emptyList())
+    val serviceIsNavigating by navigationService?.isNavigating?.collectAsState(initial = false)
+        ?: mutableStateOf(false)
+    val serviceSteps by navigationService?.navigationSteps?.collectAsState(initial = emptyList())
+        ?: mutableStateOf(emptyList())
+    val serviceCurrentStepIndex by navigationService?.currentStepIndex?.collectAsState(initial = 0)
+        ?: mutableStateOf(0)
+    val serviceDistance by navigationService?.distanceToNextTurn?.collectAsState(initial = 0.0)
+        ?: mutableStateOf(0.0)
+    val serviceRoutePoints by navigationService?.routePoints?.collectAsState(initial = emptyList())
+        ?: mutableStateOf(emptyList())
+    val serviceRemainingRoutePoints by navigationService?.remainingRoutePoints?.collectAsState(
+        initial = emptyList()
+    ) ?: mutableStateOf(emptyList())
 
-    LaunchedEffect(serviceIsNavigating, serviceSteps, serviceCurrentStepIndex, serviceDistance, serviceRemainingRoutePoints, mapLibreMap) {
+    LaunchedEffect(
+        serviceIsNavigating,
+        serviceSteps,
+        serviceCurrentStepIndex,
+        serviceDistance,
+        serviceRemainingRoutePoints,
+        mapLibreMap
+    ) {
         if (serviceIsNavigating) {
             isNavigating = true
             if (serviceSteps.isNotEmpty()) {
@@ -481,8 +553,14 @@ fun HomeScreen(navController: NavController) {
                                 Expression.interpolate(
                                     Expression.linear(),
                                     Expression.lineProgress(),
-                                    Expression.stop(0f, Expression.color(android.graphics.Color.BLUE)),
-                                    Expression.stop(1f, Expression.color(android.graphics.Color.CYAN))
+                                    Expression.stop(
+                                        0f,
+                                        Expression.color(android.graphics.Color.BLUE)
+                                    ),
+                                    Expression.stop(
+                                        1f,
+                                        Expression.color(android.graphics.Color.CYAN)
+                                    )
                                 )
                             )
                         )
@@ -496,7 +574,7 @@ fun HomeScreen(navController: NavController) {
                 navigationSteps = emptyList()
                 currentStepIndex = 0
                 distanceToNextTurn = 0.0
-                
+
                 mapLibreMap?.getStyle { style ->
                     if (style.getLayer("route-layer") != null) style.removeLayer("route-layer")
                     if (style.getSource("route-source") != null) style.removeSource("route-source")
@@ -512,55 +590,66 @@ fun HomeScreen(navController: NavController) {
     var showSharingSheet by remember { mutableStateOf(false) }
     var showGroupSheet by remember { mutableStateOf(false) }
     // Initialize from SharedPreferences
-    val sharedPreferences = remember { context.getSharedPreferences("safeko_prefs", Context.MODE_PRIVATE) }
-    var sharingOption by remember { 
-        mutableStateOf(sharedPreferences.getString("sharing_option", "Visible to others") ?: "Visible to others") 
+    val sharedPreferences =
+        remember { context.getSharedPreferences("safeko_prefs", Context.MODE_PRIVATE) }
+    var sharingOption by remember {
+        mutableStateOf(
+            sharedPreferences.getString("sharing_option", "Visible to others")
+                ?: "Visible to others"
+        )
     }
 
     // Tutorial State
     val currentUserId = auth.currentUser?.uid ?: ""
     val tutorialKey = "tutorial_completed_$currentUserId"
-    var showTutorial by remember { 
-        mutableStateOf(!sharedPreferences.getBoolean(tutorialKey, false)) 
+    var showTutorial by remember {
+        mutableStateOf(!sharedPreferences.getBoolean(tutorialKey, false))
     }
-    
+
     // Edit Profile State
     var showEditProfile by remember { mutableStateOf(false) }
-    var userPhoneNumber by remember { 
-        mutableStateOf(sharedPreferences.getString("user_phone_number_$currentUserId", "") ?: "") 
+    var userPhoneNumber by remember {
+        mutableStateOf(sharedPreferences.getString("user_phone_number_$currentUserId", "") ?: "")
     }
     var currentUserAddress by remember { mutableStateOf("Locating...") }
     var isUploadingPhoto by remember { mutableStateOf(false) }
 
     // Image Picker Launcher
-    val pickMedia = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
-        if (uri != null) {
-            isUploadingPhoto = true
-            val userId = auth.currentUser?.uid
-            if (userId != null) {
-                val storageRef = FirebaseStorage.getInstance().reference.child("profile_images/$userId.jpg")
-                scope.launch {
-                    try {
-                        storageRef.putFile(uri).await()
-                        val downloadUrl = storageRef.downloadUrl.await()
-                        
-                        // Update Firebase Auth Profile
-                        val profileUpdates = UserProfileChangeRequest.Builder()
-                            .setPhotoUri(downloadUrl)
-                            .build()
-                        
-                        auth.currentUser?.updateProfile(profileUpdates)?.await()
-                        
-                        Toast.makeText(context, "Profile picture updated!", Toast.LENGTH_SHORT).show()
-                    } catch (e: Exception) {
-                        Toast.makeText(context, "Failed to update profile picture: ${e.message}", Toast.LENGTH_SHORT).show()
-                    } finally {
-                        isUploadingPhoto = false
+    val pickMedia =
+        rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+            if (uri != null) {
+                isUploadingPhoto = true
+                val userId = auth.currentUser?.uid
+                if (userId != null) {
+                    val storageRef =
+                        FirebaseStorage.getInstance().reference.child("profile_images/$userId.jpg")
+                    scope.launch {
+                        try {
+                            storageRef.putFile(uri).await()
+                            val downloadUrl = storageRef.downloadUrl.await()
+
+                            // Update Firebase Auth Profile
+                            val profileUpdates = UserProfileChangeRequest.Builder()
+                                .setPhotoUri(downloadUrl)
+                                .build()
+
+                            auth.currentUser?.updateProfile(profileUpdates)?.await()
+
+                            Toast.makeText(context, "Profile picture updated!", Toast.LENGTH_SHORT)
+                                .show()
+                        } catch (e: Exception) {
+                            Toast.makeText(
+                                context,
+                                "Failed to update profile picture: ${e.message}",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        } finally {
+                            isUploadingPhoto = false
+                        }
                     }
                 }
             }
         }
-    }
 
     var currentTutorialStep by remember { mutableStateOf(0) }
     var searchButtonRect by remember { mutableStateOf<Rect?>(null) }
@@ -569,7 +658,7 @@ fun HomeScreen(navController: NavController) {
     var sharingLocationRect by remember { mutableStateOf<Rect?>(null) }
     var profileRect by remember { mutableStateOf<Rect?>(null) }
     var groupButtonRect by remember { mutableStateOf<Rect?>(null) }
-    
+
     val tutorialSteps = remember {
         listOf(
             TutorialStep(
@@ -617,7 +706,7 @@ fun HomeScreen(navController: NavController) {
     }
 
     // Route Animation State
-    // Optimized: Removed infiniteTransition to reduce main thread load. 
+    // Optimized: Removed infiniteTransition to reduce main thread load.
     // Animation is now handled manually in LaunchedEffect loop below.
 
 
@@ -972,6 +1061,7 @@ fun HomeScreen(navController: NavController) {
                     sharedPreferences.edit().putBoolean(tutorialKey, true).apply()
                 }
             }
+
             selectedLocation != null -> selectedLocation = null
             isNavigating -> {
                 isNavigating = false
@@ -983,6 +1073,7 @@ fun HomeScreen(navController: NavController) {
                 }
                 Toast.makeText(context, "Navigation Canceled", Toast.LENGTH_SHORT).show()
             }
+
             else -> {
                 val currentTime = System.currentTimeMillis()
                 if (currentTime - backPressState < 2000) {
@@ -1033,7 +1124,12 @@ fun HomeScreen(navController: NavController) {
             radius,
             radius,
             intArrayOf(
-                android.graphics.Color.argb(80, android.graphics.Color.red(color), android.graphics.Color.green(color), android.graphics.Color.blue(color)),
+                android.graphics.Color.argb(
+                    80,
+                    android.graphics.Color.red(color),
+                    android.graphics.Color.green(color),
+                    android.graphics.Color.blue(color)
+                ),
                 android.graphics.Color.TRANSPARENT
             ),
             floatArrayOf(0.0f, 1.0f),
@@ -1056,26 +1152,68 @@ fun HomeScreen(navController: NavController) {
 
     suspend fun markAlertResolved(alertId: String, token: String?) {
         withContext(Dispatchers.IO) {
-            val authParam = if (token != null) "?auth=$token" else ""
-            val url = URL("$rtdbBaseUrl/alerts/$alertId.json$authParam")
-            val connection = (url.openConnection() as HttpURLConnection).apply {
-                requestMethod = "PATCH"
-                connectTimeout = 5000
-                readTimeout = 5000
-                doOutput = true
-                setRequestProperty("Content-Type", "application/json")
-            }
+            var currentToken = token
+            var retries = 0
+            
+            while (retries < 2) {
+                val authParam = if (currentToken != null) "?auth=$currentToken" else ""
+                val url = URL("$rtdbBaseUrl/alerts/$alertId.json$authParam")
+                val connection = (url.openConnection() as HttpURLConnection).apply {
+                    requestMethod = "PATCH"
+                    connectTimeout = 5000
+                    readTimeout = 5000
+                    doOutput = true
+                    setRequestProperty("Content-Type", "application/json")
+                }
 
-            try {
-                val payload = JSONObject()
-                    .put("status", "resolved")
-                    .put("resolvedAt", System.currentTimeMillis())
-                connection.outputStream.use { it.write(payload.toString().toByteArray()) }
-                connection.inputStream.close()
-            } catch (e: Exception) {
-                Log.e("HomeScreen", "Failed to auto-resolve alert $alertId", e)
-            } finally {
-                connection.disconnect()
+                try {
+                    val payload = JSONObject()
+                        .put("status", "resolved")
+                        .put("resolvedAt", System.currentTimeMillis())
+                    connection.outputStream.use { it.write(payload.toString().toByteArray()) }
+                    
+                    val responseCode = connection.responseCode
+                    when (responseCode) {
+                        200 -> {
+                            connection.inputStream.close()
+                            Log.d("HomeScreen", "Alert $alertId resolved successfully")
+                            return@withContext
+                        }
+                        404 -> {
+                            Log.d("HomeScreen", "Alert $alertId not found (already deleted or never existed)")
+                            return@withContext
+                        }
+                        401 -> {
+                            // Token expired/invalid, retry with fresh token
+                            if (retries == 0) {
+                                Log.d("HomeScreen", "Token expired for alert $alertId, refreshing...")
+                                currentToken = try {
+                                    auth.currentUser?.getIdToken(true)?.await()?.token
+                                } catch (e: Exception) {
+                                    Log.e("HomeScreen", "Failed to refresh token", e)
+                                    null
+                                }
+                                retries++
+                                connection.disconnect()
+                                continue
+                            } else {
+                                Log.e("HomeScreen", "Failed to auto-resolve alert $alertId: HTTP $responseCode (retry failed)")
+                                return@withContext
+                            }
+                        }
+                        else -> {
+                            Log.e("HomeScreen", "Failed to auto-resolve alert $alertId: HTTP $responseCode")
+                            return@withContext
+                        }
+                    }
+                } catch (e: Exception) {
+                    if (e !is java.io.FileNotFoundException) {
+                        Log.e("HomeScreen", "Failed to auto-resolve alert $alertId", e)
+                    }
+                    return@withContext
+                } finally {
+                    connection.disconnect()
+                }
             }
         }
     }
@@ -1088,10 +1226,10 @@ fun HomeScreen(navController: NavController) {
                 Log.e("HomeScreen", "Error getting auth token", e)
                 null
             }
-            
+
             val authParam = if (token != null) "?auth=$token" else ""
             val url = URL("$rtdbBaseUrl/alerts.json$authParam")
-            
+
             val connection = (url.openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
                 connectTimeout = 5000
@@ -1101,7 +1239,10 @@ fun HomeScreen(navController: NavController) {
 
             try {
                 if (connection.responseCode != 200) {
-                    Log.e("HomeScreen", "Failed to fetch alerts: ${connection.responseCode} ${connection.responseMessage}")
+                    Log.e(
+                        "HomeScreen",
+                        "Failed to fetch alerts: ${connection.responseCode} ${connection.responseMessage}"
+                    )
                     return@withContext emptyMap()
                 }
                 val response = connection.inputStream.bufferedReader().use { it.readText() }
@@ -1200,7 +1341,17 @@ fun HomeScreen(navController: NavController) {
                             val lastLat = doc.getDouble("lastLat")
                             val lastLon = doc.getDouble("lastLon")
                             val lastActive = doc.getLong("lastActive")
-                            fetchedMembers.add(CircleMember(uid, name, profilePhoto, sharedNames, lastLat, lastLon, lastActive))
+                            fetchedMembers.add(
+                                CircleMember(
+                                    uid,
+                                    name,
+                                    profilePhoto,
+                                    sharedNames,
+                                    lastLat,
+                                    lastLon,
+                                    lastActive
+                                )
+                            )
                         } catch (e: Exception) {
                             Log.e("HomeScreen", "Error fetching member $uid", e)
                         }
@@ -1241,7 +1392,7 @@ fun HomeScreen(navController: NavController) {
     LaunchedEffect(userRole, userDepartment) {
         while (true) {
             val fetchedAlerts = fetchAlerts()
-            
+
             // Filter alerts for LGU Admins
             val filteredAlerts = if (userRole == "lgu_admin") {
                 fetchedAlerts.filter { (_, alert) ->
@@ -1306,8 +1457,10 @@ fun HomeScreen(navController: NavController) {
                     canvas.drawCircle(centerF, centerF, radiusF, borderPaint)
 
                     if (photoBitmap != null) {
-                        val scaledBitmap = Bitmap.createScaledBitmap(photoBitmap, size - 8, size - 8, true)
-                        val innerPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+                        val scaledBitmap =
+                            Bitmap.createScaledBitmap(photoBitmap, size - 8, size - 8, true)
+                        val innerPaint =
+                            android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
                         val shader = android.graphics.BitmapShader(
                             scaledBitmap,
                             android.graphics.Shader.TileMode.CLAMP,
@@ -1319,7 +1472,8 @@ fun HomeScreen(navController: NavController) {
                         // Fallback: colored circle with initial letter
                         paint.color = android.graphics.Color.parseColor("#FF9800")
                         canvas.drawCircle(centerF, centerF, radiusF - 4, paint)
-                        val textPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+                        val textPaint =
+                            android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
                         textPaint.color = android.graphics.Color.WHITE
                         textPaint.textSize = 36f
                         textPaint.textAlign = android.graphics.Paint.Align.CENTER
@@ -1560,7 +1714,7 @@ fun HomeScreen(navController: NavController) {
             }
             val authParam = if (token != null) "?auth=$token" else ""
             val url = URL("$rtdbBaseUrl/alerts.json$authParam")
-            
+
             val connection = (url.openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
                 doOutput = true
@@ -1708,1581 +1862,1193 @@ fun HomeScreen(navController: NavController) {
         modifier = Modifier.fillMaxSize(),
         containerColor = Color.Transparent
     ) { paddingValues ->
-            Box(modifier = Modifier.fillMaxSize()) {
-                // Map View (Background)
-                AndroidView(
-                    factory = { mapView },
-                    modifier = Modifier.fillMaxSize(),
-                    update = { mv ->
-                        mv.getMapAsync { map ->
-                            if (mapLibreMap == null) {
-                                mapLibreMap = map
+        Box(modifier = Modifier.fillMaxSize()) {
+            // Map View (Background)
+            AndroidView(
+                factory = { mapView },
+                modifier = Modifier.fillMaxSize(),
+                update = { mv ->
+                    mv.getMapAsync { map ->
+                        if (mapLibreMap == null) {
+                            mapLibreMap = map
 
-                                // Load style from assets manually to ensure it's read correctly
-                                // Using CartoDB Light style for a clean map (roads only, no clutter)
-                                try {
-                                    val styleJson =
-                                        context.assets.open("style_3d.json").bufferedReader()
-                                            .use { it.readText() }
-                                    map.setStyle(Style.Builder().fromJson(styleJson)) { style ->
-                                        // Add Images for SymbolLayer - Use colored dots for alerts
-                                        style.addImage(
-                                            "icon-fire",
-                                            createColoredDot(android.graphics.Color.parseColor("#FF6F00"), 64) // Orange for Fire
-                                        )
-                                        style.addImage(
-                                            "icon-accident",
-                                            createColoredDot(android.graphics.Color.parseColor("#F9A825"), 72) // Darker amber for better contrast
-                                        )
-                                        style.addImage(
-                                            "icon-rescue",
-                                            createColoredDot(android.graphics.Color.parseColor("#E53935"), 64) // Red for Medical
-                                        )
-                                        // Add Source and Layer for Alerts
-                                        style.addSource(GeoJsonSource("alerts-source"))
-                                        style.addLayer(
-                                            SymbolLayer("alerts-layer", "alerts-source")
-                                                .withProperties(
-                                                    PropertyFactory.iconImage("{icon-image}"),
-                                                    PropertyFactory.iconAnchor(Property.ICON_ANCHOR_CENTER),
-                                                    PropertyFactory.iconAllowOverlap(true),
-                                                    PropertyFactory.iconIgnorePlacement(true),
-                                                    PropertyFactory.iconRotationAlignment(Property.ICON_ROTATION_ALIGNMENT_VIEWPORT),
-                                                    PropertyFactory.iconPitchAlignment(Property.ICON_PITCH_ALIGNMENT_VIEWPORT),
-                                                    PropertyFactory.iconSize(1.0f)
-                                                )
-                                        )
+                            // Load style from assets manually to ensure it's read correctly
+                            // Using CartoDB Light style for a clean map (roads only, no clutter)
+                            try {
+                                val styleJson =
+                                    context.assets.open("style_3d.json").bufferedReader()
+                                        .use { it.readText() }
+                                map.setStyle(Style.Builder().fromJson(styleJson)) { style ->
+                                    // Add Images for SymbolLayer - Use colored dots for alerts
+                                    style.addImage(
+                                        "icon-fire",
+                                        createColoredDot(
+                                            android.graphics.Color.parseColor("#FF6F00"),
+                                            64
+                                        ) // Orange for Fire
+                                    )
+                                    style.addImage(
+                                        "icon-accident",
+                                        createColoredDot(
+                                            android.graphics.Color.parseColor("#F9A825"),
+                                            72
+                                        ) // Darker amber for better contrast
+                                    )
+                                    style.addImage(
+                                        "icon-rescue",
+                                        createColoredDot(
+                                            android.graphics.Color.parseColor("#E53935"),
+                                            64
+                                        ) // Red for Medical
+                                    )
+                                    // Add Source and Layer for Alerts
+                                    style.addSource(GeoJsonSource("alerts-source"))
+                                    style.addLayer(
+                                        SymbolLayer("alerts-layer", "alerts-source")
+                                            .withProperties(
+                                                PropertyFactory.iconImage("{icon-image}"),
+                                                PropertyFactory.iconAnchor(Property.ICON_ANCHOR_CENTER),
+                                                PropertyFactory.iconAllowOverlap(true),
+                                                PropertyFactory.iconIgnorePlacement(true),
+                                                PropertyFactory.iconRotationAlignment(Property.ICON_ROTATION_ALIGNMENT_VIEWPORT),
+                                                PropertyFactory.iconPitchAlignment(Property.ICON_PITCH_ALIGNMENT_VIEWPORT),
+                                                PropertyFactory.iconSize(1.0f)
+                                            )
+                                    )
 
-                                        // Add Source and Layer for Search Results
-                                        style.addSource(GeoJsonSource("search-result-source"))
-                                        style.addLayer(
-                                            CircleLayer("search-result-layer", "search-result-source")
-                                                .withProperties(
-                                                    PropertyFactory.circleColor(android.graphics.Color.BLUE),
-                                                    PropertyFactory.circleRadius(8f),
-                                                    PropertyFactory.circleStrokeColor(android.graphics.Color.WHITE),
-                                                    PropertyFactory.circleStrokeWidth(2f)
-                                                )
-                                        )
+                                    // Add Source and Layer for Search Results
+                                    style.addSource(GeoJsonSource("search-result-source"))
+                                    style.addLayer(
+                                        CircleLayer("search-result-layer", "search-result-source")
+                                            .withProperties(
+                                                PropertyFactory.circleColor(android.graphics.Color.BLUE),
+                                                PropertyFactory.circleRadius(8f),
+                                                PropertyFactory.circleStrokeColor(android.graphics.Color.WHITE),
+                                                PropertyFactory.circleStrokeWidth(2f)
+                                            )
+                                    )
 
-                                        // Add Source and Layer for Circle Members (profile photos)
-                                        style.addSource(GeoJsonSource("members-source"))
-                                        style.addLayer(
-                                            SymbolLayer("members-layer", "members-source")
-                                                .withProperties(
-                                                    PropertyFactory.iconImage("{member-icon}"),
-                                                    PropertyFactory.iconSize(1.0f),
-                                                    PropertyFactory.iconAllowOverlap(true),
-                                                    PropertyFactory.iconIgnorePlacement(true),
-                                                    PropertyFactory.iconRotationAlignment(Property.ICON_ROTATION_ALIGNMENT_VIEWPORT),
-                                                    PropertyFactory.iconPitchAlignment(Property.ICON_PITCH_ALIGNMENT_VIEWPORT),
-                                                    PropertyFactory.iconAnchor(Property.ICON_ANCHOR_CENTER)
-                                                )
-                                        )
+                                    // Add Source and Layer for Circle Members (profile photos)
+                                    style.addSource(GeoJsonSource("members-source"))
+                                    style.addLayer(
+                                        SymbolLayer("members-layer", "members-source")
+                                            .withProperties(
+                                                PropertyFactory.iconImage("{member-icon}"),
+                                                PropertyFactory.iconSize(1.0f),
+                                                PropertyFactory.iconAllowOverlap(true),
+                                                PropertyFactory.iconIgnorePlacement(true),
+                                                PropertyFactory.iconRotationAlignment(Property.ICON_ROTATION_ALIGNMENT_VIEWPORT),
+                                                PropertyFactory.iconPitchAlignment(Property.ICON_PITCH_ALIGNMENT_VIEWPORT),
+                                                PropertyFactory.iconAnchor(Property.ICON_ANCHOR_CENTER)
+                                            )
+                                    )
 
-                                        map.uiSettings.isRotateGesturesEnabled = true
-                                        map.uiSettings.isTiltGesturesEnabled = true
-                                        map.uiSettings.isCompassEnabled =
-                                            false // Disable default compass
+                                    map.uiSettings.isRotateGesturesEnabled = true
+                                    map.uiSettings.isTiltGesturesEnabled = true
+                                    map.uiSettings.isCompassEnabled =
+                                        false // Disable default compass
 
-                                        if (hasLocationPermission) {
-                                            try {
-                                                val locationComponent = map.locationComponent
-                                                locationComponent.activateLocationComponent(
-                                                    LocationComponentActivationOptions.builder(
-                                                        context,
-                                                        style
-                                                    ).build()
-                                                )
-                                                locationComponent.isLocationComponentEnabled = true
-                                                locationComponent.cameraMode = CameraMode.TRACKING
-                                                locationComponent.renderMode = RenderMode.COMPASS
-                                            } catch (e: Exception) {
-                                                Log.e("MapLibre", "Location component error", e)
-                                            }
+                                    if (hasLocationPermission) {
+                                        try {
+                                            val locationComponent = map.locationComponent
+                                            locationComponent.activateLocationComponent(
+                                                LocationComponentActivationOptions.builder(
+                                                    context,
+                                                    style
+                                                ).build()
+                                            )
+                                            locationComponent.isLocationComponentEnabled = true
+                                            locationComponent.cameraMode = CameraMode.TRACKING
+                                            locationComponent.renderMode = RenderMode.COMPASS
+                                        } catch (e: Exception) {
+                                            Log.e("MapLibre", "Location component error", e)
                                         }
+                                    }
 
-                                        // Map Click Listener (Alerts & Search Results)
-                                        map.addOnMapClickListener { point ->
-                                            try {
-                                                val screenPoint =
-                                                    map.projection.toScreenLocation(point)
+                                    // Map Click Listener (Alerts & Search Results)
+                                    map.addOnMapClickListener { point ->
+                                        try {
+                                            val screenPoint =
+                                                map.projection.toScreenLocation(point)
 
-                                                // 1. Check Member Markers
-                                                val memberFeatures = map.queryRenderedFeatures(
-                                                    screenPoint,
-                                                    "members-layer"
-                                                )
-                                                if (memberFeatures.isNotEmpty()) {
-                                                    val uid = memberFeatures[0].getStringProperty("uid")
-                                                    val tappedMember = circleMembers.find { it.uid == uid }
-                                                    if (tappedMember != null) {
-                                                        selectedMemberOnMap = tappedMember
-                                                        selectedMemberAddress = "Fetching location..."
-                                                        // Reverse-geocode on background
-                                                        scope.launch {
-                                                            val addr = try {
-                                                                if (tappedMember.lastLat != null && tappedMember.lastLon != null) {
-                                                                    PlaceSearcher.reverseGeocode(tappedMember.lastLat, tappedMember.lastLon)
-                                                                } else ""
-                                                            } catch (e: Exception) { "" }
-                                                            selectedMemberAddress = if (addr.isNotBlank()) addr
+                                            // 1. Check Member Markers
+                                            val memberFeatures = map.queryRenderedFeatures(
+                                                screenPoint,
+                                                "members-layer"
+                                            )
+                                            if (memberFeatures.isNotEmpty()) {
+                                                val uid = memberFeatures[0].getStringProperty("uid")
+                                                val tappedMember =
+                                                    circleMembers.find { it.uid == uid }
+                                                if (tappedMember != null) {
+                                                    selectedMemberOnMap = tappedMember
+                                                    selectedMemberAddress = "Fetching location..."
+                                                    // Reverse-geocode on background
+                                                    scope.launch {
+                                                        val addr = try {
+                                                            if (tappedMember.lastLat != null && tappedMember.lastLon != null) {
+                                                                PlaceSearcher.reverseGeocode(
+                                                                    tappedMember.lastLat,
+                                                                    tappedMember.lastLon
+                                                                )
+                                                            } else ""
+                                                        } catch (e: Exception) {
+                                                            ""
+                                                        }
+                                                        selectedMemberAddress =
+                                                            if (addr.isNotBlank()) addr
                                                             else if (tappedMember.lastLat != null) "${tappedMember.lastLat}, ${tappedMember.lastLon}"
                                                             else "Location unknown"
-                                                        }
                                                     }
-                                                    return@addOnMapClickListener true
                                                 }
+                                                return@addOnMapClickListener true
+                                            }
 
-                                                // 2. Check Search Results
-                                                val searchFeatures = map.queryRenderedFeatures(
-                                                    screenPoint,
-                                                    "search-result-layer"
-                                                )
-                                                if (searchFeatures.isNotEmpty()) {
-                                                    if (selectedLocation != null) {
-                                                        showLocationModal = true
-                                                    }
-                                                    return@addOnMapClickListener true
+                                            // 2. Check Search Results
+                                            val searchFeatures = map.queryRenderedFeatures(
+                                                screenPoint,
+                                                "search-result-layer"
+                                            )
+                                            if (searchFeatures.isNotEmpty()) {
+                                                if (selectedLocation != null) {
+                                                    showLocationModal = true
                                                 }
+                                                return@addOnMapClickListener true
+                                            }
 
-                                                // 2. Check Alerts
-                                                val features = map.queryRenderedFeatures(
-                                                    screenPoint,
-                                                    "alerts-layer"
-                                                )
-                                                if (features.isNotEmpty()) {
-                                                    val feature = features[0]
-                                                    val id = feature.getStringProperty("id")
-                                                    val alert = alerts[id]
-                                                    if (alert != null) {
-                                                        selectedAlert = alert
-                                                        showAlertDetails = true
+                                            // 2. Check Alerts
+                                            val features = map.queryRenderedFeatures(
+                                                screenPoint,
+                                                "alerts-layer"
+                                            )
+                                            if (features.isNotEmpty()) {
+                                                val feature = features[0]
+                                                val id = feature.getStringProperty("id")
+                                                val alert = alerts[id]
+                                                if (alert != null) {
+                                                    selectedAlert = alert
+                                                    showAlertDetails = true
 
-                                                        // Fetch address if missing
-                                                        if (alert.address.isBlank()) {
-                                                            scope.launch {
-                                                                try {
-                                                                    // Show loading state
-                                                                    selectedAlert =
-                                                                        selectedAlert?.copy(address = "Loading address...")
+                                                    // Fetch address if missing
+                                                    if (alert.address.isBlank()) {
+                                                        scope.launch {
+                                                            try {
+                                                                // Show loading state
+                                                                selectedAlert =
+                                                                    selectedAlert?.copy(address = "Loading address...")
 
-                                                                    val address =
-                                                                        PlaceSearcher.reverseGeocode(
-                                                                            alert.lat,
-                                                                            alert.lon
-                                                                        )
+                                                                val address =
+                                                                    PlaceSearcher.reverseGeocode(
+                                                                        alert.lat,
+                                                                        alert.lon
+                                                                    )
 
-                                                                    // Update if we are still viewing the same alert
-                                                                    if (selectedAlert?.id == alert.id) {
-                                                                        if (address.isNotBlank()) {
-                                                                            selectedAlert =
-                                                                                selectedAlert?.copy(
-                                                                                    address = address
-                                                                                )
-                                                                        } else {
-                                                                            // Revert to coordinates if failed
-                                                                            selectedAlert =
-                                                                                selectedAlert?.copy(
-                                                                                    address = "${alert.lat}, ${alert.lon}"
-                                                                                )
-                                                                        }
+                                                                // Update if we are still viewing the same alert
+                                                                if (selectedAlert?.id == alert.id) {
+                                                                    if (address.isNotBlank()) {
+                                                                        selectedAlert =
+                                                                            selectedAlert?.copy(
+                                                                                address = address
+                                                                            )
+                                                                    } else {
+                                                                        // Revert to coordinates if failed
+                                                                        selectedAlert =
+                                                                            selectedAlert?.copy(
+                                                                                address = "${alert.lat}, ${alert.lon}"
+                                                                            )
                                                                     }
-                                                                } catch (e: Exception) {
-                                                                    e.printStackTrace()
                                                                 }
+                                                            } catch (e: Exception) {
+                                                                e.printStackTrace()
                                                             }
                                                         }
                                                     }
-                                                    true
-                                                } else {
-                                                    false
                                                 }
-                                            } catch (e: Exception) {
-                                                Log.e("HomeScreen", "Error handling map click", e)
+                                                true
+                                            } else {
                                                 false
                                             }
+                                        } catch (e: Exception) {
+                                            Log.e("HomeScreen", "Error handling map click", e)
+                                            false
                                         }
-                                        isMapReady = true
-                                    } // Close setStyle
-                                } catch (e: Exception) {
-                                    Log.e("MapLibre", "Error loading style.json", e)
-                                    Toast.makeText(
-                                        context,
-                                        "Error loading map style",
-                                        Toast.LENGTH_LONG
-                                    ).show()
-
-                                    // Fallback to OSM Raster if asset fails
-                                    val osmStyle = Style.Builder()
-                                        .withSource(
-                                            RasterSource(
-                                                "osm-source",
-                                                TileSet(
-                                                    "tiles",
-                                                    "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
-                                                ),
-                                                256
-                                            )
-                                        )
-                                        .withLayer(RasterLayer("osm-layer", "osm-source"))
-                                    map.setStyle(osmStyle) { style ->
-                                        map.uiSettings.isRotateGesturesEnabled = true
-                                        map.uiSettings.isTiltGesturesEnabled = true
-                                        map.uiSettings.isCompassEnabled =
-                                            false // Disable default compass
-                                        isMapReady = true
                                     }
-                                }
+                                    isMapReady = true
+                                } // Close setStyle
+                            } catch (e: Exception) {
+                                Log.e("MapLibre", "Error loading style.json", e)
+                                Toast.makeText(
+                                    context,
+                                    "Error loading map style",
+                                    Toast.LENGTH_LONG
+                                ).show()
 
-                                // Set initial camera position only once
-                                map.cameraPosition = CameraPosition.Builder()
-                                    .target(LatLng(10.3157, 123.8854)) // Cebu
-                                    .zoom(12.0)
-                                    .tilt(45.0)
-                                    .build()
-                            }
-                        }
-                    }
-                )
-
-                // Top Overlay Section (Sharing Location & Buttons)
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(top = 48.dp, start = 16.dp, end = 16.dp)
-                ) {
-                    Box(modifier = Modifier.fillMaxWidth()) {
-                        // Sharing Location Pill (Center) or Navigation Card
-                        if (isNavigating && navigationSteps.isNotEmpty()) {
-                            // Navigation Instruction Card
-                            Surface(
-                                shape = RoundedCornerShape(16.dp),
-                                color = Color(0xFF29B6F6), // Light Blue
-                                contentColor = Color.White,
-                                shadowElevation = 8.dp,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(end = 60.dp) // Leave space for right icons
-                                    .align(Alignment.CenterStart)
-                            ) {
-                                Column(
-                                    modifier = Modifier.padding(16.dp)
-                                ) {
-                                    val step = navigationSteps.getOrNull(currentStepIndex)
-                                    if (step != null) {
-                                        Row(verticalAlignment = Alignment.CenterVertically) {
-                                            // Direction Icon
-                                            val icon = when {
-                                                step.maneuverModifier?.contains("left") == true -> Icons.Rounded.ArrowBack
-                                                step.maneuverModifier?.contains("right") == true -> Icons.Rounded.ArrowForward
-                                                else -> Icons.Rounded.ArrowUpward
-                                            }
-                                            Icon(
-                                                imageVector = icon,
-                                                contentDescription = null,
-                                                modifier = Modifier.size(32.dp),
-                                                tint = Color.White
-                                            )
-                                            Spacer(modifier = Modifier.width(16.dp))
-                                            Column {
-                                                Text(
-                                                    text = step.instruction,
-                                                    style = MaterialTheme.typography.titleMedium,
-                                                    fontWeight = FontWeight.Bold
-                                                )
-                                                if (distanceToNextTurn > 0) {
-                                                    Text(
-                                                        text = "${distanceToNextTurn.toInt()} m",
-                                                        style = MaterialTheme.typography.bodyMedium,
-                                                        color = Color.White.copy(alpha = 0.9f)
-                                                    )
-                                                }
-                                            }
-                                        }
-                                    } else {
-                                        Text(
-                                            "Arrived",
-                                            style = MaterialTheme.typography.titleMedium
+                                // Fallback to OSM Raster if asset fails
+                                val osmStyle = Style.Builder()
+                                    .withSource(
+                                        RasterSource(
+                                            "osm-source",
+                                            TileSet(
+                                                "tiles",
+                                                "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+                                            ),
+                                            256
                                         )
-                                    }
-                                }
-                            }
-                        } else {
-                            // Sharing Location Indicator
-                            val (sharingLabel, sharingIcon, sharingColor) = when (sharingOption) {
-                                "Visible to others" -> Triple(
-                                    "Sharing Location",
-                                    Icons.Rounded.Public,
-                                    Color(0xFF2196F3)
-                                ) // Blue
-                                "Family" -> Triple(
-                                    "Shared to family",
-                                    Icons.Rounded.Home,
-                                    Color(0xFF4CAF50)
-                                ) // Green
-                                "No one" -> Triple(
-                                    "Not sharing location",
-                                    Icons.Rounded.LocationOff,
-                                    Color(0xFFFF5252)
-                                )
-
-                                else -> Triple(
-                                    "Sharing Location",
-                                    Icons.Rounded.Public,
-                                    Color(0xFF2196F3)
-                                )
-                            }
-
-                            Surface(
-                                onClick = { showSharingSheet = true },
-                                shape = RoundedCornerShape(percent = 50),
-                                color = Color(0xFF2B2B2B).copy(alpha = 0.9f),
-                                contentColor = Color.White,
-                                shadowElevation = 6.dp,
-                                modifier = Modifier
-                                    .align(Alignment.Center)
-                                    .onGloballyPositioned { coordinates ->
-                                        val position = coordinates.positionInRoot()
-                                        val size = coordinates.size
-                                        sharingLocationRect = Rect(
-                                            offset = position,
-                                            size = Size(size.width.toFloat(), size.height.toFloat())
-                                        )
-                                    }
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(
-                                        horizontal = 20.dp,
-                                        vertical = 10.dp
-                                    ),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Icon(
-                                        imageVector = sharingIcon,
-                                        contentDescription = null,
-                                        tint = sharingColor,
-                                        modifier = Modifier.size(18.dp)
                                     )
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Text(
-                                        text = sharingLabel,
-                                        style = MaterialTheme.typography.labelLarge,
-                                        fontWeight = FontWeight.Medium
-                                    )
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Box(
-                                        modifier = Modifier
-                                            .size(8.dp)
-                                            .background(sharingColor, CircleShape)
-                                    )
-                                }
-                            }
-                        }
-
-                        // Top Right Icons (Profile & Compass)
-                        Column(
-                            modifier = Modifier.align(Alignment.CenterEnd),
-                            verticalArrangement = Arrangement.spacedBy(12.dp)
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(40.dp)
-                                    .clip(CircleShape)
-                                    .clickable { navController.navigate("profile") }
-                                    .onGloballyPositioned { coordinates ->
-                                        val position = coordinates.positionInRoot()
-                                        val size = coordinates.size
-                                        profileRect = Rect(
-                                            offset = position,
-                                            size = Size(size.width.toFloat(), size.height.toFloat())
-                                        )
-                                    }
-                            ) {
-                                val photoUrl = auth.currentUser?.photoUrl?.toString()
-                                if (!photoUrl.isNullOrBlank()) {
-                                    AsyncImage(
-                                        model = ImageRequest.Builder(LocalContext.current)
-                                            .data(photoUrl)
-                                            .crossfade(true)
-                                            .transformations(CircleCropTransformation())
-                                            .build(),
-                                        contentDescription = "Profile",
-                                        modifier = Modifier
-                                            .fillMaxSize()
-                                            .clip(CircleShape),
-                                        contentScale = ContentScale.Crop
-                                    )
-                                } else {
-                                    Box(
-                                        modifier = Modifier.fillMaxSize(),
-                                        contentAlignment = Alignment.Center
-                                    ) {
-                                        Icon(
-                                            imageVector = Icons.Filled.Person,
-                                            contentDescription = "Profile",
-                                            tint = Color.Black,
-                                            modifier = Modifier.size(24.dp)
-                                        )
-                                    }
+                                    .withLayer(RasterLayer("osm-layer", "osm-source"))
+                                map.setStyle(osmStyle) { style ->
+                                    map.uiSettings.isRotateGesturesEnabled = true
+                                    map.uiSettings.isTiltGesturesEnabled = true
+                                    map.uiSettings.isCompassEnabled =
+                                        false // Disable default compass
+                                    isMapReady = true
                                 }
                             }
 
-                            SmallFloatingActionButton(
-                                onClick = {
-                                    mapLibreMap?.let { map ->
-                                        map.animateCamera(
-                                            CameraUpdateFactory.newCameraPosition(
-                                                CameraPosition.Builder()
-                                                    .target(map.cameraPosition.target)
-                                                    .zoom(map.cameraPosition.zoom)
-                                                    .bearing(0.0) // Reset bearing to North
-                                                    .tilt(0.0)
-                                                    .build()
-                                            )
-                                        )
-                                    }
-                                },
-                                containerColor = Color.White,
-                                contentColor = Color.Black,
-                                shape = CircleShape
-                            ) {
-                                Icon(Icons.Rounded.Explore, contentDescription = "Compass")
-                            }
+                            // Set initial camera position only once
+                            map.cameraPosition = CameraPosition.Builder()
+                                .target(LatLng(10.3157, 123.8854)) // Cebu
+                                .zoom(12.0)
+                                .tilt(45.0)
+                                .build()
                         }
                     }
                 }
+            )
 
-                // Bottom Navigation Bar (Custom)
-                Box(
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .fillMaxWidth()
-                ) {
-                    // White Navigation Bar
-                    Surface(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(80.dp)
-                            .align(Alignment.BottomCenter),
-                        shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp),
-                        color = Color.White,
-                        shadowElevation = 16.dp
-                    ) {
-                        Row(
-                            modifier = Modifier.fillMaxSize(),
-                            horizontalArrangement = Arrangement.SpaceAround,
-                            verticalAlignment = Alignment.CenterVertically
+            // Top Overlay Section (Sharing Location & Buttons)
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 48.dp, start = 16.dp, end = 16.dp)
+            ) {
+                Box(modifier = Modifier.fillMaxWidth()) {
+                    // Sharing Location Pill (Center) or Navigation Card
+                    if (isNavigating && navigationSteps.isNotEmpty()) {
+                        // Navigation Instruction Card
+                        Surface(
+                            shape = RoundedCornerShape(16.dp),
+                            color = Color(0xFF29B6F6), // Light Blue
+                            contentColor = Color.White,
+                            shadowElevation = 8.dp,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(end = 60.dp) // Leave space for right icons
+                                .align(Alignment.CenterStart)
                         ) {
-                            // 1. Home
-                            IconButton(onClick = {
-                                mapLibreMap?.let { map ->
-                                    map.animateCamera(
-                                        CameraUpdateFactory.newCameraPosition(
-                                            CameraPosition.Builder()
-                                                .target(LatLng(10.3157, 123.8854)) // Reset to Cebu
-                                                .zoom(12.0)
-                                                .tilt(0.0)
-                                                .bearing(0.0)
-                                                .build()
+                            Column(
+                                modifier = Modifier.padding(16.dp)
+                            ) {
+                                val step = navigationSteps.getOrNull(currentStepIndex)
+                                if (step != null) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        // Direction Icon
+                                        val icon = when {
+                                            step.maneuverModifier?.contains("left") == true -> Icons.Rounded.ArrowBack
+                                            step.maneuverModifier?.contains("right") == true -> Icons.Rounded.ArrowForward
+                                            else -> Icons.Rounded.ArrowUpward
+                                        }
+                                        Icon(
+                                            imageVector = icon,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(32.dp),
+                                            tint = Color.White
                                         )
-                                    )
-                                }
-                            }) {
-                                Icon(
-                                    imageVector = Icons.Rounded.Home,
-                                    contentDescription = "Home",
-                                    tint = Color(0xFF29B6F6), // Light Blue
-                                    modifier = Modifier.size(28.dp)
-                                )
-                            }
-
-                            // 2. Search
-                            IconButton(
-                                onClick = { showBottomSheet = true },
-                                modifier = Modifier.onGloballyPositioned { coordinates ->
-                                    val position = coordinates.positionInRoot()
-                                    val size = coordinates.size
-                                    searchButtonRect = Rect(
-                                        offset = position,
-                                        size = Size(size.width.toFloat(), size.height.toFloat())
-                                    )
-                                }
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Rounded.Search,
-                                    contentDescription = "Search",
-                                    tint = Color.Gray,
-                                    modifier = Modifier.size(28.dp)
-                                )
-                            }
-
-                            // 3. Admin Overview (Admin Only)
-                            if (userRole == "admin" || userRole == "superadmin" || userRole == "lgu_admin") {
-                                IconButton(
-                                    onClick = { showGlobalOverview = true }
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Rounded.Dashboard,
-                                        contentDescription = "Admin Overview",
-                                        tint = Color.Gray,
-                                        modifier = Modifier.size(28.dp)
-                                    )
-                                }
-                            }
-
-                            // Spacer for Floating Alert Button (only for non-admins)
-                            if (userRole != "lgu_admin" && userRole != "superadmin" && userRole != "admin") {
-                                Spacer(modifier = Modifier.width(56.dp))
-                            }
-
-                            // 4. Notifications
-                            IconButton(
-                                onClick = { showNotifications = true },
-                                modifier = Modifier.onGloballyPositioned { coordinates ->
-                                    val position = coordinates.positionInRoot()
-                                    val size = coordinates.size
-                                    notificationsButtonRect = Rect(
-                                        offset = position,
-                                        size = Size(size.width.toFloat(), size.height.toFloat())
-                                    )
-                                }
-                            ) {
-                                // Badge logic: Check if there are any alerts
-                                Box {
-                                    Icon(
-                                        imageVector = Icons.Rounded.Notifications,
-                                        contentDescription = "Notifications",
-                                        tint = if (showNotifications) Color(0xFF29B6F6) else Color.Gray,
-                                        modifier = Modifier.size(28.dp)
-                                    )
-                                    if (alerts.isNotEmpty()) {
-                                        Box(
-                                            modifier = Modifier
-                                                .align(Alignment.TopEnd)
-                                                .size(10.dp)
-                                                .background(Color.Red, CircleShape)
-                                        )
+                                        Spacer(modifier = Modifier.width(16.dp))
+                                        Column {
+                                            Text(
+                                                text = step.instruction,
+                                                style = MaterialTheme.typography.titleMedium,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                            if (distanceToNextTurn > 0) {
+                                                Text(
+                                                    text = "${distanceToNextTurn.toInt()} m",
+                                                    style = MaterialTheme.typography.bodyMedium,
+                                                    color = Color.White.copy(alpha = 0.9f)
+                                                )
+                                            }
+                                        }
                                     }
-                                }
-                            }
-
-                            // 5. Family
-                            IconButton(
-                                onClick = {
-                                    if (userPlan == "Free") {
-                                        Toast.makeText(
-                                            context,
-                                            "Map tracking is a premium feature. Upgrade your plan to see members on the map.",
-                                            Toast.LENGTH_LONG
-                                        ).show()
-                                    } else {
-                                        showGroupSheet = true
-                                    }
-                                },
-                                modifier = Modifier.onGloballyPositioned { coordinates ->
-                                    val position = coordinates.positionInRoot()
-                                    val size = coordinates.size
-                                    groupButtonRect = Rect(
-                                        offset = position,
-                                        size = Size(size.width.toFloat(), size.height.toFloat())
+                                } else {
+                                    Text(
+                                        "Arrived",
+                                        style = MaterialTheme.typography.titleMedium
                                     )
                                 }
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Rounded.Group, // Family/Group Icon
-                                    contentDescription = "Family",
-                                    tint = if (userPlan == "Free") Color(0xFFBDBDBD) else Color.Gray,
-                                    modifier = Modifier.size(28.dp)
-                                )
                             }
                         }
-                    }
+                    } else {
+                        // Sharing Location Indicator
+                        val (sharingLabel, sharingIcon, sharingColor) = when (sharingOption) {
+                            "Visible to others" -> Triple(
+                                "Sharing Location",
+                                Icons.Rounded.Public,
+                                Color(0xFF2196F3)
+                            ) // Blue
+                            "Family" -> Triple(
+                                "Shared to family",
+                                Icons.Rounded.Home,
+                                Color(0xFF4CAF50)
+                            ) // Green
+                            "No one" -> Triple(
+                                "Not sharing location",
+                                Icons.Rounded.LocationOff,
+                                Color(0xFFFF5252)
+                            )
 
-                    // Center Floating Alert Button (Overlapping)
-                    val buttonScale = remember { Animatable(1f) }
+                            else -> Triple(
+                                "Sharing Location",
+                                Icons.Rounded.Public,
+                                Color(0xFF2196F3)
+                            )
+                        }
 
-                    if (userRole != "lgu_admin" && userRole != "superadmin") {
-                        Box(
+                        Surface(
+                            onClick = { showSharingSheet = true },
+                            shape = RoundedCornerShape(percent = 50),
+                            color = Color(0xFF2B2B2B).copy(alpha = 0.9f),
+                            contentColor = Color.White,
+                            shadowElevation = 6.dp,
                             modifier = Modifier
-                                .align(Alignment.BottomCenter)
-                                .offset(y = (-36).dp)
-                                .scale(buttonScale.value)
-                                .size(72.dp)
-                                .shadow(8.dp, CircleShape)
-                                .clip(CircleShape)
-                                .background(Color(0xFFFF9800))
+                                .align(Alignment.Center)
                                 .onGloballyPositioned { coordinates ->
                                     val position = coordinates.positionInRoot()
                                     val size = coordinates.size
-                                    alertButtonRect = Rect(
+                                    sharingLocationRect = Rect(
                                         offset = position,
                                         size = Size(size.width.toFloat(), size.height.toFloat())
                                     )
                                 }
-                                .pointerInput(Unit) {
-                                    awaitPointerEventScope {
-                                        while (true) {
-                                            val down = awaitFirstDown(requireUnconsumed = false)
-                                            
-                                            // Start bloating animation
-                                            val animationJob = scope.launch {
-                                                buttonScale.animateTo(
-                                                    targetValue = 1.5f, // Bloat to 150%
-                                                    animationSpec = tween(durationMillis = 500, easing = LinearEasing)
-                                                )
-                                            }
-
-                                            // Wait for long press only
-                                            try {
-                                                withTimeout(500) {
-                                                    // If user lifts finger before timeout, it's a tap - IGNORE IT
-                                                    val up = waitForUpOrCancellation()
-                                                    if (up != null) {
-                                                        // Tap detected - Cancel animation and revert
-                                                        animationJob.cancel()
-                                                        scope.launch { 
-                                                            buttonScale.animateTo(1f, spring(stiffness = Spring.StiffnessLow)) 
-                                                        }
-                                                    }
-                                                }
-                                            } catch (e: Exception) {
-                                                // Timeout reached -> Long Press detected
-                                                showRadialMenu = true
-                                                
-                                                // Reset scale
-                                                scope.launch { 
-                                                    buttonScale.animateTo(1f, spring(stiffness = Spring.StiffnessLow)) 
-                                                }
-                                                // Start tracking drag
-                                                var dragging = true
-                                                while (dragging) {
-                                                    val event = awaitPointerEvent()
-                                                    val change = event.changes.firstOrNull()
-                                                    if (change != null) {
-                                                        if (change.pressed) {
-                                                            // Dragging
-                                                            val position = change.position
-                                                            val centerX = size.width / 2
-                                                            val centerY = size.height / 2
-                                                            val dx = position.x - centerX
-                                                            val dy = position.y - centerY
-                                                            val dist = sqrt(dx * dx + dy * dy)
-
-                                                            // Threshold to leave center (e.g. 20% of width)
-                                                            if (dist > size.width * 0.4f) {
-                                                                // Calculate angle
-                                                                var angle = Math.toDegrees(
-                                                                    atan2(
-                                                                        dy.toDouble(),
-                                                                        dx.toDouble()
-                                                                    )
-                                                                )
-                                                                if (angle < 0) angle += 360.0
-
-                                                                // Map angle to options
-                                                                // Fire: 210 (Left-ish)
-                                                                // Rescue: 270 (Top)
-                                                                // Accident: 330 (Right-ish)
-
-                                                                radialSelection = when {
-                                                                    angle >= 180 && angle < 240 -> "Fire"
-                                                                    angle >= 240 && angle < 300 -> "Rescue"
-                                                                    angle >= 300 || angle < 0 -> "Accident" // 330 area
-                                                                    else -> null
-                                                                }
-                                                            } else {
-                                                                radialSelection = null
-                                                            }
-                                                        } else {
-                                                            // Up
-                                                            dragging = false
-                                                            if (radialSelection != null) {
-                                                                // Execute selection
-                                                                val alertType = when (radialSelection) {
-                                                                    "Rescue" -> "Emergency Rescue"
-                                                                    "Fire" -> "Fire Emergency"
-                                                                    "Accident" -> "Road Accident"
-                                                                    else -> null
-                                                                }
-                                                                if (alertType != null) {
-                                                                    sendAlert(alertType)
-                                                                }
-                                                                showRadialMenu = false
-                                                                radialSelection = null
-                                                            } else {
-                                                                // Released at center or outside selection zones
-                                                                showRadialMenu = false
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                },
-                            contentAlignment = Alignment.Center
                         ) {
-                            Icon(
-                                imageVector = Icons.Rounded.Warning,
-                                contentDescription = "Alert",
-                                tint = Color.White,
-                                modifier = Modifier.size(36.dp)
-                            )
-                        }
-                    }
-                }
-                
-                // Tutorial Overlay
-                if (showTutorial && currentTutorialStep < tutorialSteps.size) {
-                    val currentStep = tutorialSteps[currentTutorialStep]
-                    val targetRect = when (currentStep.id) {
-                        "search" -> searchButtonRect
-                        "group" -> groupButtonRect
-                        "alert" -> alertButtonRect
-                        "notifications" -> notificationsButtonRect
-                        "sharing" -> sharingLocationRect
-                        "profile" -> profileRect
-                        else -> null
-                    }
-
-                    TutorialOverlay(
-                        targetRect = targetRect,
-                        step = currentStep,
-                        onNext = {
-                            if (currentTutorialStep < tutorialSteps.size - 1) {
-                                currentTutorialStep++
-                            } else {
-                                showTutorial = false
-                                sharedPreferences.edit().putBoolean(tutorialKey, true).apply()
-                            }
-                        },
-                        onBack = if (currentTutorialStep > 0) {
-                            { currentTutorialStep-- }
-                        } else null,
-                        onDismiss = { /* Optional: Allow dismiss on tap outside? For now, stick to buttons */ }
-                    )
-                }
-            }
-        }
-
-        // Search Bottom Sheet (Drawer Style)
-        if (showBottomSheet) {
-            val focusRequester = remember { FocusRequester() }
-            val keyboardController = LocalSoftwareKeyboardController.current
-
-            LaunchedEffect(Unit) {
-                // Remove delay for faster keyboard appearance
-                focusRequester.requestFocus()
-                // Ensure window is ready before showing keyboard
-                snapshotFlow { sheetState.isVisible }
-                    .collect { isVisible ->
-                        if (isVisible) {
-                            keyboardController?.show()
-                        }
-                    }
-            }
-
-            ModalBottomSheet(
-                onDismissRequest = { showBottomSheet = false },
-                sheetState = sheetState,
-                containerColor = Color.White,
-                shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
-                dragHandle = { BottomSheetDefaults.DragHandle() },
-                modifier = Modifier.padding(top = 48.dp) // Lower the drawer below camera
-            ) {
-                ForceImmersiveMode()
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .fillMaxHeight() // Allow full height
-                        .padding(horizontal = 24.dp)
-                        .imePadding() // Ensure it moves with keyboard
-                ) {
-                    Text(
-                        text = "Search Destination",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(bottom = 16.dp)
-                    )
-
-                    OutlinedTextField(
-                        value = searchQuery,
-                        onValueChange = { searchQuery = it },
-                        placeholder = { Text("Where do you want to go?") },
-                        leadingIcon = { Icon(Icons.Rounded.Search, contentDescription = null) },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .focusRequester(focusRequester),
-                        shape = RoundedCornerShape(16.dp),
-                        singleLine = true,
-                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-                        keyboardActions = KeyboardActions(onSearch = { performSearch() })
-                    )
-
-                    Spacer(modifier = Modifier.height(16.dp))
-
-                    if (isSearching) {
-                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-                    }
-
-                    // NestedScrollConnection to prevent bottom sheet from consuming scroll events
-                    // when scrolling up (dragging down) on the list.
-                    val listState = rememberLazyListState()
-
-                    val nestedScrollConnection = remember {
-                        object : NestedScrollConnection {
-                            override fun onPreScroll(
-                                available: Offset,
-                                source: NestedScrollSource
-                            ): Offset {
-                                // If dragging down (scrolling up) and list is at top, consume it so sheet doesn't close
-                                if (available.y > 0 && listState.firstVisibleItemIndex == 0 && listState.firstVisibleItemScrollOffset == 0) {
-                                    return available
-                                }
-                                return Offset.Zero
-                            }
-
-                            override fun onPostScroll(
-                                consumed: Offset,
-                                available: Offset,
-                                source: NestedScrollSource
-                            ): Offset {
-                                // Consume all available vertical scroll so the BottomSheet doesn't capture it
-                                return available
-                            }
-
-                            override suspend fun onPostFling(
-                                consumed: Velocity,
-                                available: Velocity
-                            ): Velocity {
-                                // Consume all available vertical velocity
-                                return available
-                            }
-                        }
-                    }
-
-                    LazyColumn(
-                        state = listState,
-                        modifier = Modifier
-                            .weight(1f)
-                            .nestedScroll(nestedScrollConnection)
-                    ) {
-                        items(searchResults) { result ->
                             Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable {
-                                        selectedLocation = result
-                                        showBottomSheet = false
-                                        showLocationModal = true
-
-                                        mapLibreMap?.let { map ->
-                                            val position = LatLng(result.lat, result.lon)
-                                            map.animateCamera(
-                                                CameraUpdateFactory.newLatLngZoom(
-                                                    position,
-                                                    15.0
-                                                )
-                                            )
-                                        }
-                                    }
-                                    .padding(vertical = 12.dp),
+                                modifier = Modifier.padding(
+                                    horizontal = 20.dp,
+                                    vertical = 10.dp
+                                ),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Surface(
-                                    shape = CircleShape,
-                                    color = Color(0xFFF5F5F5),
-                                    modifier = Modifier.size(40.dp)
-                                ) {
-                                    Box(contentAlignment = Alignment.Center) {
-                                        Icon(
-                                            imageVector = Icons.Rounded.LocationOn,
-                                            contentDescription = null,
-                                            tint = Color.Gray,
-                                            modifier = Modifier.size(20.dp)
-                                        )
-                                    }
-                                }
-                                Spacer(modifier = Modifier.width(16.dp))
-                                Column {
-                                    Text(
-                                        text = result.name,
-                                        style = MaterialTheme.typography.bodyLarge,
-                                        fontWeight = FontWeight.Medium
-                                    )
-                                    Text(
-                                        text = result.address,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = Color.Gray,
-                                        maxLines = 1
-                                    )
-                                    Text(
-                                        text = result.distance,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.primary
-                                    )
-                                }
+                                Icon(
+                                    imageVector = sharingIcon,
+                                    contentDescription = null,
+                                    tint = sharingColor,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = sharingLabel,
+                                    style = MaterialTheme.typography.labelLarge,
+                                    fontWeight = FontWeight.Medium
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Box(
+                                    modifier = Modifier
+                                        .size(8.dp)
+                                        .background(sharingColor, CircleShape)
+                                )
                             }
                         }
                     }
 
-                    if (searchResults.isEmpty() && !isSearching && searchQuery.isNotEmpty()) {
-                        Text(
-                            text = "No results found",
-                            modifier = Modifier.padding(vertical = 16.dp),
-                            color = Color.Gray
-                        )
-                    }
-                }
-            }
-        }
-
-        // Radial Menu Overlay
-        if (showRadialMenu) {
-            RadialMenuOverlay(
-                selectedOption = radialSelection,
-                onDismiss = { showRadialMenu = false },
-                onOptionSelected = { type ->
-                    val alertType = when (type) {
-                        "Rescue" -> "Emergency Rescue"
-                        "Fire" -> "Fire Emergency"
-                        "Accident" -> "Road Accident"
-                        else -> type
-                    }
-                    sendAlert(alertType)
-                    showRadialMenu = false
-                }
-            )
-        }
-
-        // Member On Map Popup
-        if (selectedMemberOnMap != null) {
-            val member = selectedMemberOnMap!!
-            Dialog(onDismissRequest = { selectedMemberOnMap = null }) {
-                Surface(
-                    shape = RoundedCornerShape(24.dp),
-                    color = Color.White,
-                    shadowElevation = 16.dp
-                ) {
+                    // Top Right Icons (Profile & Compass)
                     Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(24.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
+                        modifier = Modifier.align(Alignment.CenterEnd),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        // Profile Photo
                         Box(
                             modifier = Modifier
-                                .size(80.dp)
-                                .background(Color(0xFFEEEEEE), CircleShape),
-                            contentAlignment = Alignment.Center
+                                .size(40.dp)
+                                .clip(CircleShape)
+                                .clickable { navController.navigate("profile") }
+                                .onGloballyPositioned { coordinates ->
+                                    val position = coordinates.positionInRoot()
+                                    val size = coordinates.size
+                                    profileRect = Rect(
+                                        offset = position,
+                                        size = Size(size.width.toFloat(), size.height.toFloat())
+                                    )
+                                }
                         ) {
-                            if (member.profilePhoto != null) {
+                            val photoUrl = auth.currentUser?.photoUrl?.toString()
+                            if (!photoUrl.isNullOrBlank()) {
                                 AsyncImage(
                                     model = ImageRequest.Builder(LocalContext.current)
-                                        .data(member.profilePhoto)
+                                        .data(photoUrl)
                                         .crossfade(true)
                                         .transformations(CircleCropTransformation())
                                         .build(),
                                     contentDescription = "Profile",
                                     modifier = Modifier
-                                        .size(80.dp)
+                                        .fillMaxSize()
                                         .clip(CircleShape),
                                     contentScale = ContentScale.Crop
                                 )
                             } else {
                                 Box(
-                                    modifier = Modifier
-                                        .size(80.dp)
-                                        .background(Color(0xFFFF9800), CircleShape),
+                                    modifier = Modifier.fillMaxSize(),
                                     contentAlignment = Alignment.Center
                                 ) {
-                                    Text(
-                                        text = member.name.take(1).uppercase(),
-                                        color = Color.White,
-                                        fontWeight = FontWeight.Bold,
-                                        style = MaterialTheme.typography.headlineMedium
+                                    Icon(
+                                        imageVector = Icons.Filled.Person,
+                                        contentDescription = "Profile",
+                                        tint = Color.Black,
+                                        modifier = Modifier.size(24.dp)
                                     )
                                 }
                             }
-
-                            // Online indicator dot
-                            val isOnlineNow = (member.lastActive ?: 0L) > System.currentTimeMillis() - 120_000L
-                            if (isOnlineNow) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(18.dp)
-                                        .align(Alignment.BottomEnd)
-                                        .background(Color(0xFF4CAF50), CircleShape)
-                                        .border(2.dp, Color.White, CircleShape)
-                                )
-                            }
                         }
 
-                        Spacer(modifier = Modifier.height(12.dp))
-
-                        // Name
-                        Text(
-                            text = member.name,
-                            style = MaterialTheme.typography.titleLarge,
-                            fontWeight = FontWeight.Bold,
-                            color = Color(0xFF1A1A2E)
-                        )
-
-                        Spacer(modifier = Modifier.height(4.dp))
-
-                        // Last active
-                        Text(
-                            text = formatLastActive(member.lastActive),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = if ((member.lastActive ?: 0L) > System.currentTimeMillis() - 120_000L)
-                                Color(0xFF4CAF50) else Color.Gray
-                        )
-
-                        Spacer(modifier = Modifier.height(16.dp))
-                        HorizontalDivider(color = Color(0xFFEEEEEE))
-                        Spacer(modifier = Modifier.height(16.dp))
-
-                        // Last seen address
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(
-                                imageVector = Icons.Rounded.LocationOn,
-                                contentDescription = null,
-                                tint = Color(0xFF29B6F6),
-                                modifier = Modifier.size(18.dp)
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                text = if (selectedMemberAddress.isBlank()) "Location unknown" else selectedMemberAddress,
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = Color(0xFF555555),
-                                modifier = Modifier.weight(1f)
-                            )
-                        }
-
-                        Spacer(modifier = Modifier.height(24.dp))
-
-                        // Buttons
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        SmallFloatingActionButton(
+                            onClick = {
+                                mapLibreMap?.let { map ->
+                                    map.animateCamera(
+                                        CameraUpdateFactory.newCameraPosition(
+                                            CameraPosition.Builder()
+                                                .target(map.cameraPosition.target)
+                                                .zoom(map.cameraPosition.zoom)
+                                                .bearing(0.0) // Reset bearing to North
+                                                .tilt(0.0)
+                                                .build()
+                                        )
+                                    )
+                                }
+                            },
+                            containerColor = Color.White,
+                            contentColor = Color.Black,
+                            shape = CircleShape
                         ) {
-                            // Cancel
-                            OutlinedButton(
-                                onClick = { selectedMemberOnMap = null },
-                                modifier = Modifier.weight(1f).height(48.dp),
-                                shape = RoundedCornerShape(24.dp),
-                                border = BorderStroke(1.dp, Color(0xFFDDDDDD))
-                            ) {
-                                Text("Cancel", color = Color.Gray, fontWeight = FontWeight.SemiBold)
-                            }
-
-                            // Navigate
-                            Button(
-                                onClick = {
-                                    val destLat = member.lastLat
-                                    val destLon = member.lastLon
-                                    if (destLat != null && destLon != null) {
-                                        selectedMemberOnMap = null
-                                        // Start navigation to member's last location
-                                        scope.launch {
-                                            val currentLocation = mapLibreMap?.locationComponent?.lastKnownLocation
-                                            if (currentLocation != null) {
-                                                isNavigating = true
-                                                navigationSteps = emptyList()
-                                                currentStepIndex = 0
-                                                val (points, steps) = com.example.safeko.utils.RouteFetcher.fetchRoute(
-                                                    LatLng(currentLocation.latitude, currentLocation.longitude),
-                                                    LatLng(destLat, destLon)
-                                                )
-                                                navigationSteps = steps
-
-                                                // Draw route on map
-                                                if (points.isNotEmpty()) {
-                                                    val coords = points.map { Point.fromLngLat(it.longitude, it.latitude) }
-                                                    mapLibreMap?.getStyle { style ->
-                                                        val geojson = FeatureCollection.fromFeature(
-                                                            Feature.fromGeometry(LineString.fromLngLats(coords))
-                                                        ).toJson()
-                                                        val src = style.getSourceAs<GeoJsonSource>("route-source")
-                                                        if (src != null) {
-                                                            src.setGeoJson(geojson)
-                                                        } else {
-                                                            style.addSource(GeoJsonSource("route-source", geojson))
-                                                            style.addLayer(LineLayer("route-layer", "route-source")
-                                                                .withProperties(
-                                                                    PropertyFactory.lineColor(android.graphics.Color.BLUE),
-                                                                    PropertyFactory.lineWidth(5f),
-                                                                    PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
-                                                                    PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
-                                                                    PropertyFactory.lineGradient(
-                                                                        Expression.interpolate(Expression.linear(), Expression.lineProgress(),
-                                                                            Expression.stop(0f, Expression.color(android.graphics.Color.BLUE)),
-                                                                            Expression.stop(1f, Expression.color(android.graphics.Color.BLUE))
-                                                                        )
-                                                                    )
-                                                                ))
-                                                        }
-                                                    }
-                                                }
-                                            } else {
-                                                Toast.makeText(context, "Waiting for your location...", Toast.LENGTH_SHORT).show()
-                                            }
-                                        }
-                                    } else {
-                                        Toast.makeText(context, "Member location not available", Toast.LENGTH_SHORT).show()
-                                    }
-                                },
-                                modifier = Modifier.weight(1f).height(48.dp),
-                                shape = RoundedCornerShape(24.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF29B6F6))
-                            ) {
-                                Icon(Icons.Rounded.Navigation, contentDescription = null, modifier = Modifier.size(16.dp))
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text("Navigate", fontWeight = FontWeight.Bold, color = Color.White)
-                            }
+                            Icon(Icons.Rounded.Explore, contentDescription = "Compass")
                         }
                     }
                 }
             }
-        }
 
-        // Alert Details Modal
-        if (showAlertDetails && selectedAlert != null) {
-            ModalBottomSheet(
-                onDismissRequest = { showAlertDetails = false },
-                containerColor = Color.White,
-                shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
-                dragHandle = { BottomSheetDefaults.DragHandle() }
+            // Bottom Navigation Bar (Custom)
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
             ) {
-                val alert = selectedAlert!!
-                val currentUserId = auth.currentUser?.uid
-                val isOwner = alert.userId != null && alert.userId == currentUserId
-                Column(
+                // White Navigation Bar
+                Surface(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(start = 20.dp, end = 20.dp, bottom = 40.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally
+                        .height(80.dp)
+                        .align(Alignment.BottomCenter),
+                    shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp),
+                    color = Color.White,
+                    shadowElevation = 16.dp
                 ) {
-                    // Address (moved under alert type)
-                    var displayAddress by remember { mutableStateOf(alert.address) }
+                    Row(
+                        modifier = Modifier.fillMaxSize(),
+                        horizontalArrangement = Arrangement.SpaceAround,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        // 1. Home
+                        IconButton(onClick = {
+                            mapLibreMap?.let { map ->
+                                map.animateCamera(
+                                    CameraUpdateFactory.newCameraPosition(
+                                        CameraPosition.Builder()
+                                            .target(LatLng(10.3157, 123.8854)) // Reset to Cebu
+                                            .zoom(12.0)
+                                            .tilt(0.0)
+                                            .bearing(0.0)
+                                            .build()
+                                    )
+                                )
+                            }
+                        }) {
+                            Icon(
+                                imageVector = Icons.Rounded.Home,
+                                contentDescription = "Home",
+                                tint = Color(0xFF29B6F6), // Light Blue
+                                modifier = Modifier.size(28.dp)
+                            )
+                        }
 
-                    LaunchedEffect(alert.id, alert.address) {
-                        if (displayAddress.isBlank()) {
-                            withContext(Dispatchers.IO) {
-                                try {
-                                    val address =
-                                        PlaceSearcher.reverseGeocode(alert.lat, alert.lon)
-                                    if (address.isNotBlank()) {
-                                        withContext(Dispatchers.Main) {
-                                            displayAddress = address
-                                        }
-                                    }
-                                } catch (e: Exception) {
-                                    e.printStackTrace()
+                        // 2. Search
+                        IconButton(
+                            onClick = { showBottomSheet = true },
+                            modifier = Modifier.onGloballyPositioned { coordinates ->
+                                val position = coordinates.positionInRoot()
+                                val size = coordinates.size
+                                searchButtonRect = Rect(
+                                    offset = position,
+                                    size = Size(size.width.toFloat(), size.height.toFloat())
+                                )
+                            }
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.Search,
+                                contentDescription = "Search",
+                                tint = Color.Gray,
+                                modifier = Modifier.size(28.dp)
+                            )
+                        }
+
+                        // 3. Admin Overview (Admin Only)
+                        if (userRole == "admin" || userRole == "superadmin" || userRole == "lgu_admin") {
+                            IconButton(
+                                onClick = { showGlobalOverview = true }
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Dashboard,
+                                    contentDescription = "Admin Overview",
+                                    tint = Color.Gray,
+                                    modifier = Modifier.size(28.dp)
+                                )
+                            }
+                        }
+
+                        // Spacer for Floating Alert Button (only for non-admins)
+                        if (userRole != "lgu_admin" && userRole != "superadmin" && userRole != "admin") {
+                            Spacer(modifier = Modifier.width(56.dp))
+                        }
+
+                        // 4. Notifications
+                        IconButton(
+                            onClick = { showNotifications = true },
+                            modifier = Modifier.onGloballyPositioned { coordinates ->
+                                val position = coordinates.positionInRoot()
+                                val size = coordinates.size
+                                notificationsButtonRect = Rect(
+                                    offset = position,
+                                    size = Size(size.width.toFloat(), size.height.toFloat())
+                                )
+                            }
+                        ) {
+                            // Badge logic: Check if there are any alerts
+                            Box {
+                                Icon(
+                                    imageVector = Icons.Rounded.Notifications,
+                                    contentDescription = "Notifications",
+                                    tint = if (showNotifications) Color(0xFF29B6F6) else Color.Gray,
+                                    modifier = Modifier.size(28.dp)
+                                )
+                                if (alerts.isNotEmpty()) {
+                                    Box(
+                                        modifier = Modifier
+                                            .align(Alignment.TopEnd)
+                                            .size(10.dp)
+                                            .background(Color.Red, CircleShape)
+                                    )
                                 }
                             }
                         }
-                    }
 
-                    Surface(
-                        modifier = Modifier.fillMaxWidth(),
-                        color = Color(0xFFF7F7F7),
-                        shape = RoundedCornerShape(16.dp)
+                        // 5. Family
+                        IconButton(
+                            onClick = {
+                                if (userPlan == "Free") {
+                                    Toast.makeText(
+                                        context,
+                                        "Map tracking is a premium feature. Upgrade your plan to see members on the map.",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                } else {
+                                    showGroupSheet = true
+                                }
+                            },
+                            modifier = Modifier.onGloballyPositioned { coordinates ->
+                                val position = coordinates.positionInRoot()
+                                val size = coordinates.size
+                                groupButtonRect = Rect(
+                                    offset = position,
+                                    size = Size(size.width.toFloat(), size.height.toFloat())
+                                )
+                            }
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.Group, // Family/Group Icon
+                                contentDescription = "Family",
+                                tint = if (userPlan == "Free") Color(0xFFBDBDBD) else Color.Gray,
+                                modifier = Modifier.size(28.dp)
+                            )
+                        }
+                    }
+                }
+
+                // Center Floating Alert Button (Overlapping)
+                val buttonScale = remember { Animatable(1f) }
+
+                if (userRole != "lgu_admin" && userRole != "superadmin") {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .offset(y = (-36).dp)
+                            .scale(buttonScale.value)
+                            .size(72.dp)
+                            .shadow(8.dp, CircleShape)
+                            .clip(CircleShape)
+                            .background(Color(0xFFFF9800))
+                            .onGloballyPositioned { coordinates ->
+                                val position = coordinates.positionInRoot()
+                                val size = coordinates.size
+                                alertButtonRect = Rect(
+                                    offset = position,
+                                    size = Size(size.width.toFloat(), size.height.toFloat())
+                                )
+                            }
+                            .pointerInput(Unit) {
+                                awaitPointerEventScope {
+                                    while (true) {
+                                        val down = awaitFirstDown(requireUnconsumed = false)
+
+                                        // Start bloating animation
+                                        val animationJob = scope.launch {
+                                            buttonScale.animateTo(
+                                                targetValue = 1.5f, // Bloat to 150%
+                                                animationSpec = tween(
+                                                    durationMillis = 500,
+                                                    easing = LinearEasing
+                                                )
+                                            )
+                                        }
+
+                                        // Wait for long press only
+                                        try {
+                                            withTimeout(500) {
+                                                // If user lifts finger before timeout, it's a tap - IGNORE IT
+                                                val up = waitForUpOrCancellation()
+                                                if (up != null) {
+                                                    // Tap detected - Cancel animation and revert
+                                                    animationJob.cancel()
+                                                    scope.launch {
+                                                        buttonScale.animateTo(
+                                                            1f,
+                                                            spring(stiffness = Spring.StiffnessLow)
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        } catch (e: Exception) {
+                                            // Timeout reached -> Long Press detected
+                                            showRadialMenu = true
+
+                                            // Reset scale
+                                            scope.launch {
+                                                buttonScale.animateTo(
+                                                    1f,
+                                                    spring(stiffness = Spring.StiffnessLow)
+                                                )
+                                            }
+                                            // Start tracking drag
+                                            var dragging = true
+                                            while (dragging) {
+                                                val event = awaitPointerEvent()
+                                                val change = event.changes.firstOrNull()
+                                                if (change != null) {
+                                                    if (change.pressed) {
+                                                        // Dragging
+                                                        val position = change.position
+                                                        val centerX = size.width / 2
+                                                        val centerY = size.height / 2
+                                                        val dx = position.x - centerX
+                                                        val dy = position.y - centerY
+                                                        val dist = sqrt(dx * dx + dy * dy)
+
+                                                        // Threshold to leave center (e.g. 20% of width)
+                                                        if (dist > size.width * 0.4f) {
+                                                            // Calculate angle
+                                                            var angle = Math.toDegrees(
+                                                                atan2(
+                                                                    dy.toDouble(),
+                                                                    dx.toDouble()
+                                                                )
+                                                            )
+                                                            if (angle < 0) angle += 360.0
+
+                                                            // Map angle to options
+                                                            // Fire: 210 (Left-ish)
+                                                            // Rescue: 270 (Top)
+                                                            // Accident: 330 (Right-ish)
+
+                                                            radialSelection = when {
+                                                                angle >= 180 && angle < 240 -> "Fire"
+                                                                angle >= 240 && angle < 300 -> "Rescue"
+                                                                angle >= 300 || angle < 0 -> "Accident" // 330 area
+                                                                else -> null
+                                                            }
+                                                        } else {
+                                                            radialSelection = null
+                                                        }
+                                                    } else {
+                                                        // Up
+                                                        dragging = false
+                                                        if (radialSelection != null) {
+                                                            // Execute selection
+                                                            val alertType = when (radialSelection) {
+                                                                "Rescue" -> "Emergency Rescue"
+                                                                "Fire" -> "Fire Emergency"
+                                                                "Accident" -> "Road Accident"
+                                                                else -> null
+                                                            }
+                                                            if (alertType != null) {
+                                                                sendAlert(alertType)
+                                                            }
+                                                            showRadialMenu = false
+                                                            radialSelection = null
+                                                        } else {
+                                                            // Released at center or outside selection zones
+                                                            showRadialMenu = false
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                        contentAlignment = Alignment.Center
                     ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Warning,
+                            contentDescription = "Alert",
+                            tint = Color.White,
+                            modifier = Modifier.size(36.dp)
+                        )
+                    }
+                }
+            }
+
+            // Tutorial Overlay
+            if (showTutorial && currentTutorialStep < tutorialSteps.size) {
+                val currentStep = tutorialSteps[currentTutorialStep]
+                val targetRect = when (currentStep.id) {
+                    "search" -> searchButtonRect
+                    "group" -> groupButtonRect
+                    "alert" -> alertButtonRect
+                    "notifications" -> notificationsButtonRect
+                    "sharing" -> sharingLocationRect
+                    "profile" -> profileRect
+                    else -> null
+                }
+
+                TutorialOverlay(
+                    targetRect = targetRect,
+                    step = currentStep,
+                    onNext = {
+                        if (currentTutorialStep < tutorialSteps.size - 1) {
+                            currentTutorialStep++
+                        } else {
+                            showTutorial = false
+                            sharedPreferences.edit().putBoolean(tutorialKey, true).apply()
+                        }
+                    },
+                    onBack = if (currentTutorialStep > 0) {
+                        { currentTutorialStep-- }
+                    } else null,
+                    onDismiss = { /* Optional: Allow dismiss on tap outside? For now, stick to buttons */ }
+                )
+            }
+        }
+    }
+
+    // Search Bottom Sheet (Drawer Style)
+    if (showBottomSheet) {
+        val focusRequester = remember { FocusRequester() }
+        val keyboardController = LocalSoftwareKeyboardController.current
+
+        LaunchedEffect(Unit) {
+            // Remove delay for faster keyboard appearance
+            focusRequester.requestFocus()
+            // Ensure window is ready before showing keyboard
+            snapshotFlow { sheetState.isVisible }
+                .collect { isVisible ->
+                    if (isVisible) {
+                        keyboardController?.show()
+                    }
+                }
+        }
+
+        ModalBottomSheet(
+            onDismissRequest = { showBottomSheet = false },
+            sheetState = sheetState,
+            containerColor = Color.White,
+            shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
+            dragHandle = { BottomSheetDefaults.DragHandle() },
+            modifier = Modifier.padding(top = 48.dp) // Lower the drawer below camera
+        ) {
+            ForceImmersiveMode()
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .fillMaxHeight() // Allow full height
+                    .padding(horizontal = 24.dp)
+                    .imePadding() // Ensure it moves with keyboard
+            ) {
+                Text(
+                    text = "Search Destination",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(bottom = 16.dp)
+                )
+
+                OutlinedTextField(
+                    value = searchQuery,
+                    onValueChange = { searchQuery = it },
+                    placeholder = { Text("Where do you want to go?") },
+                    leadingIcon = { Icon(Icons.Rounded.Search, contentDescription = null) },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .focusRequester(focusRequester),
+                    shape = RoundedCornerShape(16.dp),
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                    keyboardActions = KeyboardActions(onSearch = { performSearch() })
+                )
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                if (isSearching) {
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                }
+
+                // NestedScrollConnection to prevent bottom sheet from consuming scroll events
+                // when scrolling up (dragging down) on the list.
+                val listState = rememberLazyListState()
+
+                val nestedScrollConnection = remember {
+                    object : NestedScrollConnection {
+                        override fun onPreScroll(
+                            available: Offset,
+                            source: NestedScrollSource
+                        ): Offset {
+                            // If dragging down (scrolling up) and list is at top, consume it so sheet doesn't close
+                            if (available.y > 0 && listState.firstVisibleItemIndex == 0 && listState.firstVisibleItemScrollOffset == 0) {
+                                return available
+                            }
+                            return Offset.Zero
+                        }
+
+                        override fun onPostScroll(
+                            consumed: Offset,
+                            available: Offset,
+                            source: NestedScrollSource
+                        ): Offset {
+                            // Consume all available vertical scroll so the BottomSheet doesn't capture it
+                            return available
+                        }
+
+                        override suspend fun onPostFling(
+                            consumed: Velocity,
+                            available: Velocity
+                        ): Velocity {
+                            // Consume all available vertical velocity
+                            return available
+                        }
+                    }
+                }
+
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier
+                        .weight(1f)
+                        .nestedScroll(nestedScrollConnection)
+                ) {
+                    items(searchResults) { result ->
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(14.dp),
+                                .clickable {
+                                    selectedLocation = result
+                                    showBottomSheet = false
+                                    showLocationModal = true
+
+                                    mapLibreMap?.let { map ->
+                                        val position = LatLng(result.lat, result.lon)
+                                        map.animateCamera(
+                                            CameraUpdateFactory.newLatLngZoom(
+                                                position,
+                                                15.0
+                                            )
+                                        )
+                                    }
+                                }
+                                .padding(vertical = 12.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            if (!alert.userPhotoUrl.isNullOrBlank()) {
-                                AsyncImage(
-                                    model = ImageRequest.Builder(LocalContext.current)
-                                        .data(alert.userPhotoUrl)
-                                        .crossfade(true)
-                                        .transformations(CircleCropTransformation())
-                                        .build(),
-                                    contentDescription = "User Profile",
-                                    modifier = Modifier
-                                        .size(64.dp)
-                                        .clip(CircleShape)
-                                        .background(Color.LightGray),
-                                    contentScale = ContentScale.Crop
-                                )
-                            } else {
-                                Image(
-                                    imageVector = Icons.Filled.Person,
-                                    contentDescription = "User Profile",
-                                    modifier = Modifier
-                                        .size(64.dp)
-                                        .clip(CircleShape)
-                                        .background(Color.LightGray)
-                                        .padding(12.dp),
-                                    contentScale = ContentScale.Fit
-                                )
-                            }
-
-                            Spacer(modifier = Modifier.width(12.dp))
-
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = alert.userName ?: "Unknown User",
-                                    style = MaterialTheme.typography.titleSmall,
-                                    fontWeight = FontWeight.Bold
-                                )
-
-                                Spacer(modifier = Modifier.height(4.dp))
-
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    val (icon, color) = when (alert.type) {
-                                        "Fire Emergency" -> Icons.Rounded.LocalFireDepartment to Color(
-                                            0xFFFF5722
-                                        )
-
-                                        "Road Accident" -> Icons.Rounded.CarCrash to Color(0xFFFFC107)
-                                        "Emergency Rescue" -> Icons.Rounded.MedicalServices to Color.Red
-                                        else -> Icons.Rounded.Warning to Color.Red
-                                    }
-
-                                    Icon(
-                                        imageVector = icon,
-                                        contentDescription = null,
-                                        tint = color,
-                                        modifier = Modifier.size(18.dp)
-                                    )
-
-                                    Spacer(modifier = Modifier.width(6.dp))
-
-                                    Text(
-                                        text = alert.type,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = Color.Gray
-                                    )
-                                }
-
-                                Spacer(modifier = Modifier.height(6.dp))
-
-                                Row(verticalAlignment = Alignment.Top) {
+                            Surface(
+                                shape = CircleShape,
+                                color = Color(0xFFF5F5F5),
+                                modifier = Modifier.size(40.dp)
+                            ) {
+                                Box(contentAlignment = Alignment.Center) {
                                     Icon(
                                         imageVector = Icons.Rounded.LocationOn,
                                         contentDescription = null,
                                         tint = Color.Gray,
-                                        modifier = Modifier
-                                            .size(16.dp)
-                                            .padding(top = 2.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text(
-                                        text = displayAddress.ifBlank { "Lat: ${alert.lat}, Lon: ${alert.lon}" },
-                                        style = MaterialTheme.typography.bodySmall,
-                                        maxLines = 2,
-                                        overflow = TextOverflow.Ellipsis
+                                        modifier = Modifier.size(20.dp)
                                     )
                                 }
                             }
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(12.dp))
-                    HorizontalDivider(color = Color.LightGray.copy(alpha = 0.5f))
-                    Spacer(modifier = Modifier.height(12.dp))
-
-                    // Details Column (Left Aligned)
-                    Column(modifier = Modifier.fillMaxWidth()) {
-                        if (isOwner) {
-                            var phoneNumberText by remember(alert.id) {
-                                mutableStateOf(userPhoneNumber)
-                            }
-                            var localDetailsText by remember(alert.id) {
-                                mutableStateOf(alert.details)
-                            }
-
-                            Text(
-                                text = "Contact",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = Color.Gray,
-                                modifier = Modifier.padding(bottom = 6.dp)
-                            )
-
-                            Surface(
-                                modifier = Modifier.fillMaxWidth(),
-                                color = Color(0xFFF7F7F7),
-                                shape = RoundedCornerShape(12.dp)
-                            ) {
-                                Column(modifier = Modifier.padding(12.dp)) {
-                                    Text(
-                                        text = "Phone Number *",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = Color.Gray,
-                                        modifier = Modifier.padding(bottom = 6.dp)
-                                    )
-
-                                    OutlinedTextField(
-                                        value = phoneNumberText,
-                                        onValueChange = { phoneNumberText = it },
-                                        modifier = Modifier.fillMaxWidth(),
-                                        placeholder = { Text("+63 912 345 6789", color = Color.LightGray) },
-                                        singleLine = true,
-                                        shape = RoundedCornerShape(10.dp),
-                                        colors = OutlinedTextFieldDefaults.colors(
-                                            focusedBorderColor = Color(0xFFE0E0E0),
-                                            unfocusedBorderColor = Color(0xFFE0E0E0),
-                                            focusedContainerColor = Color.White,
-                                            unfocusedContainerColor = Color.White
-                                        )
-                                    )
-                                }
-                            }
-
-                            Spacer(modifier = Modifier.height(10.dp))
-
-                            Text(
-                                text = "Details (Optional)",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = Color.Gray,
-                                modifier = Modifier.padding(bottom = 6.dp)
-                            )
-
-                            OutlinedTextField(
-                                value = localDetailsText,
-                                onValueChange = { localDetailsText = it },
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(100.dp),
-                                placeholder = { Text("Describe the situation...", color = Color.LightGray) },
-                                maxLines = 4,
-                                shape = RoundedCornerShape(12.dp),
-                                colors = OutlinedTextFieldDefaults.colors(
-                                    focusedBorderColor = Color(0xFFE0E0E0),
-                                    unfocusedBorderColor = Color(0xFFE0E0E0),
-                                    focusedContainerColor = Color(0xFFF7F7F7),
-                                    unfocusedContainerColor = Color(0xFFF7F7F7)
+                            Spacer(modifier = Modifier.width(16.dp))
+                            Column {
+                                Text(
+                                    text = result.name,
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    fontWeight = FontWeight.Medium
                                 )
-                            )
-
-                            if (alert.photoBase64.isNotBlank()) {
-                                Spacer(modifier = Modifier.height(12.dp))
-                                val imageBitmap = remember(alert.photoBase64) {
-                                    try {
-                                        val decodedBytes =
-                                            Base64.decode(alert.photoBase64, Base64.DEFAULT)
-                                        BitmapFactory.decodeByteArray(
-                                            decodedBytes,
-                                            0,
-                                            decodedBytes.size
-                                        )?.asImageBitmap()
-                                    } catch (e: Exception) {
-                                        null
-                                    }
-                                }
-
-                                if (imageBitmap != null) {
-                                    Box(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .height(84.dp)
-                                            .clip(RoundedCornerShape(12.dp))
-                                            .background(Color(0xFFEDEDED))
-                                    ) {
-                                        androidx.compose.foundation.Image(
-                                            bitmap = imageBitmap,
-                                            contentDescription = "Attached Photo",
-                                            contentScale = ContentScale.Crop,
-                                            modifier = Modifier.fillMaxSize()
-                                        )
-                                    }
-                                }
+                                Text(
+                                    text = result.address,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = Color.Gray,
+                                    maxLines = 1
+                                )
+                                Text(
+                                    text = result.distance,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
                             }
+                        }
+                    }
+                }
 
-                            Spacer(modifier = Modifier.height(10.dp))
+                if (searchResults.isEmpty() && !isSearching && searchQuery.isNotEmpty()) {
+                    Text(
+                        text = "No results found",
+                        modifier = Modifier.padding(vertical = 16.dp),
+                        color = Color.Gray
+                    )
+                }
+            }
+        }
+    }
 
-                            Text(
-                                text = "Photos (Optional)",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = Color.Gray,
-                                modifier = Modifier.padding(bottom = 6.dp)
+    // Radial Menu Overlay
+    if (showRadialMenu) {
+        RadialMenuOverlay(
+            selectedOption = radialSelection,
+            onDismiss = { showRadialMenu = false },
+            onOptionSelected = { type ->
+                val alertType = when (type) {
+                    "Rescue" -> "Emergency Rescue"
+                    "Fire" -> "Fire Emergency"
+                    "Accident" -> "Road Accident"
+                    else -> type
+                }
+                sendAlert(alertType)
+                showRadialMenu = false
+            }
+        )
+    }
+
+    // Member On Map Popup
+    if (selectedMemberOnMap != null) {
+        val member = selectedMemberOnMap!!
+        Dialog(onDismissRequest = { selectedMemberOnMap = null }) {
+            Surface(
+                shape = RoundedCornerShape(24.dp),
+                color = Color.White,
+                shadowElevation = 16.dp
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    // Profile Photo
+                    Box(
+                        modifier = Modifier
+                            .size(80.dp)
+                            .background(Color(0xFFEEEEEE), CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (member.profilePhoto != null) {
+                            AsyncImage(
+                                model = ImageRequest.Builder(LocalContext.current)
+                                    .data(member.profilePhoto)
+                                    .crossfade(true)
+                                    .transformations(CircleCropTransformation())
+                                    .build(),
+                                contentDescription = "Profile",
+                                modifier = Modifier
+                                    .size(80.dp)
+                                    .clip(CircleShape),
+                                contentScale = ContentScale.Crop
                             )
-
-                            if (capturedBitmap != null) {
-                                Box(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .height(104.dp)
-                                        .clip(RoundedCornerShape(12.dp))
-                                        .background(Color(0xFFEDEDED))
-                                ) {
-                                    androidx.compose.foundation.Image(
-                                        bitmap = capturedBitmap!!.asImageBitmap(),
-                                        contentDescription = "Captured Image",
-                                        contentScale = ContentScale.Crop,
-                                        modifier = Modifier.fillMaxSize()
-                                    )
-                                    IconButton(
-                                        onClick = {
-                                            val photoFile = createImageFile(context)
-                                            capturedImageUri = FileProvider.getUriForFile(
-                                                context,
-                                                "${context.packageName}.fileprovider",
-                                                photoFile
-                                            )
-                                            cameraLauncher.launch(capturedImageUri!!)
-                                        },
-                                        modifier = Modifier
-                                            .align(Alignment.TopEnd)
-                                            .padding(8.dp)
-                                            .background(Color.Black.copy(alpha = 0.5f), CircleShape)
-                                    ) {
-                                        Icon(
-                                            Icons.Rounded.PhotoCamera,
-                                            contentDescription = "Retake",
-                                            tint = Color.White
-                                        )
-                                    }
-                                }
-                            } else {
-                                OutlinedButton(
-                                    onClick = {
-                                        try {
-                                            val photoFile = createImageFile(context)
-                                            val uri = FileProvider.getUriForFile(
-                                                context,
-                                                "${context.packageName}.fileprovider",
-                                                photoFile
-                                            )
-                                            capturedImageUri = uri
-                                            cameraLauncher.launch(uri)
-                                        } catch (e: Exception) {
-                                            e.printStackTrace()
-                                            Toast.makeText(
-                                                context,
-                                                "Cannot open camera: ${e.message}",
-                                                Toast.LENGTH_SHORT
-                                            ).show()
-                                        }
-                                    },
-                                    modifier = Modifier.fillMaxWidth(),
-                                    shape = RoundedCornerShape(12.dp),
-                                    colors = ButtonDefaults.outlinedButtonColors(
-                                        containerColor = Color(0xFFF7F7F7)
-                                    )
-                                ) {
-                                    Icon(Icons.Rounded.PhotoCamera, contentDescription = null)
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Text("Upload")
-                                }
-                            }
-
-                            Spacer(modifier = Modifier.height(12.dp))
-
-                            Button(
-                                onClick = {
-                                    var photoBase64: String? = null
-                                    if (capturedBitmap != null) {
-                                        val outputStream = ByteArrayOutputStream()
-                                        capturedBitmap!!.compress(
-                                            Bitmap.CompressFormat.JPEG,
-                                            70,
-                                            outputStream
-                                        )
-                                        val byteArray = outputStream.toByteArray()
-                                        photoBase64 = Base64.encodeToString(byteArray, Base64.DEFAULT)
-                                    }
-                                    updateAlert(alert.id, localDetailsText, photoBase64, phoneNumberText)
-                                },
-                                modifier = Modifier.fillMaxWidth(),
-                                shape = RoundedCornerShape(12.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = Color.Black)
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .size(80.dp)
+                                    .background(Color(0xFFFF9800), CircleShape),
+                                contentAlignment = Alignment.Center
                             ) {
-                                Text("Submit Details")
+                                Text(
+                                    text = member.name.take(1).uppercase(),
+                                    color = Color.White,
+                                    fontWeight = FontWeight.Bold,
+                                    style = MaterialTheme.typography.headlineMedium
+                                )
                             }
                         }
 
+                        // Online indicator dot
+                        val isOnlineNow =
+                            (member.lastActive ?: 0L) > System.currentTimeMillis() - 120_000L
+                        if (isOnlineNow) {
+                            Box(
+                                modifier = Modifier
+                                    .size(18.dp)
+                                    .align(Alignment.BottomEnd)
+                                    .background(Color(0xFF4CAF50), CircleShape)
+                                    .border(2.dp, Color.White, CircleShape)
+                            )
+                        }
                     }
 
-                    Spacer(modifier = Modifier.height(32.dp))
+                    Spacer(modifier = Modifier.height(12.dp))
 
-                    // Navigation Button (Only for non-owners)
-                    if (!isOwner) {
+                    // Name
+                    Text(
+                        text = member.name,
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFF1A1A2E)
+                    )
+
+                    Spacer(modifier = Modifier.height(4.dp))
+
+                    // Last active
+                    Text(
+                        text = formatLastActive(member.lastActive),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if ((member.lastActive
+                                ?: 0L) > System.currentTimeMillis() - 120_000L
+                        )
+                            Color(0xFF4CAF50) else Color.Gray
+                    )
+
+                    Spacer(modifier = Modifier.height(16.dp))
+                    HorizontalDivider(color = Color(0xFFEEEEEE))
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    // Last seen address
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Rounded.LocationOn,
+                            contentDescription = null,
+                            tint = Color(0xFF29B6F6),
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = if (selectedMemberAddress.isBlank()) "Location unknown" else selectedMemberAddress,
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = Color(0xFF555555),
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(24.dp))
+
+                    // Buttons
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        // Cancel
+                        OutlinedButton(
+                            onClick = { selectedMemberOnMap = null },
+                            modifier = Modifier.weight(1f).height(48.dp),
+                            shape = RoundedCornerShape(24.dp),
+                            border = BorderStroke(1.dp, Color(0xFFDDDDDD))
+                        ) {
+                            Text("Cancel", color = Color.Gray, fontWeight = FontWeight.SemiBold)
+                        }
+
+                        // Navigate
                         Button(
                             onClick = {
-                                val userLocation = mapLibreMap?.locationComponent?.lastKnownLocation
-                                if (userLocation != null) {
+                                val destLat = member.lastLat
+                                val destLon = member.lastLon
+                                if (destLat != null && destLon != null) {
+                                    selectedMemberOnMap = null
+                                    // Start navigation to member's last location
                                     scope.launch {
-                                        Toast.makeText(
-                                            context,
-                                            "Calculating route...",
-                                            Toast.LENGTH_SHORT
-                                        ).show()
-                                        val start =
-                                            LatLng(userLocation.latitude, userLocation.longitude)
-                                        val end = LatLng(alert.lat, alert.lon)
+                                        val currentLocation =
+                                            mapLibreMap?.locationComponent?.lastKnownLocation
+                                        if (currentLocation != null) {
+                                            isNavigating = true
+                                            navigationSteps = emptyList()
+                                            currentStepIndex = 0
+                                            val (points, steps) = com.example.safeko.utils.RouteFetcher.fetchRoute(
+                                                LatLng(
+                                                    currentLocation.latitude,
+                                                    currentLocation.longitude
+                                                ),
+                                                LatLng(destLat, destLon)
+                                            )
+                                            navigationSteps = steps
 
-                                        val (points, steps) = RouteFetcher.fetchRoute(start, end)
-
-                                        if (points.isNotEmpty()) {
-                                            navigationService?.startNavigation(steps, points, end)
-                                            mapLibreMap?.getStyle { style ->
-                                                // Remove existing route layer and source if any
-                                                if (style.getLayer("route-layer") != null) style.removeLayer(
-                                                    "route-layer"
-                                                )
-                                                if (style.getSource("route-source") != null) style.removeSource(
-                                                    "route-source"
-                                                )
-
-                                                // Create GeoJsonSource with lineMetrics enabled
-                                                val lineString = LineString.fromLngLats(points.map {
+                                            // Draw route on map
+                                            if (points.isNotEmpty()) {
+                                                val coords = points.map {
                                                     Point.fromLngLat(
                                                         it.longitude,
                                                         it.latitude
                                                     )
-                                                })
-                                                val source = GeoJsonSource(
-                                                    "route-source",
-                                                    Feature.fromGeometry(lineString),
-                                                    GeoJsonOptions().withLineMetrics(true)
-                                                )
-                                                style.addSource(source)
-
-                                                // Create LineLayer with Gradient
-                                                val layer = LineLayer("route-layer", "route-source")
-                                                layer.setProperties(
-                                                    PropertyFactory.lineWidth(8f),
-                                                    PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
-                                                    PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
-                                                    PropertyFactory.lineGradient(
-                                                        Expression.interpolate(
-                                                            Expression.linear(),
-                                                            Expression.lineProgress(),
-                                                            Expression.stop(
-                                                                0f,
-                                                                Expression.color(android.graphics.Color.BLUE)
-                                                            ),
-                                                            Expression.stop(
-                                                                1f,
-                                                                Expression.color(android.graphics.Color.CYAN)
+                                                }
+                                                mapLibreMap?.getStyle { style ->
+                                                    val geojson = FeatureCollection.fromFeature(
+                                                        Feature.fromGeometry(
+                                                            LineString.fromLngLats(
+                                                                coords
                                                             )
                                                         )
-                                                    )
-                                                )
-                                                style.addLayer(layer)
-
-                                                // Zoom to start
-                                                mapLibreMap?.animateCamera(
-                                                    CameraUpdateFactory.newLatLngZoom(
-                                                        start,
-                                                        16.0
-                                                    )
-                                                )
-                                                isNavigating = true
+                                                    ).toJson()
+                                                    val src =
+                                                        style.getSourceAs<GeoJsonSource>("route-source")
+                                                    if (src != null) {
+                                                        src.setGeoJson(geojson)
+                                                    } else {
+                                                        style.addSource(
+                                                            GeoJsonSource(
+                                                                "route-source",
+                                                                geojson
+                                                            )
+                                                        )
+                                                        style.addLayer(
+                                                            LineLayer("route-layer", "route-source")
+                                                                .withProperties(
+                                                                    PropertyFactory.lineColor(
+                                                                        android.graphics.Color.BLUE
+                                                                    ),
+                                                                    PropertyFactory.lineWidth(5f),
+                                                                    PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+                                                                    PropertyFactory.lineJoin(
+                                                                        Property.LINE_JOIN_ROUND
+                                                                    ),
+                                                                    PropertyFactory.lineGradient(
+                                                                        Expression.interpolate(
+                                                                            Expression.linear(),
+                                                                            Expression.lineProgress(),
+                                                                            Expression.stop(
+                                                                                0f,
+                                                                                Expression.color(
+                                                                                    android.graphics.Color.BLUE
+                                                                                )
+                                                                            ),
+                                                                            Expression.stop(
+                                                                                1f,
+                                                                                Expression.color(
+                                                                                    android.graphics.Color.BLUE
+                                                                                )
+                                                                            )
+                                                                        )
+                                                                    )
+                                                                )
+                                                        )
+                                                    }
+                                                }
                                             }
-                                            showAlertDetails = false
                                         } else {
                                             Toast.makeText(
                                                 context,
-                                                "Route not found",
+                                                "Waiting for your location...",
                                                 Toast.LENGTH_SHORT
                                             ).show()
                                         }
@@ -3290,256 +3056,738 @@ fun HomeScreen(navController: NavController) {
                                 } else {
                                     Toast.makeText(
                                         context,
-                                        "Waiting for current location...",
+                                        "Member location not available",
                                         Toast.LENGTH_SHORT
                                     ).show()
                                 }
                             },
-                            modifier = Modifier.fillMaxWidth(),
-                            shape = RoundedCornerShape(12.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1A1A2E))
+                            modifier = Modifier.weight(1f).height(48.dp),
+                            shape = RoundedCornerShape(24.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF29B6F6))
                         ) {
                             Icon(
-                                Icons.Rounded.NearMe,
+                                Icons.Rounded.Navigation,
                                 contentDescription = null,
-                                tint = Color.White
+                                modifier = Modifier.size(16.dp)
                             )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = "Navigate to Location",
-                                modifier = Modifier.padding(vertical = 8.dp),
-                                style = MaterialTheme.typography.titleMedium
-                            )
-                        }
-                    }
-
-                    if (isOwner && alert.status != "resolved") {
-                        Spacer(modifier = Modifier.height(12.dp))
-                        Button(
-                            onClick = { resolveAlert(alert.id) },
-                            modifier = Modifier.fillMaxWidth(),
-                            shape = RoundedCornerShape(12.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))
-                        ) {
-                            Text("Resolve Alert")
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Navigate", fontWeight = FontWeight.Bold, color = Color.White)
                         }
                     }
                 }
             }
         }
+    }
 
-        // Add Details Modal
-        if (showAddDetails && selectedAlert != null) {
-            ModalBottomSheet(
-                onDismissRequest = { showAddDetails = false },
-                containerColor = Color.White,
-                shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
-                dragHandle = { BottomSheetDefaults.DragHandle() }
+    // Alert Details Modal
+    if (showAlertDetails && selectedAlert != null) {
+        ModalBottomSheet(
+            onDismissRequest = { showAlertDetails = false },
+            containerColor = Color.White,
+            shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
+            dragHandle = { BottomSheetDefaults.DragHandle() }
+        ) {
+            val alert = selectedAlert!!
+            val currentUserId = auth.currentUser?.uid
+            val isOwner = alert.userId != null && alert.userId == currentUserId
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 20.dp, end = 20.dp, bottom = 40.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                val alert = selectedAlert!!
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(24.dp)
-                        .imePadding()
-                ) {
-                    Text(
-                        text = "Add Details",
-                        style = MaterialTheme.typography.titleLarge,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(bottom = 16.dp)
-                    )
+                // Address (moved under alert type)
+                var displayAddress by remember { mutableStateOf(alert.address) }
 
-                    OutlinedTextField(
-                        value = detailsText,
-                        onValueChange = { detailsText = it },
-                        label = { Text("Additional Information") },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(150.dp),
-                        maxLines = 5
-                    )
-
-                    Spacer(modifier = Modifier.height(16.dp))
-
-                    // Camera Button and Preview
-                    if (capturedBitmap != null) {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(200.dp)
-                                .clip(RoundedCornerShape(12.dp))
-                                .background(Color.Gray)
-                        ) {
-                            androidx.compose.foundation.Image(
-                                bitmap = capturedBitmap!!.asImageBitmap(),
-                                contentDescription = "Captured Image",
-                                contentScale = ContentScale.Crop,
-                                modifier = Modifier.fillMaxSize()
-                            )
-                            // Retake Button
-                            IconButton(
-                                onClick = {
-                                    val photoFile = createImageFile(context)
-                                    capturedImageUri = FileProvider.getUriForFile(
-                                        context,
-                                        "${context.packageName}.fileprovider",
-                                        photoFile
-                                    )
-                                    cameraLauncher.launch(capturedImageUri!!)
-                                },
-                                modifier = Modifier
-                                    .align(Alignment.TopEnd)
-                                    .padding(8.dp)
-                                    .background(Color.Black.copy(alpha = 0.5f), CircleShape)
-                            ) {
-                                Icon(
-                                    Icons.Rounded.PhotoCamera,
-                                    contentDescription = "Retake",
-                                    tint = Color.White
-                                )
-                            }
-                        }
-                    } else {
-                        Button(
-                            onClick = {
-                                try {
-                                    val photoFile = createImageFile(context)
-                                    val uri = FileProvider.getUriForFile(
-                                        context,
-                                        "${context.packageName}.fileprovider",
-                                        photoFile
-                                    )
-                                    capturedImageUri = uri
-                                    cameraLauncher.launch(uri)
-                                } catch (e: Exception) {
-                                    e.printStackTrace()
-                                    Toast.makeText(
-                                        context,
-                                        "Cannot open camera: ${e.message}",
-                                        Toast.LENGTH_SHORT
-                                    ).show()
+                LaunchedEffect(alert.id, alert.address) {
+                    if (displayAddress.isBlank()) {
+                        withContext(Dispatchers.IO) {
+                            try {
+                                val address =
+                                    PlaceSearcher.reverseGeocode(alert.lat, alert.lon)
+                                if (address.isNotBlank()) {
+                                    withContext(Dispatchers.Main) {
+                                        displayAddress = address
+                                    }
                                 }
-                            },
-                            modifier = Modifier.fillMaxWidth(),
-                            colors = ButtonDefaults.buttonColors(containerColor = Color.Gray)
-                        ) {
-                            Icon(Icons.Rounded.PhotoCamera, contentDescription = null)
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("Take Photo")
+                            } catch (e: Exception) {
+                                e.printStackTrace()
+                            }
                         }
                     }
-
-                    Spacer(modifier = Modifier.height(24.dp))
-
-                    Button(
-                        onClick = {
-                            // Convert Bitmap to Base64
-                            var photoBase64: String? = null
-                            if (capturedBitmap != null) {
-                                val outputStream = ByteArrayOutputStream()
-                                capturedBitmap!!.compress(
-                                    Bitmap.CompressFormat.JPEG,
-                                    70,
-                                    outputStream
-                                )
-                                val byteArray = outputStream.toByteArray()
-                                photoBase64 = Base64.encodeToString(byteArray, Base64.DEFAULT)
-                            }
-
-                            updateAlert(alert.id, detailsText, photoBase64)
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color.Black)
-                    ) {
-                        Text("Submit Details")
-                    }
-
-                    Spacer(modifier = Modifier.height(24.dp))
                 }
-            }
-        }
 
-        // Notifications Modal
-        if (showNotifications) {
-            // Use same skipPartiallyExpanded logic as search sheet if desired,
-            // though typically notifications might want to be half-expanded.
-            // User asked to make it "same as the search", so we should use skipPartiallyExpanded = true
-            // and apply the nested scroll fix.
-            val notificationSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-
-            ModalBottomSheet(
-                onDismissRequest = { showNotifications = false },
-                sheetState = notificationSheetState,
-                containerColor = Color.White,
-                shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
-                dragHandle = { BottomSheetDefaults.DragHandle() },
-                // Lower the drawer to be below the camera (add top padding)
-                modifier = Modifier.padding(top = 48.dp)
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(horizontal = 24.dp)
-                    // .fillMaxHeight(0.7f) // Remove fixed height to behave like search sheet (full/dynamic)
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    color = Color(0xFFF7F7F7),
+                    shape = RoundedCornerShape(16.dp)
                 ) {
-                    var showResolvedAlerts by remember { mutableStateOf(false) }
-
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(bottom = 20.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
+                            .padding(14.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(
-                                imageVector = Icons.Rounded.NotificationsActive,
-                                contentDescription = null,
-                                tint = Color.Black,
-                                modifier = Modifier.size(28.dp)
+                        if (!alert.userPhotoUrl.isNullOrBlank()) {
+                            AsyncImage(
+                                model = ImageRequest.Builder(LocalContext.current)
+                                    .data(alert.userPhotoUrl)
+                                    .crossfade(true)
+                                    .transformations(CircleCropTransformation())
+                                    .build(),
+                                contentDescription = "User Profile",
+                                modifier = Modifier
+                                    .size(64.dp)
+                                    .clip(CircleShape)
+                                    .background(Color.LightGray),
+                                contentScale = ContentScale.Crop
                             )
-                            Spacer(modifier = Modifier.width(12.dp))
-                            Text(
-                                text = if (showResolvedAlerts) "Resolved Alerts" else "Alert Notifications",
-                                style = MaterialTheme.typography.headlineSmall,
-                                fontWeight = FontWeight.Bold,
-                                color = Color.Black
+                        } else {
+                            Image(
+                                imageVector = Icons.Filled.Person,
+                                contentDescription = "User Profile",
+                                modifier = Modifier
+                                    .size(64.dp)
+                                    .clip(CircleShape)
+                                    .background(Color.LightGray)
+                                    .padding(12.dp),
+                                contentScale = ContentScale.Fit
                             )
                         }
 
-                        Surface(
-                            onClick = { showResolvedAlerts = !showResolvedAlerts },
-                            shape = RoundedCornerShape(20.dp),
-                            color = if (showResolvedAlerts) Color.Black else Color(0xFFF5F5F5),
-                            tonalElevation = 0.dp
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
+                        Spacer(modifier = Modifier.width(12.dp))
+
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = alert.userName ?: "Unknown User",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold
+                            )
+
+                            Spacer(modifier = Modifier.height(4.dp))
+
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                val (icon, color) = when (alert.type) {
+                                    "Fire Emergency" -> Icons.Rounded.LocalFireDepartment to Color(
+                                        0xFFFF5722
+                                    )
+
+                                    "Road Accident" -> Icons.Rounded.CarCrash to Color(0xFFFFC107)
+                                    "Emergency Rescue" -> Icons.Rounded.MedicalServices to Color.Red
+                                    else -> Icons.Rounded.Warning to Color.Red
+                                }
+
                                 Icon(
-                                    imageVector = if (showResolvedAlerts) Icons.Rounded.History else Icons.Rounded.Notifications,
+                                    imageVector = icon,
                                     contentDescription = null,
-                                    tint = if (showResolvedAlerts) Color.White else Color.Black,
+                                    tint = color,
                                     modifier = Modifier.size(18.dp)
+                                )
+
+                                Spacer(modifier = Modifier.width(6.dp))
+
+                                Text(
+                                    text = alert.type,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = Color.Gray
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.height(6.dp))
+
+                            Row(verticalAlignment = Alignment.Top) {
+                                Icon(
+                                    imageVector = Icons.Rounded.LocationOn,
+                                    contentDescription = null,
+                                    tint = Color.Gray,
+                                    modifier = Modifier
+                                        .size(16.dp)
+                                        .padding(top = 2.dp)
                                 )
                                 Spacer(modifier = Modifier.width(6.dp))
                                 Text(
-                                    text = if (showResolvedAlerts) "Show Active" else "Show Resolved",
-                                    style = MaterialTheme.typography.labelMedium,
-                                    fontWeight = FontWeight.Medium,
-                                    color = if (showResolvedAlerts) Color.White else Color.Black
+                                    text = displayAddress.ifBlank { "Lat: ${alert.lat}, Lon: ${alert.lon}" },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis
                                 )
                             }
                         }
                     }
+                }
 
-                    val displayedAlerts = remember(alerts, showResolvedAlerts, userRole, userDepartment) {
+                Spacer(modifier = Modifier.height(12.dp))
+                HorizontalDivider(color = Color.LightGray.copy(alpha = 0.5f))
+                Spacer(modifier = Modifier.height(12.dp))
+
+                // Details Column (Left Aligned)
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    if (isOwner) {
+                        var phoneNumberText by remember(alert.id) {
+                            mutableStateOf(userPhoneNumber)
+                        }
+                        var localDetailsText by remember(alert.id) {
+                            mutableStateOf(alert.details)
+                        }
+
+                        Text(
+                            text = "Contact",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Color.Gray,
+                            modifier = Modifier.padding(bottom = 6.dp)
+                        )
+
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            color = Color(0xFFF7F7F7),
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Column(modifier = Modifier.padding(12.dp)) {
+                                Text(
+                                    text = "Phone Number *",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = Color.Gray,
+                                    modifier = Modifier.padding(bottom = 6.dp)
+                                )
+
+                                OutlinedTextField(
+                                    value = phoneNumberText,
+                                    onValueChange = { phoneNumberText = it },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    placeholder = {
+                                        Text(
+                                            "+63 912 345 6789",
+                                            color = Color.LightGray
+                                        )
+                                    },
+                                    singleLine = true,
+                                    shape = RoundedCornerShape(10.dp),
+                                    colors = OutlinedTextFieldDefaults.colors(
+                                        focusedBorderColor = Color(0xFFE0E0E0),
+                                        unfocusedBorderColor = Color(0xFFE0E0E0),
+                                        focusedContainerColor = Color.White,
+                                        unfocusedContainerColor = Color.White
+                                    )
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(10.dp))
+
+                        Text(
+                            text = "Details (Optional)",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Color.Gray,
+                            modifier = Modifier.padding(bottom = 6.dp)
+                        )
+
+                        OutlinedTextField(
+                            value = localDetailsText,
+                            onValueChange = { localDetailsText = it },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(100.dp),
+                            placeholder = {
+                                Text(
+                                    "Describe the situation...",
+                                    color = Color.LightGray
+                                )
+                            },
+                            maxLines = 4,
+                            shape = RoundedCornerShape(12.dp),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = Color(0xFFE0E0E0),
+                                unfocusedBorderColor = Color(0xFFE0E0E0),
+                                focusedContainerColor = Color(0xFFF7F7F7),
+                                unfocusedContainerColor = Color(0xFFF7F7F7)
+                            )
+                        )
+
+                        if (alert.photoBase64.isNotBlank()) {
+                            Spacer(modifier = Modifier.height(12.dp))
+                            val imageBitmap = remember(alert.photoBase64) {
+                                try {
+                                    val decodedBytes =
+                                        Base64.decode(alert.photoBase64, Base64.DEFAULT)
+                                    BitmapFactory.decodeByteArray(
+                                        decodedBytes,
+                                        0,
+                                        decodedBytes.size
+                                    )?.asImageBitmap()
+                                } catch (e: Exception) {
+                                    null
+                                }
+                            }
+
+                            if (imageBitmap != null) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(84.dp)
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .background(Color(0xFFEDEDED))
+                                ) {
+                                    androidx.compose.foundation.Image(
+                                        bitmap = imageBitmap,
+                                        contentDescription = "Attached Photo",
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                }
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(10.dp))
+
+                        Text(
+                            text = "Photos (Optional)",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Color.Gray,
+                            modifier = Modifier.padding(bottom = 6.dp)
+                        )
+
+                        if (capturedBitmap != null) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(104.dp)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(Color(0xFFEDEDED))
+                            ) {
+                                androidx.compose.foundation.Image(
+                                    bitmap = capturedBitmap!!.asImageBitmap(),
+                                    contentDescription = "Captured Image",
+                                    contentScale = ContentScale.Crop,
+                                    modifier = Modifier.fillMaxSize()
+                                )
+                                IconButton(
+                                    onClick = {
+                                        val photoFile = createImageFile(context)
+                                        capturedImageUri = FileProvider.getUriForFile(
+                                            context,
+                                            "${context.packageName}.fileprovider",
+                                            photoFile
+                                        )
+                                        cameraLauncher.launch(capturedImageUri!!)
+                                    },
+                                    modifier = Modifier
+                                        .align(Alignment.TopEnd)
+                                        .padding(8.dp)
+                                        .background(Color.Black.copy(alpha = 0.5f), CircleShape)
+                                ) {
+                                    Icon(
+                                        Icons.Rounded.PhotoCamera,
+                                        contentDescription = "Retake",
+                                        tint = Color.White
+                                    )
+                                }
+                            }
+                        } else {
+                            OutlinedButton(
+                                onClick = {
+                                    try {
+                                        val photoFile = createImageFile(context)
+                                        val uri = FileProvider.getUriForFile(
+                                            context,
+                                            "${context.packageName}.fileprovider",
+                                            photoFile
+                                        )
+                                        capturedImageUri = uri
+                                        cameraLauncher.launch(uri)
+                                    } catch (e: Exception) {
+                                        e.printStackTrace()
+                                        Toast.makeText(
+                                            context,
+                                            "Cannot open camera: ${e.message}",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                    }
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(12.dp),
+                                colors = ButtonDefaults.outlinedButtonColors(
+                                    containerColor = Color(0xFFF7F7F7)
+                                )
+                            ) {
+                                Icon(Icons.Rounded.PhotoCamera, contentDescription = null)
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("Upload")
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        Button(
+                            onClick = {
+                                var photoBase64: String? = null
+                                if (capturedBitmap != null) {
+                                    val outputStream = ByteArrayOutputStream()
+                                    capturedBitmap!!.compress(
+                                        Bitmap.CompressFormat.JPEG,
+                                        70,
+                                        outputStream
+                                    )
+                                    val byteArray = outputStream.toByteArray()
+                                    photoBase64 = Base64.encodeToString(byteArray, Base64.DEFAULT)
+                                }
+                                updateAlert(
+                                    alert.id,
+                                    localDetailsText,
+                                    photoBase64,
+                                    phoneNumberText
+                                )
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color.Black)
+                        ) {
+                            Text("Submit Details")
+                        }
+                    }
+
+                }
+
+                Spacer(modifier = Modifier.height(32.dp))
+
+                // Navigation Button (Only for non-owners)
+                if (!isOwner) {
+                    Button(
+                        onClick = {
+                            val userLocation = mapLibreMap?.locationComponent?.lastKnownLocation
+                            if (userLocation != null) {
+                                scope.launch {
+                                    Toast.makeText(
+                                        context,
+                                        "Calculating route...",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                    val start =
+                                        LatLng(userLocation.latitude, userLocation.longitude)
+                                    val end = LatLng(alert.lat, alert.lon)
+
+                                    val (points, steps) = RouteFetcher.fetchRoute(start, end)
+
+                                    if (points.isNotEmpty()) {
+                                        navigationService?.startNavigation(steps, points, end)
+                                        mapLibreMap?.getStyle { style ->
+                                            // Remove existing route layer and source if any
+                                            if (style.getLayer("route-layer") != null) style.removeLayer(
+                                                "route-layer"
+                                            )
+                                            if (style.getSource("route-source") != null) style.removeSource(
+                                                "route-source"
+                                            )
+
+                                            // Create GeoJsonSource with lineMetrics enabled
+                                            val lineString = LineString.fromLngLats(points.map {
+                                                Point.fromLngLat(
+                                                    it.longitude,
+                                                    it.latitude
+                                                )
+                                            })
+                                            val source = GeoJsonSource(
+                                                "route-source",
+                                                Feature.fromGeometry(lineString),
+                                                GeoJsonOptions().withLineMetrics(true)
+                                            )
+                                            style.addSource(source)
+
+                                            // Create LineLayer with Gradient
+                                            val layer = LineLayer("route-layer", "route-source")
+                                            layer.setProperties(
+                                                PropertyFactory.lineWidth(8f),
+                                                PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+                                                PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
+                                                PropertyFactory.lineGradient(
+                                                    Expression.interpolate(
+                                                        Expression.linear(),
+                                                        Expression.lineProgress(),
+                                                        Expression.stop(
+                                                            0f,
+                                                            Expression.color(android.graphics.Color.BLUE)
+                                                        ),
+                                                        Expression.stop(
+                                                            1f,
+                                                            Expression.color(android.graphics.Color.CYAN)
+                                                        )
+                                                    )
+                                                )
+                                            )
+                                            style.addLayer(layer)
+
+                                            // Zoom to start
+                                            mapLibreMap?.animateCamera(
+                                                CameraUpdateFactory.newLatLngZoom(
+                                                    start,
+                                                    16.0
+                                                )
+                                            )
+                                            isNavigating = true
+                                        }
+                                        showAlertDetails = false
+                                    } else {
+                                        Toast.makeText(
+                                            context,
+                                            "Route not found",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                    }
+                                }
+                            } else {
+                                Toast.makeText(
+                                    context,
+                                    "Waiting for current location...",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1A1A2E))
+                    ) {
+                        Icon(
+                            Icons.Rounded.NearMe,
+                            contentDescription = null,
+                            tint = Color.White
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Navigate to Location",
+                            modifier = Modifier.padding(vertical = 8.dp),
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                    }
+                }
+
+                if (isOwner && alert.status != "resolved") {
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Button(
+                        onClick = { resolveAlert(alert.id) },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))
+                    ) {
+                        Text("Resolve Alert")
+                    }
+                }
+            }
+        }
+    }
+
+    // Add Details Modal
+    if (showAddDetails && selectedAlert != null) {
+        ModalBottomSheet(
+            onDismissRequest = { showAddDetails = false },
+            containerColor = Color.White,
+            shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
+            dragHandle = { BottomSheetDefaults.DragHandle() }
+        ) {
+            val alert = selectedAlert!!
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(24.dp)
+                    .imePadding()
+            ) {
+                Text(
+                    text = "Add Details",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(bottom = 16.dp)
+                )
+
+                OutlinedTextField(
+                    value = detailsText,
+                    onValueChange = { detailsText = it },
+                    label = { Text("Additional Information") },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(150.dp),
+                    maxLines = 5
+                )
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // Camera Button and Preview
+                if (capturedBitmap != null) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(200.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(Color.Gray)
+                    ) {
+                        androidx.compose.foundation.Image(
+                            bitmap = capturedBitmap!!.asImageBitmap(),
+                            contentDescription = "Captured Image",
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                        // Retake Button
+                        IconButton(
+                            onClick = {
+                                val photoFile = createImageFile(context)
+                                capturedImageUri = FileProvider.getUriForFile(
+                                    context,
+                                    "${context.packageName}.fileprovider",
+                                    photoFile
+                                )
+                                cameraLauncher.launch(capturedImageUri!!)
+                            },
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                .padding(8.dp)
+                                .background(Color.Black.copy(alpha = 0.5f), CircleShape)
+                        ) {
+                            Icon(
+                                Icons.Rounded.PhotoCamera,
+                                contentDescription = "Retake",
+                                tint = Color.White
+                            )
+                        }
+                    }
+                } else {
+                    Button(
+                        onClick = {
+                            try {
+                                val photoFile = createImageFile(context)
+                                val uri = FileProvider.getUriForFile(
+                                    context,
+                                    "${context.packageName}.fileprovider",
+                                    photoFile
+                                )
+                                capturedImageUri = uri
+                                cameraLauncher.launch(uri)
+                            } catch (e: Exception) {
+                                e.printStackTrace()
+                                Toast.makeText(
+                                    context,
+                                    "Cannot open camera: ${e.message}",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color.Gray)
+                    ) {
+                        Icon(Icons.Rounded.PhotoCamera, contentDescription = null)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Take Photo")
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(24.dp))
+
+                Button(
+                    onClick = {
+                        // Convert Bitmap to Base64
+                        var photoBase64: String? = null
+                        if (capturedBitmap != null) {
+                            val outputStream = ByteArrayOutputStream()
+                            capturedBitmap!!.compress(
+                                Bitmap.CompressFormat.JPEG,
+                                70,
+                                outputStream
+                            )
+                            val byteArray = outputStream.toByteArray()
+                            photoBase64 = Base64.encodeToString(byteArray, Base64.DEFAULT)
+                        }
+
+                        updateAlert(alert.id, detailsText, photoBase64)
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color.Black)
+                ) {
+                    Text("Submit Details")
+                }
+
+                Spacer(modifier = Modifier.height(24.dp))
+            }
+        }
+    }
+
+    // Notifications Modal
+    if (showNotifications) {
+        // Use same skipPartiallyExpanded logic as search sheet if desired,
+        // though typically notifications might want to be half-expanded.
+        // User asked to make it "same as the search", so we should use skipPartiallyExpanded = true
+        // and apply the nested scroll fix.
+        val notificationSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+
+        ModalBottomSheet(
+            onDismissRequest = { showNotifications = false },
+            sheetState = notificationSheetState,
+            containerColor = Color.White,
+            shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
+            dragHandle = { BottomSheetDefaults.DragHandle() },
+            // Lower the drawer to be below the camera (add top padding)
+            modifier = Modifier.padding(top = 48.dp)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(horizontal = 24.dp)
+                // .fillMaxHeight(0.7f) // Remove fixed height to behave like search sheet (full/dynamic)
+            ) {
+                var showResolvedAlerts by remember { mutableStateOf(false) }
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 20.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.NotificationsActive,
+                            contentDescription = null,
+                            tint = Color.Black,
+                            modifier = Modifier.size(28.dp)
+                        )
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Text(
+                            text = if (showResolvedAlerts) "Resolved Alerts" else "Alert Notifications",
+                            style = MaterialTheme.typography.headlineSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.Black
+                        )
+                    }
+
+                    Surface(
+                        onClick = { showResolvedAlerts = !showResolvedAlerts },
+                        shape = RoundedCornerShape(20.dp),
+                        color = if (showResolvedAlerts) Color.Black else Color(0xFFF5F5F5),
+                        tonalElevation = 0.dp
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = if (showResolvedAlerts) Icons.Rounded.History else Icons.Rounded.Notifications,
+                                contentDescription = null,
+                                tint = if (showResolvedAlerts) Color.White else Color.Black,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = if (showResolvedAlerts) "Show Active" else "Show Resolved",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Medium,
+                                color = if (showResolvedAlerts) Color.White else Color.Black
+                            )
+                        }
+                    }
+                }
+
+                val displayedAlerts =
+                    remember(alerts, showResolvedAlerts, userRole, userDepartment) {
                         alerts.values.filter { alert ->
-                            val statusMatch = if (showResolvedAlerts) alert.status == "resolved" else alert.status != "resolved"
+                            val statusMatch =
+                                if (showResolvedAlerts) alert.status == "resolved" else alert.status != "resolved"
                             if (!statusMatch) return@filter false
 
                             // Filter alerts for LGU Admins in the notifications list
@@ -3556,349 +3804,384 @@ fun HomeScreen(navController: NavController) {
                         }.sortedByDescending { it.timestamp }
                     }
 
-                    if (displayedAlerts.isEmpty()) {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .weight(1f),
-                            contentAlignment = Alignment.Center
+                if (displayedAlerts.isEmpty()) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(16.dp)
                         ) {
-                            Column(
-                                horizontalAlignment = Alignment.CenterHorizontally,
-                                verticalArrangement = Arrangement.spacedBy(16.dp)
+                            Surface(
+                                shape = CircleShape,
+                                color = Color(0xFFF5F5F5),
+                                modifier = Modifier.size(80.dp)
                             ) {
-                                Surface(
-                                    shape = CircleShape,
-                                    color = Color(0xFFF5F5F5),
-                                    modifier = Modifier.size(80.dp)
-                                ) {
-                                    Icon(
-                                        imageVector = if (showResolvedAlerts) 
-                                            Icons.Rounded.CheckCircle 
-                                        else 
-                                            Icons.Rounded.NotificationsNone,
-                                        contentDescription = null,
-                                        tint = Color.Black,
-                                        modifier = Modifier.padding(20.dp)
-                                    )
-                                }
-                                
-                                Text(
-                                    text = if (showResolvedAlerts) "No Resolved Alerts" else "No Active Alerts",
-                                    style = MaterialTheme.typography.titleLarge,
-                                    fontWeight = FontWeight.Bold,
-                                    color = MaterialTheme.colorScheme.onSurface
-                                )
-                                
-                                Text(
-                                    text = if (showResolvedAlerts) 
-                                        "All alerts have been successfully resolved"
-                                    else 
-                                        "Stay alert for emergency notifications in your area",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    textAlign = TextAlign.Center,
-                                    modifier = Modifier.padding(horizontal = 32.dp)
+                                Icon(
+                                    imageVector = if (showResolvedAlerts)
+                                        Icons.Rounded.CheckCircle
+                                    else
+                                        Icons.Rounded.NotificationsNone,
+                                    contentDescription = null,
+                                    tint = Color.Black,
+                                    modifier = Modifier.padding(20.dp)
                                 )
                             }
+
+                            Text(
+                                text = if (showResolvedAlerts) "No Resolved Alerts" else "No Active Alerts",
+                                style = MaterialTheme.typography.titleLarge,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+
+                            Text(
+                                text = if (showResolvedAlerts)
+                                    "All alerts have been successfully resolved"
+                                else
+                                    "Stay alert for emergency notifications in your area",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.padding(horizontal = 32.dp)
+                            )
                         }
-                    } else {
-                        // NestedScrollConnection Fix
-                        val listState = rememberLazyListState()
-                        val nestedScrollConnection = remember {
-                            object : NestedScrollConnection {
-                                override fun onPreScroll(
-                                    available: Offset,
-                                    source: NestedScrollSource
-                                ): Offset {
-                                    if (available.y > 0 && listState.firstVisibleItemIndex == 0 && listState.firstVisibleItemScrollOffset == 0) {
-                                        return available
-                                    }
-                                    return Offset.Zero
+                    }
+                } else {
+                    // NestedScrollConnection Fix
+                    val listState = rememberLazyListState()
+                    val nestedScrollConnection = remember {
+                        object : NestedScrollConnection {
+                            override fun onPreScroll(
+                                available: Offset,
+                                source: NestedScrollSource
+                            ): Offset {
+                                if (available.y > 0 && listState.firstVisibleItemIndex == 0 && listState.firstVisibleItemScrollOffset == 0) {
+                                    return available
                                 }
-
-                                override fun onPostScroll(
-                                    consumed: Offset,
-                                    available: Offset,
-                                    source: NestedScrollSource
-                                ): Offset = available
-
-                                override suspend fun onPostFling(
-                                    consumed: Velocity,
-                                    available: Velocity
-                                ): Velocity = available
+                                return Offset.Zero
                             }
-                        }
 
-                        LazyColumn(
-                            state = listState,
-                            verticalArrangement = Arrangement.spacedBy(16.dp),
-                            modifier = Modifier
-                                .weight(1f)
-                                .nestedScroll(nestedScrollConnection)
-                                .padding(bottom = 24.dp) // Add bottom padding
-                        ) {
-                            items(displayedAlerts, key = { it.id }) { alert ->
-                                // Lightweight card entrance animation
-                                val animatedVisibility = remember { Animatable(0.92f) }
-                                LaunchedEffect(Unit) {
-                                    animatedVisibility.animateTo(
-                                        1f,
-                                        animationSpec = tween(220, easing = androidx.compose.animation.core.FastOutSlowInEasing)
+                            override fun onPostScroll(
+                                consumed: Offset,
+                                available: Offset,
+                                source: NestedScrollSource
+                            ): Offset = available
+
+                            override suspend fun onPostFling(
+                                consumed: Velocity,
+                                available: Velocity
+                            ): Velocity = available
+                        }
+                    }
+
+                    LazyColumn(
+                        state = listState,
+                        verticalArrangement = Arrangement.spacedBy(16.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .nestedScroll(nestedScrollConnection)
+                            .padding(bottom = 24.dp) // Add bottom padding
+                    ) {
+                        items(displayedAlerts, key = { it.id }) { alert ->
+                            // Lightweight card entrance animation
+                            val animatedVisibility = remember { Animatable(0.92f) }
+                            LaunchedEffect(Unit) {
+                                animatedVisibility.animateTo(
+                                    1f,
+                                    animationSpec = tween(
+                                        220,
+                                        easing = androidx.compose.animation.core.FastOutSlowInEasing
                                     )
-                                }
-                                
-                                Card(
-                                    modifier = Modifier
-                                        .graphicsLayer {
-                                            alpha = animatedVisibility.value
-                                            // Only scale vertically for a subtle slide-in feel
-                                            scaleY = animatedVisibility.value
-                                        },
-                                    onClick = {
-                                        try {
-                                            if (alert.status == "resolved") {
-                                                Toast.makeText(
-                                                    context,
-                                                    "Alert already resolved",
-                                                    Toast.LENGTH_SHORT
-                                                ).show()
-                                            } else {
-                                                showNotifications = false
-                                                // Focus on this alert
-                                                mapLibreMap?.let { map ->
-                                                    val position = LatLng(alert.lat, alert.lon)
-                                                    map.animateCamera(
-                                                        CameraUpdateFactory.newLatLngZoom(
-                                                            position,
-                                                            16.0
-                                                        )
-                                                    )
-                                                }
-                                                selectedAlert = alert
-                                                showAlertDetails = true
-                                            }
-                                        } catch (e: Exception) {
-                                            Log.e(
-                                                "HomeScreen",
-                                                "Error handling notification click",
-                                                e
-                                            )
+                                )
+                            }
+
+                            Card(
+                                modifier = Modifier
+                                    .graphicsLayer {
+                                        alpha = animatedVisibility.value
+                                        // Only scale vertically for a subtle slide-in feel
+                                        scaleY = animatedVisibility.value
+                                    },
+                                onClick = {
+                                    try {
+                                        if (alert.status == "resolved") {
                                             Toast.makeText(
                                                 context,
-                                                "Error opening alert",
+                                                "Alert already resolved",
                                                 Toast.LENGTH_SHORT
                                             ).show()
+                                        } else {
+                                            showNotifications = false
+                                            // Focus on this alert
+                                            mapLibreMap?.let { map ->
+                                                val position = LatLng(alert.lat, alert.lon)
+                                                map.animateCamera(
+                                                    CameraUpdateFactory.newLatLngZoom(
+                                                        position,
+                                                        16.0
+                                                    )
+                                                )
+                                            }
+                                            selectedAlert = alert
+                                            showAlertDetails = true
                                         }
-                                    },
-                                    colors = CardDefaults.cardColors(
-                                        containerColor = Color.White
-                                    ),
-                                    elevation = CardDefaults.cardElevation(
-                                        defaultElevation = 0.dp,
-                                        pressedElevation = 2.dp
-                                    ),
-                                    shape = RoundedCornerShape(16.dp),
-                                    border = BorderStroke(
-                                        2.dp,
-                                        when (alert.type) {
-                                            "Fire Emergency" -> Color(0xFFFF6B00)
-                                            "Emergency Rescue" -> Color(0xFFE53935)
-                                            "Road Accident" -> Color(0xFFFFC107)
-                                            else -> Color(0xFF9E9E9E)
-                                        }
-                                    )
-                                ) {
-                                    // Derive per-type values
-                                    val alertColor = when (alert.type) {
+                                    } catch (e: Exception) {
+                                        Log.e(
+                                            "HomeScreen",
+                                            "Error handling notification click",
+                                            e
+                                        )
+                                        Toast.makeText(
+                                            context,
+                                            "Error opening alert",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                    }
+                                },
+                                colors = CardDefaults.cardColors(
+                                    containerColor = Color.White
+                                ),
+                                elevation = CardDefaults.cardElevation(
+                                    defaultElevation = 0.dp,
+                                    pressedElevation = 2.dp
+                                ),
+                                shape = RoundedCornerShape(16.dp),
+                                border = BorderStroke(
+                                    2.dp,
+                                    when (alert.type) {
                                         "Fire Emergency" -> Color(0xFFFF6B00)
                                         "Emergency Rescue" -> Color(0xFFE53935)
                                         "Road Accident" -> Color(0xFFFFC107)
                                         else -> Color(0xFF9E9E9E)
                                     }
-                                    val alertIcon = when (alert.type) {
-                                        "Emergency Rescue" -> Icons.Rounded.MedicalServices
-                                        "Fire Emergency" -> Icons.Rounded.LocalFireDepartment
-                                        "Road Accident" -> Icons.Rounded.DirectionsCar
-                                        else -> Icons.Rounded.Warning
-                                    }
-                                    val diff = currentTime - alert.timestamp
-                                    val timeAgo = when {
-                                        diff < 60000 -> "Just now"
-                                        diff < 3600000 -> "${diff / 60000}m ago"
-                                        diff < 86400000 -> "${diff / 3600000}h ago"
-                                        else -> java.text.SimpleDateFormat("MMM dd", java.util.Locale.getDefault()).format(java.util.Date(alert.timestamp))
-                                    }
+                                )
+                            ) {
+                                // Derive per-type values
+                                val alertColor = when (alert.type) {
+                                    "Fire Emergency" -> Color(0xFFFF6B00)
+                                    "Emergency Rescue" -> Color(0xFFE53935)
+                                    "Road Accident" -> Color(0xFFFFC107)
+                                    else -> Color(0xFF9E9E9E)
+                                }
+                                val alertIcon = when (alert.type) {
+                                    "Emergency Rescue" -> Icons.Rounded.MedicalServices
+                                    "Fire Emergency" -> Icons.Rounded.LocalFireDepartment
+                                    "Road Accident" -> Icons.Rounded.DirectionsCar
+                                    else -> Icons.Rounded.Warning
+                                }
+                                val diff = currentTime - alert.timestamp
+                                val timeAgo = when {
+                                    diff < 60000 -> "Just now"
+                                    diff < 3600000 -> "${diff / 60000}m ago"
+                                    diff < 86400000 -> "${diff / 3600000}h ago"
+                                    else -> java.text.SimpleDateFormat(
+                                        "MMM dd",
+                                        java.util.Locale.getDefault()
+                                    ).format(java.util.Date(alert.timestamp))
+                                }
 
-                                    var notificationAddress by remember { mutableStateOf(alert.address) }
-                                    LaunchedEffect(alert.id, alert.address) {
-                                        if (notificationAddress.isBlank()) {
-                                            withContext(Dispatchers.IO) {
-                                                try {
-                                                    val address = PlaceSearcher.reverseGeocode(alert.lat, alert.lon)
-                                                    if (address.isNotBlank()) withContext(Dispatchers.Main) { notificationAddress = address }
-                                                } catch (e: Exception) { e.printStackTrace() }
+                                var notificationAddress by remember { mutableStateOf(alert.address) }
+                                LaunchedEffect(alert.id, alert.address) {
+                                    if (notificationAddress.isBlank()) {
+                                        withContext(Dispatchers.IO) {
+                                            try {
+                                                val address = PlaceSearcher.reverseGeocode(
+                                                    alert.lat,
+                                                    alert.lon
+                                                )
+                                                if (address.isNotBlank()) withContext(Dispatchers.Main) {
+                                                    notificationAddress = address
+                                                }
+                                            } catch (e: Exception) {
+                                                e.printStackTrace()
                                             }
                                         }
                                     }
+                                }
 
-                                    Column(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .padding(16.dp)
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(16.dp)
+                                ) {
+                                    // ── Top row: avatar + name/type + time chip ──
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.fillMaxWidth()
                                     ) {
-                                        // ── Top row: avatar + name/type + time chip ──
-                                        Row(
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            modifier = Modifier.fillMaxWidth()
+                                        // Circular avatar with tinted bg
+                                        Surface(
+                                            shape = CircleShape,
+                                            color = alertColor.copy(alpha = 0.12f),
+                                            modifier = Modifier.size(46.dp)
                                         ) {
-                                            // Circular avatar with tinted bg
-                                            Surface(
-                                                shape = CircleShape,
-                                                color = alertColor.copy(alpha = 0.12f),
-                                                modifier = Modifier.size(46.dp)
-                                            ) {
-                                                if (!alert.userPhotoUrl.isNullOrBlank()) {
-                                                    AsyncImage(
-                                                        model = ImageRequest.Builder(LocalContext.current)
-                                                            .data(alert.userPhotoUrl)
-                                                            .crossfade(true)
-                                                            .transformations(CircleCropTransformation())
-                                                            .build(),
-                                                        contentDescription = "User Profile",
-                                                        modifier = Modifier.size(46.dp).clip(CircleShape),
-                                                        contentScale = ContentScale.Crop
-                                                    )
-                                                } else {
-                                                    Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
-                                                        Icon(
-                                                            imageVector = alertIcon,
-                                                            contentDescription = null,
-                                                            tint = alertColor,
-                                                            modifier = Modifier.size(22.dp)
-                                                        )
-                                                    }
-                                                }
-                                            }
-
-                                            Spacer(modifier = Modifier.width(12.dp))
-
-                                            // Name + colored type label
-                                            Column(modifier = Modifier.weight(1f)) {
-                                                Row(
-                                                    verticalAlignment = Alignment.CenterVertically
+                                            if (!alert.userPhotoUrl.isNullOrBlank()) {
+                                                AsyncImage(
+                                                    model = ImageRequest.Builder(LocalContext.current)
+                                                        .data(alert.userPhotoUrl)
+                                                        .crossfade(true)
+                                                        .transformations(CircleCropTransformation())
+                                                        .build(),
+                                                    contentDescription = "User Profile",
+                                                    modifier = Modifier.size(46.dp)
+                                                        .clip(CircleShape),
+                                                    contentScale = ContentScale.Crop
+                                                )
+                                            } else {
+                                                Box(
+                                                    contentAlignment = Alignment.Center,
+                                                    modifier = Modifier.fillMaxSize()
                                                 ) {
-                                                    Text(
-                                                        text = alert.userName ?: "Unknown User",
-                                                        style = MaterialTheme.typography.titleMedium,
-                                                        fontWeight = FontWeight.Bold,
-                                                        color = Color.Black
-                                                    )
-                                                    Spacer(modifier = Modifier.width(6.dp))
                                                     Icon(
                                                         imageVector = alertIcon,
-                                                        contentDescription = alert.type,
+                                                        contentDescription = null,
                                                         tint = alertColor,
-                                                        modifier = Modifier.size(16.dp)
+                                                        modifier = Modifier.size(22.dp)
                                                     )
                                                 }
-                                                Text(
-                                                    text = alert.type.uppercase(),
-                                                    style = MaterialTheme.typography.labelSmall,
-                                                    fontWeight = FontWeight.Bold,
-                                                    color = alertColor,
-                                                    letterSpacing = 0.5.sp
-                                                )
-                                            }
-
-                                            // Time chip
-                                            Surface(
-                                                shape = RoundedCornerShape(20.dp),
-                                                color = Color(0xFFF5F5F5)
-                                            ) {
-                                                Text(
-                                                    text = timeAgo,
-                                                    style = MaterialTheme.typography.labelSmall,
-                                                    fontWeight = FontWeight.Medium,
-                                                    color = Color.DarkGray,
-                                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
-                                                )
                                             }
                                         }
 
-                                        Spacer(modifier = Modifier.height(12.dp))
-                                        HorizontalDivider(color = Color(0xFFF0F0F0))
-                                        Spacer(modifier = Modifier.height(12.dp))
+                                        Spacer(modifier = Modifier.width(12.dp))
 
-                                        // ── LOCATION row ──
-                                        Row(verticalAlignment = Alignment.Top) {
-                                            Text(
-                                                text = "LOCATION",
-                                                style = MaterialTheme.typography.labelSmall,
-                                                fontWeight = FontWeight.Bold,
-                                                color = Color(0xFF9E9E9E),
-                                                modifier = Modifier.width(72.dp)
-                                            )
-                                            Text(
-                                                text = notificationAddress.ifEmpty { "${String.format("%.4f", alert.lat)}, ${String.format("%.4f", alert.lon)}" },
-                                                style = MaterialTheme.typography.bodySmall,
-                                                color = Color.Black,
-                                                maxLines = 2,
-                                                overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-                                                modifier = Modifier.weight(1f)
-                                            )
-                                        }
-
-                                        if (alert.status != "resolved") {
-                                            Spacer(modifier = Modifier.height(14.dp))
-                                            // ── Details button ──
-                                            Button(
-                                                onClick = {
-                                                    try {
-                                                        showNotifications = false
-                                                        mapLibreMap?.let { map ->
-                                                            map.animateCamera(CameraUpdateFactory.newLatLngZoom(LatLng(alert.lat, alert.lon), 16.0))
-                                                        }
-                                                        selectedAlert = alert
-                                                        showAlertDetails = true
-                                                    } catch (e: Exception) {
-                                                        Log.e("HomeScreen", "Error handling notification click", e)
-                                                    }
-                                                },
-                                                modifier = Modifier.fillMaxWidth(),
-                                                shape = RoundedCornerShape(12.dp),
-                                                colors = ButtonDefaults.buttonColors(
-                                                    containerColor = Color(0xFFE3F2FD),
-                                                    contentColor = Color(0xFF1565C0)
-                                                ),
-                                                contentPadding = PaddingValues(vertical = 12.dp)
-                                            ) {
-                                                Text(
-                                                    text = "Details",
-                                                    style = MaterialTheme.typography.labelLarge,
-                                                    fontWeight = FontWeight.Bold
-                                                )
-                                            }
-                                        } else {
-                                            Spacer(modifier = Modifier.height(8.dp))
+                                        // Name + colored type label
+                                        Column(modifier = Modifier.weight(1f)) {
                                             Row(
-                                                verticalAlignment = Alignment.CenterVertically,
-                                                modifier = Modifier.padding(top = 4.dp)
+                                                verticalAlignment = Alignment.CenterVertically
                                             ) {
-                                                Icon(
-                                                    imageVector = Icons.Rounded.CheckCircle,
-                                                    contentDescription = null,
-                                                    tint = Color(0xFF4CAF50),
-                                                    modifier = Modifier.size(16.dp)
+                                                Text(
+                                                    text = alert.userName ?: "Unknown User",
+                                                    style = MaterialTheme.typography.titleMedium,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = Color.Black
                                                 )
                                                 Spacer(modifier = Modifier.width(6.dp))
-                                                Text(
-                                                    text = "Resolved",
-                                                    style = MaterialTheme.typography.labelMedium,
-                                                    color = Color(0xFF4CAF50),
-                                                    fontWeight = FontWeight.Medium
+                                                Icon(
+                                                    imageVector = alertIcon,
+                                                    contentDescription = alert.type,
+                                                    tint = alertColor,
+                                                    modifier = Modifier.size(16.dp)
                                                 )
                                             }
+                                            Text(
+                                                text = alert.type.uppercase(),
+                                                style = MaterialTheme.typography.labelSmall,
+                                                fontWeight = FontWeight.Bold,
+                                                color = alertColor,
+                                                letterSpacing = 0.5.sp
+                                            )
+                                        }
+
+                                        // Time chip
+                                        Surface(
+                                            shape = RoundedCornerShape(20.dp),
+                                            color = Color(0xFFF5F5F5)
+                                        ) {
+                                            Text(
+                                                text = timeAgo,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                fontWeight = FontWeight.Medium,
+                                                color = Color.DarkGray,
+                                                modifier = Modifier.padding(
+                                                    horizontal = 10.dp,
+                                                    vertical = 5.dp
+                                                )
+                                            )
+                                        }
+                                    }
+
+                                    Spacer(modifier = Modifier.height(12.dp))
+                                    HorizontalDivider(color = Color(0xFFF0F0F0))
+                                    Spacer(modifier = Modifier.height(12.dp))
+
+                                    // ── LOCATION row ──
+                                    Row(verticalAlignment = Alignment.Top) {
+                                        Text(
+                                            text = "LOCATION",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            fontWeight = FontWeight.Bold,
+                                            color = Color(0xFF9E9E9E),
+                                            modifier = Modifier.width(72.dp)
+                                        )
+                                        Text(
+                                            text = notificationAddress.ifEmpty {
+                                                "${
+                                                    String.format(
+                                                        "%.4f",
+                                                        alert.lat
+                                                    )
+                                                }, ${String.format("%.4f", alert.lon)}"
+                                            },
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = Color.Black,
+                                            maxLines = 2,
+                                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                    }
+
+                                    if (alert.status != "resolved") {
+                                        Spacer(modifier = Modifier.height(14.dp))
+                                        // ── Details button ──
+                                        Button(
+                                            onClick = {
+                                                try {
+                                                    showNotifications = false
+                                                    mapLibreMap?.let { map ->
+                                                        map.animateCamera(
+                                                            CameraUpdateFactory.newLatLngZoom(
+                                                                LatLng(alert.lat, alert.lon),
+                                                                16.0
+                                                            )
+                                                        )
+                                                    }
+                                                    selectedAlert = alert
+                                                    showAlertDetails = true
+                                                } catch (e: Exception) {
+                                                    Log.e(
+                                                        "HomeScreen",
+                                                        "Error handling notification click",
+                                                        e
+                                                    )
+                                                }
+                                            },
+                                            modifier = Modifier.fillMaxWidth(),
+                                            shape = RoundedCornerShape(12.dp),
+                                            colors = ButtonDefaults.buttonColors(
+                                                containerColor = Color(0xFFE3F2FD),
+                                                contentColor = Color(0xFF1565C0)
+                                            ),
+                                            contentPadding = PaddingValues(vertical = 12.dp)
+                                        ) {
+                                            Text(
+                                                text = "Details",
+                                                style = MaterialTheme.typography.labelLarge,
+                                                fontWeight = FontWeight.Bold
+                                            )
+                                        }
+                                    } else {
+                                        Spacer(modifier = Modifier.height(8.dp))
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            modifier = Modifier.padding(top = 4.dp)
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Rounded.CheckCircle,
+                                                contentDescription = null,
+                                                tint = Color(0xFF4CAF50),
+                                                modifier = Modifier.size(16.dp)
+                                            )
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Text(
+                                                text = "Resolved",
+                                                style = MaterialTheme.typography.labelMedium,
+                                                color = Color(0xFF4CAF50),
+                                                fontWeight = FontWeight.Medium
+                                            )
                                         }
                                     }
                                 }
@@ -3908,471 +4191,493 @@ fun HomeScreen(navController: NavController) {
                 }
             }
         }
+    }
 
-        
 
-        // Location Details Modal
-        @Composable
-        fun LocationDetailsModal(
-            location: SearchResult,
-            isNavigating: Boolean,
-            onDismiss: () -> Unit,
-            onGetDirections: () -> Unit,
-            onCancelNavigation: () -> Unit
-        ) {
-            AlertDialog(
-                onDismissRequest = onDismiss,
-                title = {
-                    ForceImmersiveMode()
+
+    // Location Details Modal
+    @Composable
+    fun LocationDetailsModal(
+        location: SearchResult,
+        isNavigating: Boolean,
+        onDismiss: () -> Unit,
+        onGetDirections: () -> Unit,
+        onCancelNavigation: () -> Unit
+    ) {
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            title = {
+                ForceImmersiveMode()
+                Text(
+                    text = location.name,
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold
+                )
+            },
+            text = {
+                Column {
                     Text(
-                        text = location.name,
-                        style = MaterialTheme.typography.titleLarge,
-                        fontWeight = FontWeight.Bold
-                    )
-                },
-                text = {
-                    Column {
-                        Text(
-                            text = location.address,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = Color.Gray
-                        )
-                        Spacer(modifier = Modifier.height(16.dp))
-                    }
-                },
-                confirmButton = {
-                    Button(
-                        onClick = {
-                            if (isNavigating) {
-                                onCancelNavigation()
-                            } else {
-                                onGetDirections()
-                            }
-                        },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (isNavigating) Color.Red else Color(0xFF2196F3),
-                            contentColor = Color.White
-                        ),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text(if (isNavigating) "Cancel Navigation" else "Get Directions")
-                    }
-                },
-                dismissButton = {
-                    OutlinedButton(
-                        onClick = onDismiss,
-                        colors = ButtonDefaults.outlinedButtonColors(
-                            contentColor = Color.Gray
-                        ),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text("Back")
-                    }
-                },
-                containerColor = Color.White,
-                shape = RoundedCornerShape(16.dp)
-            )
-        }
-        
-        if (showLocationModal && selectedLocation != null) {
-            LocationDetailsModal(
-                location = selectedLocation!!,
-                isNavigating = isNavigating,
-                onDismiss = { showLocationModal = false },
-                onCancelNavigation = {
-                    showLocationModal = false
-                    navigationService?.stopNavigation()
-                },
-                onGetDirections = {
-                    showLocationModal = false
-
-                    if (hasLocationPermission) {
-                        val currentLocation = mapLibreMap?.locationComponent?.lastKnownLocation
-                        if (currentLocation != null) {
-                            Toast.makeText(context, "Calculating route...", Toast.LENGTH_SHORT)
-                                .show()
-
-                            scope.launch {
-                                val start =
-                                    LatLng(currentLocation.latitude, currentLocation.longitude)
-                                val end = LatLng(selectedLocation!!.lat, selectedLocation!!.lon)
-
-                                val (points, steps) = RouteFetcher.fetchRoute(start, end)
-                                if (points.isNotEmpty()) {
-                                    navigationService?.startNavigation(steps, points, end)
-                                    mapLibreMap?.getStyle { style ->
-                                        // Remove existing if any
-                                        if (style.getLayer("route-layer") != null) style.removeLayer(
-                                            "route-layer"
-                                        )
-                                        if (style.getSource("route-source") != null) style.removeSource(
-                                            "route-source"
-                                        )
-
-                                        // Create GeoJsonSource with lineMetrics enabled (required for gradient)
-                                        val lineString = LineString.fromLngLats(points.map {
-                                            Point.fromLngLat(
-                                                it.longitude,
-                                                it.latitude
-                                            )
-                                        })
-                                        val source = GeoJsonSource(
-                                            "route-source",
-                                            Feature.fromGeometry(lineString),
-                                            GeoJsonOptions().withLineMetrics(true)
-                                        )
-                                        style.addSource(source)
-
-                                        // Create LineLayer with Gradient
-                                        val layer = LineLayer("route-layer", "route-source")
-                                        layer.setProperties(
-                                            PropertyFactory.lineWidth(8f),
-                                            PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
-                                            PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
-                                            // Initial gradient (will be animated)
-                                            PropertyFactory.lineGradient(
-                                                Expression.interpolate(
-                                                    Expression.linear(),
-                                                    Expression.lineProgress(),
-                                                    Expression.stop(
-                                                        0f,
-                                                        Expression.color(android.graphics.Color.BLUE)
-                                                    ),
-                                                    Expression.stop(
-                                                        1f,
-                                                        Expression.color(android.graphics.Color.CYAN)
-                                                    )
-                                                )
-                                            )
-                                        )
-                                        style.addLayer(layer)
-
-                                        // Zoom to start
-                                        mapLibreMap?.animateCamera(
-                                            CameraUpdateFactory.newLatLngZoom(
-                                                start,
-                                                16.0
-                                            )
-                                        )
-                                    }
-                                } else {
-                                    Toast.makeText(
-                                        context,
-                                        "Could not find route",
-                                        Toast.LENGTH_SHORT
-                                    ).show()
-                                }
-                            }
-                        } else {
-                            Toast.makeText(context, "Waiting for location...", Toast.LENGTH_SHORT)
-                                .show()
-                        }
-                    } else {
-                        Toast.makeText(context, "Location permission required", Toast.LENGTH_SHORT)
-                            .show()
-                    }
-                }
-            )
-        }
-
-        // Sharing Location Bottom Sheet
-        if (showSharingSheet) {
-            ModalBottomSheet(
-                onDismissRequest = { showSharingSheet = false },
-                containerColor = Color.White,
-                contentColor = Color.Black,
-                shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
-                dragHandle = { BottomSheetDefaults.DragHandle() }
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(24.dp)
-                ) {
-                    Text(
-                        text = "Who can see your location",
-                        style = MaterialTheme.typography.titleLarge,
-                        fontWeight = FontWeight.Bold,
-                        color = Color.Black
-                    )
-
-                    Spacer(modifier = Modifier.height(8.dp))
-
-                    Text(
-                        text = "If you share, your precise location updates every time you open SafeKo, but disappears if you don't open the app for 24 hours.",
+                        text = location.address,
                         style = MaterialTheme.typography.bodyMedium,
                         color = Color.Gray
                     )
+                    Spacer(modifier = Modifier.height(16.dp))
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        if (isNavigating) {
+                            onCancelNavigation()
+                        } else {
+                            onGetDirections()
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (isNavigating) Color.Red else Color(0xFF2196F3),
+                        contentColor = Color.White
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(if (isNavigating) "Cancel Navigation" else "Get Directions")
+                }
+            },
+            dismissButton = {
+                OutlinedButton(
+                    onClick = onDismiss,
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = Color.Gray
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Back")
+                }
+            },
+            containerColor = Color.White,
+            shape = RoundedCornerShape(16.dp)
+        )
+    }
 
-                    Spacer(modifier = Modifier.height(24.dp))
+    if (showLocationModal && selectedLocation != null) {
+        LocationDetailsModal(
+            location = selectedLocation!!,
+            isNavigating = isNavigating,
+            onDismiss = { showLocationModal = false },
+            onCancelNavigation = {
+                showLocationModal = false
+                navigationService?.stopNavigation()
+            },
+            onGetDirections = {
+                showLocationModal = false
 
-                    val options = listOf(
-                        Triple("Visible to others", "Share with everyone", Icons.Rounded.Public),
-                        Triple("Family", "Share with family only", Icons.Rounded.Home),
-                        Triple("No one", "Don't share location", Icons.Rounded.LocationOff)
-                    )
+                if (hasLocationPermission) {
+                    val currentLocation = mapLibreMap?.locationComponent?.lastKnownLocation
+                    if (currentLocation != null) {
+                        Toast.makeText(context, "Calculating route...", Toast.LENGTH_SHORT)
+                            .show()
 
-                    options.forEach { (option, description, icon) ->
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable { sharingOption = option }
-                                .padding(vertical = 12.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Surface(
-                                shape = CircleShape,
-                                color = when (option) {
-                                    "Visible to others" -> Color(0xFF29B6F6)
-                                    "Family" -> Color(0xFF00E676)
-                                    else -> Color.LightGray
-                                },
-                                modifier = Modifier.size(48.dp)
-                            ) {
-                                Box(contentAlignment = Alignment.Center) {
-                                    Icon(
-                                        imageVector = icon,
-                                        contentDescription = null,
-                                        tint = Color.White,
-                                        modifier = Modifier.size(24.dp)
+                        scope.launch {
+                            val start =
+                                LatLng(currentLocation.latitude, currentLocation.longitude)
+                            val end = LatLng(selectedLocation!!.lat, selectedLocation!!.lon)
+
+                            val (points, steps) = RouteFetcher.fetchRoute(start, end)
+                            if (points.isNotEmpty()) {
+                                navigationService?.startNavigation(steps, points, end)
+                                mapLibreMap?.getStyle { style ->
+                                    // Remove existing if any
+                                    if (style.getLayer("route-layer") != null) style.removeLayer(
+                                        "route-layer"
+                                    )
+                                    if (style.getSource("route-source") != null) style.removeSource(
+                                        "route-source"
+                                    )
+
+                                    // Create GeoJsonSource with lineMetrics enabled (required for gradient)
+                                    val lineString = LineString.fromLngLats(points.map {
+                                        Point.fromLngLat(
+                                            it.longitude,
+                                            it.latitude
+                                        )
+                                    })
+                                    val source = GeoJsonSource(
+                                        "route-source",
+                                        Feature.fromGeometry(lineString),
+                                        GeoJsonOptions().withLineMetrics(true)
+                                    )
+                                    style.addSource(source)
+
+                                    // Create LineLayer with Gradient
+                                    val layer = LineLayer("route-layer", "route-source")
+                                    layer.setProperties(
+                                        PropertyFactory.lineWidth(8f),
+                                        PropertyFactory.lineCap(Property.LINE_CAP_ROUND),
+                                        PropertyFactory.lineJoin(Property.LINE_JOIN_ROUND),
+                                        // Initial gradient (will be animated)
+                                        PropertyFactory.lineGradient(
+                                            Expression.interpolate(
+                                                Expression.linear(),
+                                                Expression.lineProgress(),
+                                                Expression.stop(
+                                                    0f,
+                                                    Expression.color(android.graphics.Color.BLUE)
+                                                ),
+                                                Expression.stop(
+                                                    1f,
+                                                    Expression.color(android.graphics.Color.CYAN)
+                                                )
+                                            )
+                                        )
+                                    )
+                                    style.addLayer(layer)
+
+                                    // Zoom to start
+                                    mapLibreMap?.animateCamera(
+                                        CameraUpdateFactory.newLatLngZoom(
+                                            start,
+                                            16.0
+                                        )
                                     )
                                 }
+                            } else {
+                                Toast.makeText(
+                                    context,
+                                    "Could not find route",
+                                    Toast.LENGTH_SHORT
+                                ).show()
                             }
-
-                            Spacer(modifier = Modifier.width(16.dp))
-
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = option,
-                                    style = MaterialTheme.typography.titleMedium,
-                                    fontWeight = FontWeight.Bold,
-                                    color = Color.Black
-                                )
-                                Text(
-                                    text = description,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = Color.Gray
-                                )
-                            }
-
-                            RadioButton(
-                                selected = (sharingOption == option),
-                                onClick = { sharingOption = option },
-                                colors = RadioButtonDefaults.colors(
-                                    selectedColor = Color(0xFF29B6F6),
-                                    unselectedColor = Color.Gray
-                                )
-                            )
                         }
+                    } else {
+                        Toast.makeText(context, "Waiting for location...", Toast.LENGTH_SHORT)
+                            .show()
                     }
-
-                    Spacer(modifier = Modifier.height(24.dp))
-
-                    Button(
-                        onClick = { showSharingSheet = false },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(50.dp),
-                        shape = RoundedCornerShape(25.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF29B6F6))
-                    ) {
-                        Text(
-                            text = "Share location",
-                            fontSize = 16.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = Color.White
-                        )
-                    }
-
-                    Spacer(modifier = Modifier.height(24.dp))
+                } else {
+                    Toast.makeText(context, "Location permission required", Toast.LENGTH_SHORT)
+                        .show()
                 }
             }
-        }
+        )
+    }
 
-        // Group Bottom Sheet
-        if (showGroupSheet) {
-            val groupSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = false)
-
-            ModalBottomSheet(
-                onDismissRequest = { 
-                    if (isCreatingCircle) {
-                        isCreatingCircle = false
-                    } else {
-                        showGroupSheet = false 
-                    }
-                },
-                sheetState = groupSheetState,
-                containerColor = Color.White,
-                shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
-                dragHandle = { BottomSheetDefaults.DragHandle() }
+    // Sharing Location Bottom Sheet
+    if (showSharingSheet) {
+        ModalBottomSheet(
+            onDismissRequest = { showSharingSheet = false },
+            containerColor = Color.White,
+            contentColor = Color.Black,
+            shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
+            dragHandle = { BottomSheetDefaults.DragHandle() }
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(24.dp)
             ) {
-                if (isCreatingCircle) {
-                    var circleName by remember { mutableStateOf("") }
-                    var selectedImageUri by remember { mutableStateOf<android.net.Uri?>(null) }
-                    var isUploading by remember { mutableStateOf(false) }
+                Text(
+                    text = "Who can see your location",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.Black
+                )
 
-                    val pickMedia = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+                Spacer(modifier = Modifier.height(8.dp))
+
+                Text(
+                    text = "If you share, your precise location updates every time you open SafeKo, but disappears if you don't open the app for 24 hours.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Color.Gray
+                )
+
+                Spacer(modifier = Modifier.height(24.dp))
+
+                val options = listOf(
+                    Triple("Visible to others", "Share with everyone", Icons.Rounded.Public),
+                    Triple("Family", "Share with family only", Icons.Rounded.Home),
+                    Triple("No one", "Don't share location", Icons.Rounded.LocationOff)
+                )
+
+                options.forEach { (option, description, icon) ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { sharingOption = option }
+                            .padding(vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Surface(
+                            shape = CircleShape,
+                            color = when (option) {
+                                "Visible to others" -> Color(0xFF29B6F6)
+                                "Family" -> Color(0xFF00E676)
+                                else -> Color.LightGray
+                            },
+                            modifier = Modifier.size(48.dp)
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    imageVector = icon,
+                                    contentDescription = null,
+                                    tint = Color.White,
+                                    modifier = Modifier.size(24.dp)
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.width(16.dp))
+
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = option,
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = Color.Black
+                            )
+                            Text(
+                                text = description,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = Color.Gray
+                            )
+                        }
+
+                        RadioButton(
+                            selected = (sharingOption == option),
+                            onClick = { sharingOption = option },
+                            colors = RadioButtonDefaults.colors(
+                                selectedColor = Color(0xFF29B6F6),
+                                unselectedColor = Color.Gray
+                            )
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(24.dp))
+
+                Button(
+                    onClick = { showSharingSheet = false },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(50.dp),
+                    shape = RoundedCornerShape(25.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF29B6F6))
+                ) {
+                    Text(
+                        text = "Share location",
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(24.dp))
+            }
+        }
+    }
+
+    // Group Bottom Sheet
+    if (showGroupSheet) {
+        val groupSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = false)
+
+        ModalBottomSheet(
+            onDismissRequest = {
+                if (isCreatingCircle) {
+                    isCreatingCircle = false
+                } else {
+                    showGroupSheet = false
+                }
+            },
+            sheetState = groupSheetState,
+            containerColor = Color.White,
+            shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
+            dragHandle = { BottomSheetDefaults.DragHandle() }
+        ) {
+            if (isCreatingCircle) {
+                var circleName by remember { mutableStateOf("") }
+                var selectedImageUri by remember { mutableStateOf<android.net.Uri?>(null) }
+                var isUploading by remember { mutableStateOf(false) }
+
+                val pickMedia =
+                    rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
                         if (uri != null) selectedImageUri = uri
                     }
 
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 24.dp)
-                            .padding(bottom = 48.dp)
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 24.dp)
+                        .padding(bottom = 48.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            IconButton(onClick = { isCreatingCircle = false }) {
-                                Icon(Icons.Rounded.ArrowBack, contentDescription = "Back")
-                            }
-                            Text(
-                                text = "New group",
-                                style = MaterialTheme.typography.titleLarge,
-                                fontWeight = FontWeight.Bold
-                            )
-                            TextButton(
-                                onClick = {
-                                    if (circleName.isNotBlank() && !isUploading) {
-                                        val uid = auth.currentUser?.uid
-                                        if (uid != null) {
-                                            isUploading = true
-                                            val circleId = UUID.randomUUID().toString()
-                                            
-                                            val createCircle = { imageUrl: String? ->
-                                                val limit = if (userPlan == "OWL+") 10 else 5
-                                                val newCircle = Circle(
-                                                    id = circleId,
-                                                    name = circleName,
-                                                    ownerId = uid,
-                                                    members = listOf(uid),
-                                                    memberLimit = limit,
-                                                    type = "Group",
-                                                    createdAt = System.currentTimeMillis(),
-                                                    imageUrl = imageUrl
-                                                )
-                                                Firebase.firestore.collection("circles").document(newCircle.id)
-                                                    .set(newCircle)
-                                                    .addOnSuccessListener {
-                                                        Toast.makeText(context, "Circle created!", Toast.LENGTH_SHORT).show()
-                                                        isCreatingCircle = false
-                                                        isUploading = false
-                                                        navController.navigate("chat/${newCircle.id}")
-                                                    }
-                                                    .addOnFailureListener { e ->
-                                                        Toast.makeText(context, "Failed: ${e.message}", Toast.LENGTH_LONG).show()
-                                                        Log.e("HomeScreen", "Error creating circle", e)
-                                                        isUploading = false
-                                                    }
-                                            }
+                        IconButton(onClick = { isCreatingCircle = false }) {
+                            Icon(Icons.Rounded.ArrowBack, contentDescription = "Back")
+                        }
+                        Text(
+                            text = "New group",
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold
+                        )
+                        TextButton(
+                            onClick = {
+                                if (circleName.isNotBlank() && !isUploading) {
+                                    val uid = auth.currentUser?.uid
+                                    if (uid != null) {
+                                        isUploading = true
+                                        val circleId = UUID.randomUUID().toString()
 
-                                            if (selectedImageUri != null) {
-                                                val storageRef = com.google.firebase.storage.FirebaseStorage.getInstance().reference.child("circle_images/$circleId.jpg")
-                                                storageRef.putFile(selectedImageUri!!)
-                                                    .addOnSuccessListener {
-                                                        storageRef.downloadUrl.addOnSuccessListener { uri ->
-                                                            createCircle(uri.toString())
-                                                        }
+                                        val createCircle = { imageUrl: String? ->
+                                            val limit = if (userPlan == "OWL+") 10 else 5
+                                            val newCircle = Circle(
+                                                id = circleId,
+                                                name = circleName,
+                                                ownerId = uid,
+                                                members = listOf(uid),
+                                                memberLimit = limit,
+                                                type = "Group",
+                                                createdAt = System.currentTimeMillis(),
+                                                imageUrl = imageUrl
+                                            )
+                                            Firebase.firestore.collection("circles")
+                                                .document(newCircle.id)
+                                                .set(newCircle)
+                                                .addOnSuccessListener {
+                                                    Toast.makeText(
+                                                        context,
+                                                        "Circle created!",
+                                                        Toast.LENGTH_SHORT
+                                                    ).show()
+                                                    isCreatingCircle = false
+                                                    isUploading = false
+                                                    navController.navigate("chat/${newCircle.id}")
+                                                }
+                                                .addOnFailureListener { e ->
+                                                    Toast.makeText(
+                                                        context,
+                                                        "Failed: ${e.message}",
+                                                        Toast.LENGTH_LONG
+                                                    ).show()
+                                                    Log.e("HomeScreen", "Error creating circle", e)
+                                                    isUploading = false
+                                                }
+                                        }
+
+                                        if (selectedImageUri != null) {
+                                            val storageRef =
+                                                com.google.firebase.storage.FirebaseStorage.getInstance().reference.child(
+                                                    "circle_images/$circleId.jpg"
+                                                )
+                                            storageRef.putFile(selectedImageUri!!)
+                                                .addOnSuccessListener {
+                                                    storageRef.downloadUrl.addOnSuccessListener { uri ->
+                                                        createCircle(uri.toString())
+                                                    }
                                                         .addOnFailureListener { e ->
-                                                            Toast.makeText(context, "Failed to get image URL: ${e.message}", Toast.LENGTH_SHORT).show()
+                                                            Toast.makeText(
+                                                                context,
+                                                                "Failed to get image URL: ${e.message}",
+                                                                Toast.LENGTH_SHORT
+                                                            ).show()
                                                             createCircle(null)
                                                         }
-                                                    }
-                                                    .addOnFailureListener { e ->
-                                                        Toast.makeText(context, "Image upload failed: ${e.message}", Toast.LENGTH_SHORT).show()
-                                                        createCircle(null)
-                                                    }
-                                            } else {
-                                                createCircle(null)
-                                            }
+                                                }
+                                                .addOnFailureListener { e ->
+                                                    Toast.makeText(
+                                                        context,
+                                                        "Image upload failed: ${e.message}",
+                                                        Toast.LENGTH_SHORT
+                                                    ).show()
+                                                    createCircle(null)
+                                                }
+                                        } else {
+                                            createCircle(null)
                                         }
                                     }
-                                },
-                                enabled = circleName.isNotBlank() && !isUploading
-                            ) {
-                                if (isUploading) {
-                                    CircularProgressIndicator(
-                                        modifier = Modifier.size(24.dp),
-                                        color = Color(0xFF29B6F6),
-                                        strokeWidth = 2.dp
-                                    )
-                                } else {
-                                    Text(
-                                        text = "Create",
-                                        style = MaterialTheme.typography.titleMedium,
-                                        fontWeight = FontWeight.Bold,
-                                        color = if (circleName.isNotBlank()) Color(0xFF29B6F6) else Color.Gray
-                                    )
                                 }
-                            }
-                        }
-
-                        Spacer(modifier = Modifier.height(24.dp))
-
-                        // Image Picker
-                        Box(
-                            modifier = Modifier
-                                .align(Alignment.CenterHorizontally)
-                                .size(80.dp)
-                                .clip(CircleShape)
-                                .background(Color(0xFFF5F5F5))
-                                .clickable {
-                                    pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
-                                },
-                            contentAlignment = Alignment.Center
+                            },
+                            enabled = circleName.isNotBlank() && !isUploading
                         ) {
-                            if (selectedImageUri != null) {
-                                AsyncImage(
-                                    model = selectedImageUri,
-                                    contentDescription = null,
-                                    modifier = Modifier.fillMaxSize(),
-                                    contentScale = ContentScale.Crop
+                            if (isUploading) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(24.dp),
+                                    color = Color(0xFF29B6F6),
+                                    strokeWidth = 2.dp
                                 )
                             } else {
-                                Icon(
-                                    Icons.Rounded.AddAPhoto,
-                                    contentDescription = "Add Photo",
-                                    tint = Color.Gray,
-                                    modifier = Modifier.size(32.dp)
-                                )
-                            }
-                        }
-
-                        Spacer(modifier = Modifier.height(24.dp))
-
-                        Surface(
-                            color = Color(0xFFF5F5F5),
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Column(modifier = Modifier.padding(16.dp)) {
                                 Text(
-                                    text = "Group name (optional)",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = Color.Gray
-                                )
-                                androidx.compose.foundation.text.BasicTextField(
-                                    value = circleName,
-                                    onValueChange = { circleName = it },
-                                    textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
-                                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
+                                    text = "Create",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (circleName.isNotBlank()) Color(0xFF29B6F6) else Color.Gray
                                 )
                             }
                         }
-
-                        Spacer(modifier = Modifier.height(24.dp))
-                        
-                        Text(
-                            text = "Members must be added directly or join through an invite link.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = Color.Gray,
-                            modifier = Modifier.padding(top = 8.dp)
-                        )
                     }
-                } else {
+
+                    Spacer(modifier = Modifier.height(24.dp))
+
+                    // Image Picker
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.CenterHorizontally)
+                            .size(80.dp)
+                            .clip(CircleShape)
+                            .background(Color(0xFFF5F5F5))
+                            .clickable {
+                                pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                            },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (selectedImageUri != null) {
+                            AsyncImage(
+                                model = selectedImageUri,
+                                contentDescription = null,
+                                modifier = Modifier.fillMaxSize(),
+                                contentScale = ContentScale.Crop
+                            )
+                        } else {
+                            Icon(
+                                Icons.Rounded.AddAPhoto,
+                                contentDescription = "Add Photo",
+                                tint = Color.Gray,
+                                modifier = Modifier.size(32.dp)
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(24.dp))
+
+                    Surface(
+                        color = Color(0xFFF5F5F5),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            Text(
+                                text = "Group name (optional)",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color.Gray
+                            )
+                            androidx.compose.foundation.text.BasicTextField(
+                                value = circleName,
+                                onValueChange = { circleName = it },
+                                textStyle = MaterialTheme.typography.bodyLarge.copy(color = Color.Black),
+                                modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(24.dp))
+
+                    Text(
+                        text = "Members must be added directly or join through an invite link.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color.Gray,
+                        modifier = Modifier.padding(top = 8.dp)
+                    )
+                }
+            } else {
                 val isEligible = userPlan == "Premium" || userPlan == "OWL+"
 
                 Column(
@@ -4397,14 +4702,24 @@ fun HomeScreen(navController: NavController) {
                             modifier = Modifier.weight(1f)
                         )
                         if (isEligible || userRole == "lgu_admin" || userRole == "admin" || userRole == "superadmin") {
-                            IconButton(onClick = { showLinkJoinDialog = true; showGroupSheet = false }) {
+                            IconButton(onClick = {
+                                showLinkJoinDialog = true; showGroupSheet = false
+                            }) {
                                 Icon(
                                     Icons.Rounded.Link,
                                     contentDescription = "Join by Link",
                                     tint = Color.Gray
                                 )
                             }
-                            IconButton(onClick = { showScanner = true; showGroupSheet = false }) {
+                            IconButton(onClick = { 
+                                if (hasCameraPermission) {
+                                    showScanner = true
+                                    showGroupSheet = false
+                                } else {
+                                    permissionLauncher.launch(arrayOf(Manifest.permission.CAMERA))
+                                    Toast.makeText(context, "Please grant camera permission", Toast.LENGTH_SHORT).show()
+                                }
+                            }) {
                                 Icon(
                                     Icons.Rounded.QrCodeScanner,
                                     contentDescription = "Scan QR",
@@ -4415,7 +4730,7 @@ fun HomeScreen(navController: NavController) {
                                 "Premium", "OWL+" -> ownedGroupCount == 0
                                 else -> false
                             }
-                            if ( canCreateCircle ) {
+                            if (canCreateCircle) {
                                 IconButton(onClick = { isCreatingCircle = true }) {
                                     Icon(
                                         Icons.Rounded.Add,
@@ -4424,7 +4739,13 @@ fun HomeScreen(navController: NavController) {
                                     )
                                 }
                             } else {
-                                IconButton(onClick = { Toast.makeText(context, "You can only create 1 group max.", Toast.LENGTH_SHORT).show() }) {
+                                IconButton(onClick = {
+                                    Toast.makeText(
+                                        context,
+                                        "You can only create 1 group max.",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                }) {
                                     Icon(
                                         Icons.Rounded.Add,
                                         contentDescription = "Create circle",
@@ -4465,7 +4786,11 @@ fun HomeScreen(navController: NavController) {
                                                 .fillMaxWidth()
                                                 .padding(vertical = 8.dp),
                                             shape = RoundedCornerShape(16.dp),
-                                            colors = CardDefaults.cardColors(containerColor = Color(0xFFF5F5F5))
+                                            colors = CardDefaults.cardColors(
+                                                containerColor = Color(
+                                                    0xFFF5F5F5
+                                                )
+                                            )
                                         ) {
                                             Row(
                                                 modifier = Modifier.padding(16.dp),
@@ -4484,7 +4809,10 @@ fun HomeScreen(navController: NavController) {
                                                     Box(
                                                         modifier = Modifier
                                                             .size(48.dp)
-                                                            .background(Color(0xFF29B6F6), CircleShape),
+                                                            .background(
+                                                                Color(0xFF29B6F6),
+                                                                CircleShape
+                                                            ),
                                                         contentAlignment = Alignment.Center
                                                     ) {
                                                         Text(
@@ -4518,10 +4846,13 @@ fun HomeScreen(navController: NavController) {
                                             }
                                         }
                                     }
-                                    
+
                                     if (circleMembers.isNotEmpty() || isLoadingMembers) {
                                         item {
-                                            HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp), color = Color(0xFFEEEEEE))
+                                            HorizontalDivider(
+                                                modifier = Modifier.padding(vertical = 16.dp),
+                                                color = Color(0xFFEEEEEE)
+                                            )
                                             Text(
                                                 text = "Members",
                                                 style = MaterialTheme.typography.titleMedium,
@@ -4531,7 +4862,11 @@ fun HomeScreen(navController: NavController) {
                                         }
                                         if (isLoadingMembers) {
                                             item {
-                                                Box(modifier = Modifier.fillMaxWidth().padding(16.dp), contentAlignment = Alignment.Center) {
+                                                Box(
+                                                    modifier = Modifier.fillMaxWidth()
+                                                        .padding(16.dp),
+                                                    contentAlignment = Alignment.Center
+                                                ) {
                                                     CircularProgressIndicator()
                                                 }
                                             }
@@ -4551,10 +4886,14 @@ fun HomeScreen(navController: NavController) {
                                                     ) {
                                                         if (member.profilePhoto != null) {
                                                             AsyncImage(
-                                                                model = ImageRequest.Builder(LocalContext.current)
+                                                                model = ImageRequest.Builder(
+                                                                    LocalContext.current
+                                                                )
                                                                     .data(member.profilePhoto)
                                                                     .crossfade(true)
-                                                                    .transformations(CircleCropTransformation())
+                                                                    .transformations(
+                                                                        CircleCropTransformation()
+                                                                    )
                                                                     .build(),
                                                                 contentDescription = "Profile Picture",
                                                                 modifier = Modifier
@@ -4566,11 +4905,15 @@ fun HomeScreen(navController: NavController) {
                                                             Box(
                                                                 modifier = Modifier
                                                                     .size(40.dp)
-                                                                    .background(Color(0xFFFF9800), CircleShape),
+                                                                    .background(
+                                                                        Color(0xFFFF9800),
+                                                                        CircleShape
+                                                                    ),
                                                                 contentAlignment = Alignment.Center
                                                             ) {
                                                                 Text(
-                                                                    text = member.name.take(1).uppercase(),
+                                                                    text = member.name.take(1)
+                                                                        .uppercase(),
                                                                     color = Color.White,
                                                                     fontWeight = FontWeight.Bold,
                                                                     style = MaterialTheme.typography.titleMedium
@@ -4585,14 +4928,24 @@ fun HomeScreen(navController: NavController) {
                                                                 fontWeight = FontWeight.Bold
                                                             )
                                                             Text(
-                                                                text = "In: ${member.sharedCircles.joinToString(", ")}",
+                                                                text = "In: ${
+                                                                    member.sharedCircles.joinToString(
+                                                                        ", "
+                                                                    )
+                                                                }",
                                                                 style = MaterialTheme.typography.bodySmall,
                                                                 color = Color.Gray
                                                             )
                                                             Text(
-                                                                text = "Last active: ${formatLastActive(member.lastActive)}",
+                                                                text = "Last active: ${
+                                                                    formatLastActive(
+                                                                        member.lastActive
+                                                                    )
+                                                                }",
                                                                 style = MaterialTheme.typography.bodySmall,
-                                                                color = if ((member.lastActive ?: 0L) > System.currentTimeMillis() - 120_000L)
+                                                                color = if ((member.lastActive
+                                                                        ?: 0L) > System.currentTimeMillis() - 120_000L
+                                                                )
                                                                     Color(0xFF4CAF50) else Color.Gray
                                                             )
                                                         }
@@ -4618,7 +4971,7 @@ fun HomeScreen(navController: NavController) {
                                     textAlign = TextAlign.Center
                                 )
                                 Spacer(modifier = Modifier.height(24.dp))
-                                
+
                                 val canCreateCircle = when (userPlan) {
                                     "Premium", "OWL+" -> ownedGroupCount == 0
                                     else -> false
@@ -4628,14 +4981,22 @@ fun HomeScreen(navController: NavController) {
                                         if (canCreateCircle) {
                                             isCreatingCircle = true
                                         } else {
-                                            Toast.makeText(context, "You reached your group creation limits.", Toast.LENGTH_SHORT).show()
+                                            Toast.makeText(
+                                                context,
+                                                "You reached your group creation limits.",
+                                                Toast.LENGTH_SHORT
+                                            ).show()
                                         }
                                     },
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .height(56.dp),
                                     shape = RoundedCornerShape(16.dp),
-                                    colors = ButtonDefaults.buttonColors(containerColor = if (canCreateCircle) Color(0xFF29B6F6) else Color.LightGray)
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = if (canCreateCircle) Color(
+                                            0xFF29B6F6
+                                        ) else Color.LightGray
+                                    )
                                 ) {
                                     Icon(Icons.Rounded.GroupAdd, contentDescription = null)
                                     Spacer(modifier = Modifier.width(8.dp))
@@ -4670,13 +5031,17 @@ fun HomeScreen(navController: NavController) {
                             Spacer(modifier = Modifier.height(24.dp))
                             Button(
                                 onClick = {
-                                     navController.navigate("premium")
+                                    navController.navigate("premium")
                                 },
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .height(56.dp),
                                 shape = RoundedCornerShape(16.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFFD54F)) // Gold
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = Color(
+                                        0xFFFFD54F
+                                    )
+                                ) // Gold
                             ) {
                                 Text(
                                     text = "View Plans",
@@ -4686,63 +5051,141 @@ fun HomeScreen(navController: NavController) {
                                 )
                             }
                         }
-                        
+
                         // Scan and Create actions moved to header icons above
                     }
                 }
+            }
+        }
+    }
+
+
+    // Admin Overview Bottom Sheet (Admin Only)
+    if (showGlobalOverview && (userRole == "admin" || userRole == "superadmin" || userRole == "lgu_admin")) {
+        val overviewSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = false)
+        var totalAlerts by remember { mutableStateOf(0) }
+        var activeAlerts by remember { mutableStateOf(0) }
+
+        LaunchedEffect(Unit) {
+            scope.launch {
+                try {
+                    val alertsResult = Firebase.firestore.collection("alerts").get().await()
+                    var alertCount = 0
+                    var activeCount = 0
+
+                    for (alertDoc in alertsResult) {
+                        alertCount++
+                        val status = alertDoc.getString("status") ?: "active"
+                        if (status == "active" || status.isEmpty()) {
+                            activeCount++
+                        }
+                    }
+
+                    totalAlerts = alertCount
+                    activeAlerts = activeCount
+                } catch (e: Exception) {
+                    Log.e("GlobalOverview", "Error fetching alerts: ${e.message}")
+                    totalAlerts = 0
+                    activeAlerts = 0
                 }
             }
         }
 
-
-        // Admin Overview Bottom Sheet (Admin Only)
-        if (showGlobalOverview && (userRole == "admin" || userRole == "superadmin" || userRole == "lgu_admin")) {
-            val overviewSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = false)
-            var totalAlerts by remember { mutableStateOf(0) }
-            var activeAlerts by remember { mutableStateOf(0) }
-
-            LaunchedEffect(Unit) {
-                scope.launch {
-                    try {
-                        val alertsResult = Firebase.firestore.collection("alerts").get().await()
-                        var alertCount = 0
-                        var activeCount = 0
-
-                        for (alertDoc in alertsResult) {
-                            alertCount++
-                            val status = alertDoc.getString("status") ?: "active"
-                            if (status == "active" || status.isEmpty()) {
-                                activeCount++
-                            }
+        // Set up real-time listener for Pending Co-Admin Requests
+        LaunchedEffect(showGlobalOverview) {
+            if (showGlobalOverview) {
+                loadingPendingRequests = true
+                val currentLgcId = auth.currentUser?.uid ?: ""
+                
+                val listener = Firebase.firestore
+                    .collection("pending_admins")
+                    .whereEqualTo("lgcId", currentLgcId)
+                    .whereEqualTo("status", "pending")
+                    .addSnapshotListener { snapshot, error ->
+                        if (error != null) {
+                            Log.e("PendingAdmins", "Error listening to pending requests: ${error.message}")
+                            loadingPendingRequests = false
+                            return@addSnapshotListener
                         }
-
-                        totalAlerts = alertCount
-                        activeAlerts = activeCount
-                    } catch (e: Exception) {
-                        Log.e("GlobalOverview", "Error fetching alerts: ${e.message}")
-                        totalAlerts = 0
-                        activeAlerts = 0
+                        
+                        if (snapshot != null) {
+                            pendingCoAdmins = snapshot.documents.map { doc ->
+                                mapOf(
+                                    "id" to (doc.id as Any),
+                                    "userName" to (doc.getString("userName") ?: "" as Any),
+                                    "userEmail" to (doc.getString("userEmail") ?: "" as Any),
+                                    "createdAt" to (doc.getTimestamp("createdAt")
+                                        ?: com.google.firebase.Timestamp.now() as Any),
+                                    "userId" to (doc.getString("userId") ?: "" as Any)
+                                )
+                            }
+                            loadingPendingRequests = false
+                        }
                     }
-                }
             }
+        }
 
-            ModalBottomSheet(
-                onDismissRequest = { showGlobalOverview = false },
-                sheetState = overviewSheetState,
-                containerColor = Color.White,
-                shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
-                dragHandle = { BottomSheetDefaults.DragHandle() }
+        // Set up real-time listener for Co-Admin List
+        LaunchedEffect(showGlobalOverview, userRole, userLgcId) {
+            if (showGlobalOverview) {
+                loadingCoAdmins = true
+                // For lgu_admin, use their lgc_id; for admin/superadmin, use their uid
+                val searchLgcId = if (userRole == "lgu_admin" && userLgcId.isNotEmpty()) {
+                    userLgcId
+                } else {
+                    auth.currentUser?.uid ?: ""
+                }
+                
+                val listener = Firebase.firestore
+                    .collection("users")
+                    .whereEqualTo("lgc_id", searchLgcId)
+                    .whereEqualTo("role", "lgu_admin")
+                    .addSnapshotListener { snapshot, error ->
+                        if (error != null) {
+                            Log.e("CoAdminsList", "Error listening to co-admins: ${error.message}")
+                            loadingCoAdmins = false
+                            return@addSnapshotListener
+                        }
+                        
+                        if (snapshot != null) {
+                            coAdminsList = snapshot.documents.map { doc ->
+                                mapOf(
+                                    "id" to (doc.id as Any),
+                                    "displayName" to (doc.getString("displayName")
+                                        ?: doc.getString("name") ?: "Unknown" as Any),
+                                    "email" to (doc.getString("email") ?: "" as Any),
+                                    "createdAt" to (doc.getTimestamp("createdAt")
+                                        ?: doc.getTimestamp("joinedDate")
+                                        ?: com.google.firebase.Timestamp.now() as Any)
+                                )
+                            }
+                            loadingCoAdmins = false
+                        }
+                    }
+            }
+        }
+
+        ModalBottomSheet(
+            onDismissRequest = { showGlobalOverview = false },
+            sheetState = overviewSheetState,
+            containerColor = Color.White,
+            shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
+            dragHandle = { BottomSheetDefaults.DragHandle() }
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(24.dp)
             ) {
-                Column(
+                // Title with QR and Link Icons
+                Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(24.dp)
+                        .padding(bottom = 20.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    // Title
                     Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(bottom = 20.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Icon(
@@ -4752,126 +5195,904 @@ fun HomeScreen(navController: NavController) {
                             modifier = Modifier.size(28.dp)
                         )
                         Spacer(modifier = Modifier.width(12.dp))
-                        Text(
-                            text = "Admin Overview",
-                            style = MaterialTheme.typography.headlineMedium,
-                            fontWeight = FontWeight.Bold,
-                            color = Color.Black
-                        )
+                        Column {
+                            Text(
+                                text = "Admin Overview",
+                                style = MaterialTheme.typography.headlineMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = Color.Black
+                            )
+                            // DEBUG: Show current user role
+                            Text(
+                                text = "Your role: $userRole",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Color.Gray
+                            )
+                        }
                     }
 
-                    // Statistics Cards
-                    Row(
+                    // QR and Link Icons (visible to all admins)
+                    if (userRole == "admin" || userRole == "superadmin" || userRole == "lgu_admin") {
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            // QR Icon - using clickable instead of IconButton
+                            Icon(
+                                imageVector = Icons.Rounded.QrCode2,
+                                contentDescription = "Show QR Code",
+                                tint = Color(0xFF1565C0),
+                                modifier = Modifier
+                                    .size(36.dp)
+                                    .padding(8.dp)
+                                    .clickable {
+                                        Log.d("QRIcon", "QR icon clicked, userRole: $userRole")
+                                        if (userRole == "admin" || userRole == "superadmin" || userRole == "lgu_admin") {
+                                            val lgcId = auth.currentUser?.uid ?: ""
+                                            Log.d("QRIcon", "Generating QR for lgcId: $lgcId")
+                                            val invite = QRCodeUtils.generateCoAdminInviteQR(lgcId)
+                                            Log.d("QRIcon", "QR generated: ${invite != null}, showQrDialog before: $showQrDialog")
+                                            if (invite != null) {
+                                                coAdminInviteQR = invite.qrBitmap
+                                                coAdminInviteToken = invite.token
+                                                coAdminDeepLink = invite.deepLink
+                                                showQrDialog = true
+                                                Log.d("QRIcon", "showQrDialog after: $showQrDialog")
+                                                Toast.makeText(context, "QR Code Generated!", Toast.LENGTH_SHORT).show()
+                                            } else {
+                                                Log.e("QRIcon", "Failed to generate QR code")
+                                                Toast.makeText(context, "Failed to generate QR code", Toast.LENGTH_SHORT).show()
+                                            }
+                                        } else {
+                                            Log.d("QRIcon", "User role not admin: $userRole")
+                                        }
+                                    }
+                            )
+
+                            // Link Icon - using clickable instead of IconButton
+                            Icon(
+                                imageVector = Icons.Rounded.Link,
+                                contentDescription = "Copy Invite Link",
+                                tint = Color(0xFF1565C0),
+                                modifier = Modifier
+                                    .size(36.dp)
+                                    .padding(8.dp)
+                                    .clickable {
+                                        Log.d("LinkIcon", "Link icon clicked, userRole: $userRole")
+                                        if (userRole == "admin" || userRole == "superadmin" || userRole == "lgu_admin") {
+                                            val lgcId = auth.currentUser?.uid ?: ""
+                                            Log.d("LinkIcon", "Generating QR for lgcId: $lgcId")
+                                            val invite = QRCodeUtils.generateCoAdminInviteQR(lgcId)
+                                            Log.d("LinkIcon", "QR generated: ${invite != null}")
+                                            if (invite != null) {
+                                                coAdminInviteQR = invite.qrBitmap
+                                                coAdminInviteToken = invite.token
+                                                coAdminDeepLink = invite.deepLink
+                                                showQrDialog = true
+                                                Toast.makeText(context, "QR Code Generated!", Toast.LENGTH_SHORT).show()
+                                            } else {
+                                                Log.e("LinkIcon", "Failed to generate QR code")
+                                                Toast.makeText(context, "Failed to generate QR code", Toast.LENGTH_SHORT).show()
+                                            }
+                                        } else {
+                                            Log.d("LinkIcon", "User role not admin: $userRole")
+                                        }
+                                    }
+                            )
+                        }
+                    }
+                }
+
+                // Statistics Cards
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 20.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    // Total Alerts Card
+                    Card(
                         modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(bottom = 20.dp),
-                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                            .weight(1f)
+                            .height(100.dp),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFFE8F5E9))
                     ) {
-                        // Total Alerts Card
-                        Card(
+                        Column(
                             modifier = Modifier
-                                .weight(1f)
-                                .height(100.dp),
-                            shape = RoundedCornerShape(12.dp),
-                            colors = CardDefaults.cardColors(containerColor = Color(0xFFE8F5E9))
+                                .fillMaxSize()
+                                .padding(12.dp),
+                            verticalArrangement = Arrangement.Center,
+                            horizontalAlignment = Alignment.CenterHorizontally
                         ) {
-                            Column(
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .padding(12.dp),
-                                verticalArrangement = Arrangement.Center,
-                                horizontalAlignment = Alignment.CenterHorizontally
-                            ) {
-                                Text(
-                                    text = totalAlerts.toString(),
-                                    style = MaterialTheme.typography.headlineSmall,
-                                    fontWeight = FontWeight.Bold,
-                                    color = Color(0xFF2E7D32)
-                                )
-                                Spacer(modifier = Modifier.height(4.dp))
-                                Text(
-                                    text = "Total Alerts",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = Color.Gray
-                                )
-                            }
-                        }
-
-                        // Active Alerts Card
-                        Card(
-                            modifier = Modifier
-                                .weight(1f)
-                                .height(100.dp),
-                            shape = RoundedCornerShape(12.dp),
-                            colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF3E0))
-                        ) {
-                            Column(
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .padding(12.dp),
-                                verticalArrangement = Arrangement.Center,
-                                horizontalAlignment = Alignment.CenterHorizontally
-                            ) {
-                                Text(
-                                    text = activeAlerts.toString(),
-                                    style = MaterialTheme.typography.headlineSmall,
-                                    fontWeight = FontWeight.Bold,
-                                    color = Color(0xFFF57C00)
-                                )
-                                Spacer(modifier = Modifier.height(4.dp))
-                                Text(
-                                    text = "Active Alerts",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = Color.Gray
-                                )
-                            }
+                            Text(
+                                text = totalAlerts.toString(),
+                                style = MaterialTheme.typography.headlineSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = Color(0xFF2E7D32)
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "Total Alerts",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Color.Gray
+                            )
                         }
                     }
 
-                    // Recent Activity Section
+                    // Active Alerts Card
+                    Card(
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(100.dp),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF3E0))
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(12.dp),
+                            verticalArrangement = Arrangement.Center,
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Text(
+                                text = activeAlerts.toString(),
+                                style = MaterialTheme.typography.headlineSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = Color(0xFFF57C00)
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "Active Alerts",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Color.Gray
+                            )
+                        }
+                    }
+                }
+
+                // Recent Activity Section
+                Text(
+                    text = "Recent Activity",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(bottom = 12.dp)
+                )
+
+                // Activity Placeholder
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(120.dp),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFFF5F5F5))
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize(),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.BarChart,
+                                contentDescription = null,
+                                tint = Color.Gray,
+                                modifier = Modifier.size(40.dp)
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = "No recent activity",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color.Gray
+                            )
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(24.dp))
+
+                // Pending Co-Admin Requests Section - NOW OUTSIDE CARD
+                if (userRole == "admin" || userRole == "superadmin" || userRole == "lgu_admin") {
+                    HorizontalDivider(
+                        modifier = Modifier.padding(vertical = 12.dp),
+                        color = Color(0xFFEEEEEE)
+                    )
+
                     Text(
-                        text = "Recent Activity",
+                        text = "Pending Co-Admin Requests",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold,
                         modifier = Modifier.padding(bottom = 12.dp)
                     )
 
-                    // Activity Placeholder
+                    if (loadingPendingRequests) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(80.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                CircularProgressIndicator(modifier = Modifier.size(32.dp))
+                            }
+                        } else if (pendingCoAdmins.isEmpty()) {
+                            Card(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(80.dp),
+                                shape = RoundedCornerShape(12.dp),
+                                colors = CardDefaults.cardColors(containerColor = Color(0xFFF5F5F5))
+                            ) {
+                                Box(
+                                    modifier = Modifier.fillMaxSize(),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        text = "No pending requests",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = Color.Gray
+                                    )
+                                }
+                            }
+                        } else {
+                            LazyColumn(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                items(pendingCoAdmins.size) { index ->
+                                    val request = pendingCoAdmins[index]
+                                    val userName = request["userName"] as? String ?: "Unknown"
+                                    val userEmail = request["userEmail"] as? String ?: ""
+                                    val requestId = request["id"] as? String ?: ""
+                                    val userId = request["userId"] as? String ?: ""
+
+                                    Card(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(horizontal = 4.dp),
+                                        shape = RoundedCornerShape(8.dp),
+                                        colors = CardDefaults.cardColors(
+                                            containerColor = Color(
+                                                0xFFFAFAFA
+                                            )
+                                        ),
+                                        border = BorderStroke(1.dp, Color(0xFFE0E0E0))
+                                    ) {
+                                        Column(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(12.dp)
+                                        ) {
+                                            // User Info
+                                            Text(
+                                                text = userName,
+                                                style = MaterialTheme.typography.labelLarge,
+                                                fontWeight = FontWeight.Bold,
+                                                color = Color.Black
+                                            )
+                                            Spacer(modifier = Modifier.height(4.dp))
+                                            Text(
+                                                text = userEmail,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = Color.Gray
+                                            )
+
+                                            Spacer(modifier = Modifier.height(12.dp))
+
+                                            // Action Buttons - Show for admin, superadmin, and lgu_admin
+                                            if (userRole == "admin" || userRole == "superadmin" || userRole == "lgu_admin") {
+                                                Row(
+                                                    modifier = Modifier
+                                                        .fillMaxWidth(),
+                                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                                ) {
+                                                    Button(
+                                                        onClick = {
+                                                            // Approve logic will be implemented in Step 5
+                                                            scope.launch {
+                                                                try {
+                                                                    val currentLgcId =
+                                                                        auth.currentUser?.uid ?: ""
+
+                                                                    // Update user role to lgu_admin
+                                                                    Firebase.firestore.collection("users")
+                                                                        .document(userId)
+                                                                        .update(
+                                                                            mapOf(
+                                                                                "role" to "lgu_admin",
+                                                                                "lgc_id" to currentLgcId,
+                                                                                "department" to userDepartment
+                                                                            )
+                                                                        )
+                                                                        .await()
+
+                                                                    // Update request status to approved
+                                                                    Firebase.firestore.collection("pending_admins")
+                                                                        .document(requestId)
+                                                                        .update(
+                                                                            mapOf(
+                                                                                "status" to "approved",
+                                                                                "approvedBy" to auth.currentUser?.uid
+                                                                            )
+                                                                        )
+                                                                        .await()
+
+                                                                    // Refresh the pending requests list
+                                                                    val updatedResult =
+                                                                        Firebase.firestore
+                                                                            .collection("pending_admins")
+                                                                            .whereEqualTo(
+                                                                                "lgcId",
+                                                                                currentLgcId
+                                                                            )
+                                                                            .whereEqualTo(
+                                                                                "status",
+                                                                                "pending"
+                                                                            )
+                                                                            .get()
+                                                                            .await()
+
+                                                                    pendingCoAdmins =
+                                                                        updatedResult.documents.map { doc ->
+                                                                            mapOf(
+                                                                                "id" to (doc.id as Any),
+                                                                                "userName" to (doc.getString(
+                                                                                    "userName"
+                                                                                ) ?: "" as Any),
+                                                                                "userEmail" to (doc.getString(
+                                                                                    "userEmail"
+                                                                                ) ?: "" as Any),
+                                                                                "createdAt" to (doc.getTimestamp(
+                                                                                    "createdAt"
+                                                                                )
+                                                                                    ?: com.google.firebase.Timestamp.now() as Any),
+                                                                                "userId" to (doc.getString(
+                                                                                    "userId"
+                                                                                ) ?: "" as Any)
+                                                                            )
+                                                                        }
+
+                                                                    Toast.makeText(
+                                                                        context,
+                                                                        "$userName approved as co-admin",
+                                                                        Toast.LENGTH_SHORT
+                                                                    ).show()
+                                                                } catch (e: Exception) {
+                                                                    Toast.makeText(
+                                                                        context,
+                                                                        "Error approving request: ${e.message}",
+                                                                        Toast.LENGTH_SHORT
+                                                                    ).show()
+                                                                }
+                                                            }
+                                                        },
+                                                        modifier = Modifier
+                                                            .weight(1f)
+                                                            .height(36.dp),
+                                                        colors = ButtonDefaults.buttonColors(
+                                                            containerColor = Color(0xFF4CAF50)
+                                                        ),
+                                                        shape = RoundedCornerShape(6.dp)
+                                                    ) {
+                                                        Text(
+                                                            text = "Approve",
+                                                            color = Color.White,
+                                                            style = MaterialTheme.typography.labelSmall
+                                                        )
+                                                    }
+
+                                                    Button(
+                                                        onClick = {
+                                                            scope.launch {
+                                                                try {
+                                                                    // Update request status to declined
+                                                                    Firebase.firestore.collection("pending_admins")
+                                                                        .document(requestId)
+                                                                        .update(
+                                                                            mapOf("status" to "declined")
+                                                                        )
+                                                                    // Refresh the pending requests list
+                                                                    val currentLgcId =
+                                                                        auth.currentUser?.uid ?: ""
+                                                                    val updatedResult =
+                                                                        Firebase.firestore
+                                                                            .collection("pending_admins")
+                                                                            .whereEqualTo(
+                                                                                "lgcId",
+                                                                                currentLgcId
+                                                                            )
+                                                                            .whereEqualTo(
+                                                                                "status",
+                                                                                "pending"
+                                                                            )
+                                                                            .get()
+                                                                            .await()
+
+                                                                    pendingCoAdmins =
+                                                                        updatedResult.documents.map { doc ->
+                                                                            mapOf(
+                                                                                "id" to (doc.id as Any),
+                                                                                "userName" to (doc.getString(
+                                                                                    "userName"
+                                                                                ) ?: "" as Any),
+                                                                                "userEmail" to (doc.getString(
+                                                                                    "userEmail"
+                                                                                ) ?: "" as Any),
+                                                                                "createdAt" to (doc.getTimestamp(
+                                                                                    "createdAt"
+                                                                                )
+                                                                                    ?: com.google.firebase.Timestamp.now() as Any),
+                                                                                "userId" to (doc.getString(
+                                                                                    "userId"
+                                                                                ) ?: "" as Any)
+                                                                            )
+                                                                        }
+
+                                                                    Toast.makeText(
+                                                                        context,
+                                                                        "Request declined",
+                                                                        Toast.LENGTH_SHORT
+                                                                    ).show()
+                                                                } catch (e: Exception) {
+                                                                    Toast.makeText(
+                                                                        context,
+                                                                        "Error declining request: ${e.message}",
+                                                                        Toast.LENGTH_SHORT
+                                                                    ).show()
+                                                                }
+                                                            }
+                                                        },
+                                                        modifier = Modifier
+                                                            .weight(1f)
+                                                            .height(36.dp),
+                                                        colors = ButtonDefaults.buttonColors(
+                                                            containerColor = Color(0xFFF44336)
+                                                        ),
+                                                        shape = RoundedCornerShape(6.dp)
+                                                    ) {
+                                                        Text(
+                                                            text = "Decline",
+                                                            color = Color.White,
+                                                            style = MaterialTheme.typography.labelSmall
+                                                        )
+                                                    }
+                                                }
+                                            } else {
+                                                // For co-admins, show read-only state
+                                                Text(
+                                                    text = "Pending review by main admin",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = Color(0xFF1565C0),
+                                                    fontStyle = androidx.compose.ui.text.font.FontStyle.Italic
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                }
+
+                Spacer(modifier = Modifier.height(24.dp))
+
+                HorizontalDivider(
+                    modifier = Modifier.padding(vertical = 12.dp),
+                    color = Color(0xFFEEEEEE)
+                )
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = "Co-Admins",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+
+                    // Co-admin count badge
+                    Card(
+                        modifier = Modifier
+                            .wrapContentSize(),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFF1565C0))
+                    ) {
+                        Text(
+                            text = coAdminsList.size.toString(),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Color.White,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+
+                if (loadingCoAdmins) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(80.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        CircularProgressIndicator(modifier = Modifier.size(32.dp))
+                    }
+                } else if (coAdminsList.isEmpty()) {
                     Card(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(120.dp),
+                            .height(80.dp),
                         shape = RoundedCornerShape(12.dp),
                         colors = CardDefaults.cardColors(containerColor = Color(0xFFF5F5F5))
                     ) {
                         Box(
-                            modifier = Modifier
-                                .fillMaxSize(),
+                            modifier = Modifier.fillMaxSize(),
                             contentAlignment = Alignment.Center
                         ) {
-                            Column(
-                                horizontalAlignment = Alignment.CenterHorizontally
+                            Text(
+                                text = "No co-admins yet",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color.Gray
+                            )
+                        }
+                    }
+                } else {
+                    LazyColumn(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        items(coAdminsList.size) { index ->
+                            val coAdmin = coAdminsList[index]
+                            val displayName = coAdmin["displayName"] as? String ?: "Unknown"
+                            val email = coAdmin["email"] as? String ?: ""
+                            val coAdminId = coAdmin["id"] as? String ?: ""
+                            val joinedDate =
+                                coAdmin["createdAt"] as? com.google.firebase.Timestamp
+                            val formattedDate = if (joinedDate != null) {
+                                java.text.DateFormat.getDateInstance(java.text.DateFormat.SHORT)
+                                    .format(joinedDate.toDate())
+                            } else {
+                                "Date unknown"
+                            }
+
+                            Card(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 4.dp),
+                                shape = RoundedCornerShape(8.dp),
+                                colors = CardDefaults.cardColors(
+                                    containerColor = Color(
+                                        0xFFFAFAFA
+                                    )
+                                ),
+                                border = BorderStroke(1.dp, Color(0xFFE0E0E0))
                             ) {
-                                Icon(
-                                    imageVector = Icons.Rounded.BarChart,
-                                    contentDescription = null,
-                                    tint = Color.Gray,
-                                    modifier = Modifier.size(40.dp)
-                                )
-                                Spacer(modifier = Modifier.height(8.dp))
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(12.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Column(
+                                        modifier = Modifier.weight(1f)
+                                    ) {
+                                        Text(
+                                            text = displayName,
+                                            style = MaterialTheme.typography.labelLarge,
+                                            fontWeight = FontWeight.Bold,
+                                            color = Color.Black
+                                        )
+                                        Spacer(modifier = Modifier.height(2.dp))
+                                        Text(
+                                            text = email,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = Color.Gray
+                                        )
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        Text(
+                                            text = "Joined: $formattedDate",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = Color(0xFF666666),
+                                            fontSize = 10.sp
+                                        )
+                                    }
+
+                                    // Remove button - for admin, superadmin, and lgu_admin
+                                    if (userRole == "admin" || userRole == "superadmin" || userRole == "lgu_admin") {
+                                        Button(
+                                            onClick = {
+                                                scope.launch {
+                                                    try {
+                                                        // Change role back to user
+                                                        Firebase.firestore.collection("users")
+                                                            .document(coAdminId)
+                                                            .update(
+                                                                mapOf(
+                                                                    "role" to "user",
+                                                                    "lgc_id" to ""
+                                                                )
+                                                            )
+                                                            .await()
+
+                                                        // Refresh the co-admins list
+                                                        val currentLgcId =
+                                                            auth.currentUser?.uid ?: ""
+                                                        val updatedResult =
+                                                            Firebase.firestore
+                                                                .collection("users")
+                                                                .whereEqualTo(
+                                                                    "lgc_id",
+                                                                    currentLgcId
+                                                                )
+                                                                .whereEqualTo(
+                                                                    "role",
+                                                                    "lgu_admin"
+                                                                )
+                                                                .get()
+                                                                .await()
+
+                                                        coAdminsList =
+                                                            updatedResult.documents.map { doc ->
+                                                                mapOf(
+                                                                    "id" to (doc.id as Any),
+                                                                    "displayName" to (doc.getString(
+                                                                        "displayName"
+                                                                    )
+                                                                        ?: doc.getString("name")
+                                                                        ?: "Unknown" as Any),
+                                                                    "email" to (doc.getString(
+                                                                        "email"
+                                                                    ) ?: "" as Any),
+                                                                    "createdAt" to (doc.getTimestamp(
+                                                                        "createdAt"
+                                                                    ) ?: doc.getTimestamp(
+                                                                        "joinedDate"
+                                                                    )
+                                                                    ?: com.google.firebase.Timestamp.now() as Any)
+                                                                )
+                                                            }
+
+                                                        Toast.makeText(
+                                                            context,
+                                                            "$displayName has been removed as co-admin",
+                                                            Toast.LENGTH_SHORT
+                                                        ).show()
+                                                    } catch (e: Exception) {
+                                                        Toast.makeText(
+                                                            context,
+                                                            "Error removing co-admin: ${e.message}",
+                                                            Toast.LENGTH_SHORT
+                                                        ).show()
+                                                    }
+                                                }
+                                            },
+                                            modifier = Modifier
+                                                .height(36.dp)
+                                                .wrapContentWidth(),
+                                            colors = ButtonDefaults.buttonColors(
+                                                containerColor = Color(0xFFF44336)
+                                            ),
+                                            shape = RoundedCornerShape(6.dp),
+                                            contentPadding = PaddingValues(
+                                                horizontal = 12.dp,
+                                                vertical = 4.dp
+                                            )
+                                        ) {
+                                            Text(
+                                                text = "Remove",
+                                                color = Color.White,
+                                                style = MaterialTheme.typography.labelSmall
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(24.dp))
+            }
+        }
+
+        // QR Code Dialog (Root Level - shown when icons are clicked)
+        Log.d("QRDialog", "Dialog condition check: showQrDialog=$showQrDialog, qrNotNull=${coAdminInviteQR != null}, userRole=$userRole")
+        if (showQrDialog && coAdminInviteQR != null && (userRole == "admin" || userRole == "superadmin" || userRole == "lgu_admin")) {
+            Log.d("QRDialog", "Dialog should be showing!")
+            Dialog(
+                onDismissRequest = { showQrDialog = false },
+                properties = DialogProperties(usePlatformDefaultWidth = false)
+            ) {
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth(0.85f)
+                        .padding(16.dp),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color.White)
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(24.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(16.dp)
+                    ) {
+                        // Title
+                        Text(
+                            text = "Invite Co-Admin",
+                            style = MaterialTheme.typography.headlineSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.Black
+                        )
+
+                        // QR Code
+                        Card(
+                            modifier = Modifier
+                                .size(200.dp),
+                            shape = RoundedCornerShape(12.dp),
+                            border = BorderStroke(2.dp, Color(0xFF1565C0))
+                        ) {
+                            Image(
+                                bitmap = coAdminInviteQR!!.asImageBitmap(),
+                                contentDescription = "Co-Admin Invite QR",
+                                modifier = Modifier.fillMaxSize(),
+                                contentScale = ContentScale.Fit
+                            )
+                        }
+
+                        Text(
+                            text = "Scan with phone",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Color.Gray
+                        )
+
+                        HorizontalDivider(
+                            modifier = Modifier.padding(vertical = 8.dp),
+                            color = Color(0xFFE0E0E0)
+                        )
+
+                        // Shareable Link
+                        Text(
+                            text = "Or share this link:",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = Color.Gray
+                        )
+
+                        Card(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    val clipboard =
+                                        context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                    val clip = ClipData.newPlainText(
+                                        "Invite Link",
+                                        coAdminDeepLink ?: ""
+                                    )
+                                    clipboard.setPrimaryClip(clip)
+                                    Toast.makeText(
+                                        context,
+                                        "Link copied to clipboard",
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                },
+                            shape = RoundedCornerShape(8.dp),
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFFE3F2FD)),
+                            border = BorderStroke(1.dp, Color(0xFF1565C0))
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
                                 Text(
-                                    text = "No recent activity",
+                                    text = coAdminDeepLink?.take(35) + "...",
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = Color.Gray
+                                    color = Color(0xFF1565C0),
+                                    modifier = Modifier.weight(1f)
+                                )
+                                Icon(
+                                    imageVector = Icons.Rounded.ContentCopy,
+                                    contentDescription = "Copy Link",
+                                    tint = Color(0xFF1565C0),
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
+                        }
+
+                        // Scan and Close Buttons
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(44.dp),
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            // Scan Button
+                            Button(
+                                onClick = { 
+                                    showQrDialog = false
+                                    showQrScanner = true
+                                },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .fillMaxHeight(),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = Color(0xFF4CAF50)
+                                ),
+                                shape = RoundedCornerShape(8.dp)
+                            ) {
+                                Text(
+                                    text = "Scan",
+                                    color = Color.White,
+                                    style = MaterialTheme.typography.labelLarge
+                                )
+                            }
+
+                            // Close Button
+                            Button(
+                                onClick = { showQrDialog = false },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .fillMaxHeight(),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = Color(0xFF1565C0)
+                                ),
+                                shape = RoundedCornerShape(8.dp)
+                            ) {
+                                Text(
+                                    text = "Close",
+                                    color = Color.White,
+                                    style = MaterialTheme.typography.labelLarge
                                 )
                             }
                         }
                     }
-
-                    Spacer(modifier = Modifier.height(24.dp))
                 }
             }
         }
+
+        // QR Code Scanner
+        if (showQrScanner) {
+            QRCodeScanner(
+                onQrCodeScanned = { scannedValue ->
+                    Log.d("QRScanner", "QR code scanned: $scannedValue")
+                    showQrScanner = false
+                    // Parse the deep link and navigate to ProcessCoAdminInviteScreen
+                    if (!scannedValue.isNullOrBlank() && scannedValue.startsWith("safeko://invite")) {
+                        // Extract token and lgcId from the deep link
+                        try {
+                            val uri = android.net.Uri.parse(scannedValue)
+                            val token = uri.getQueryParameter("token")
+                            val lgcId = uri.getQueryParameter("lgcId")
+                            if (!token.isNullOrBlank() && !lgcId.isNullOrBlank()) {
+                                Log.d("QRScanner", "Navigating to process_invite with token=$token, lgcId=$lgcId")
+                                // Navigate using the route name defined in MainActivity
+                                navController.navigate("process_invite?token=${java.net.URLEncoder.encode(token, "UTF-8")}&lgcId=${java.net.URLEncoder.encode(lgcId, "UTF-8")}")
+                            } else {
+                                Toast.makeText(context, "Invalid QR code format - missing token or LGU ID", Toast.LENGTH_SHORT).show()
+                                Log.w("QRScanner", "Invalid QR format - token: $token, lgcId: $lgcId")
+                            }
+                        } catch (e: Exception) {
+                            Toast.makeText(context, "Error processing QR code: ${e.message}", Toast.LENGTH_SHORT).show()
+                            Log.e("QRScanner", "Error parsing QR code", e)
+                        }
+                    } else {
+                        Toast.makeText(context, "This is not a SafeKo invite QR code", Toast.LENGTH_SHORT).show()
+                    }
+                },
+                onClose = {
+                    showQrScanner = false
+                    showQrDialog = true  // Go back to the dialog
+                }
+            )
+        }
+
+
 
         // Edit Profile Dialog
         if (showEditProfile) {
@@ -4892,14 +6113,16 @@ fun HomeScreen(navController: NavController) {
                     sharedPreferences.edit()
                         .putString("user_phone_number_${auth.currentUser?.uid}", newPhone)
                         .apply()
-                        
+
                     val userId = auth.currentUser?.uid
                     if (userId != null && newName.isNotBlank() && newName != auth.currentUser?.displayName) {
-                        val profileUpdates = com.google.firebase.auth.UserProfileChangeRequest.Builder()
-                            .setDisplayName(newName)
-                            .build()
+                        val profileUpdates =
+                            com.google.firebase.auth.UserProfileChangeRequest.Builder()
+                                .setDisplayName(newName)
+                                .build()
                         auth.currentUser?.updateProfile(profileUpdates)
-                        com.google.firebase.ktx.Firebase.firestore.collection("users").document(userId)
+                        com.google.firebase.ktx.Firebase.firestore.collection("users")
+                            .document(userId)
                             .update("name", newName)
                     }
 
@@ -4909,257 +6132,651 @@ fun HomeScreen(navController: NavController) {
             )
         }
 
-    if (showScanner) {
-        QRCodeScanner(
-            onQrCodeScanned = { result ->
-                showScanner = false
-                
-                if (result.contains("/join/")) {
-                    val circleId = result.substringAfterLast("/join/")
-                    if (circleId.isNotBlank()) {
-                        val currentUserId = auth.currentUser?.uid
-                        if (currentUserId != null) {
-                            com.google.firebase.ktx.Firebase.firestore.collection("circles").document(circleId)
-                                .get()
-                                .addOnSuccessListener { doc ->
-                                    if (doc.exists()) {
-                                        val members = doc.get("members") as? List<*> ?: emptyList<Any>()
-                                        val limit = doc.getLong("memberLimit")?.toInt() ?: 5 // Legacy fallback to 5
-                                        val type = doc.getString("type") ?: "Group"
+        if (showLinkJoinDialog) {
+            var linkInput by remember { mutableStateOf("") }
+            var isJoining by remember { mutableStateOf(false) }
 
-                                        if (type == "Duo") {
-                                            Toast.makeText(context, "This circle type is no longer supported.", Toast.LENGTH_LONG).show()
-                                        } else if (userPlan != "Premium" && userPlan != "OWL+") {
-                                            Toast.makeText(context, "Upgrade to Premium to join family circles.", Toast.LENGTH_LONG).show()
-                                        } else if (members.size >= limit) {
-                                            Toast.makeText(context, "This circle has reached its maximum member limit!", Toast.LENGTH_LONG).show()
-                                        } else {
-                                            com.google.firebase.ktx.Firebase.firestore.collection("circles").document(circleId)
-                                                .update("members", com.google.firebase.firestore.FieldValue.arrayUnion(currentUserId))
-                                                .addOnSuccessListener {
-                                                    Toast.makeText(context, "Joined group!", Toast.LENGTH_SHORT).show()
-                                                    navController.navigate("chat/$circleId")
-                                                }
-                                                .addOnFailureListener { e ->
-                                                    Toast.makeText(context, "Failed: ${e.message}", Toast.LENGTH_LONG).show()
-                                                }
-                                        }
-                                    } else {
-                                        Toast.makeText(context, "Circle not found", Toast.LENGTH_SHORT).show()
-                                    }
-                                }
-                                .addOnFailureListener {
-                                     Toast.makeText(context, "Failed to join: ${it.message}", Toast.LENGTH_LONG).show()
-                                }
-                        }
-                    } else {
-                        Toast.makeText(context, "Invalid join link", Toast.LENGTH_SHORT).show()
+            AlertDialog(
+                onDismissRequest = { showLinkJoinDialog = false },
+                title = { Text("Join Circle", fontWeight = FontWeight.Bold) },
+                text = {
+                    Column {
+                        Text("Enter the group invite link to join.")
+                        Spacer(modifier = Modifier.height(16.dp))
+                        OutlinedTextField(
+                            value = linkInput,
+                            onValueChange = { linkInput = it },
+                            modifier = Modifier.fillMaxWidth(),
+                            placeholder = { Text("https://safeko.app/join/...") },
+                            singleLine = true
+                        )
                     }
-                } else {
-                    val uid = if (result.contains("/user/")) {
-                        result.substringAfterLast("/user/")
-                    } else if (!result.startsWith("http")) {
-                        result
-                    } else {
-                        ""
-                    }
-                    if (uid.isNotBlank() && !uid.contains("/")) {
-                         navController.navigate("public_profile/$uid")
-                    } else {
-                        Toast.makeText(context, "Invalid QR Code", Toast.LENGTH_SHORT).show()
-                    }
-                }
-            },
-            onClose = { showScanner = false }
-        )
-    }
-
-    if (showLinkJoinDialog) {
-        var linkInput by remember { mutableStateOf("") }
-        var isJoining by remember { mutableStateOf(false) }
-
-        AlertDialog(
-            onDismissRequest = { showLinkJoinDialog = false },
-            title = { Text("Join Circle", fontWeight = FontWeight.Bold) },
-            text = {
-                Column {
-                    Text("Enter the group invite link to join.")
-                    Spacer(modifier = Modifier.height(16.dp))
-                    OutlinedTextField(
-                        value = linkInput,
-                        onValueChange = { linkInput = it },
-                        modifier = Modifier.fillMaxWidth(),
-                        placeholder = { Text("https://safeko.app/join/...") },
-                        singleLine = true
-                    )
-                }
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        val circleIdStr = if (linkInput.contains("/join/")) {
-                            linkInput.substringAfterLast("/join/")
-                        } else {
-                            linkInput // User might just paste the ID
-                        }
-                        
-                        val parsedCircleId = circleIdStr.trim().removeSuffix("/")
-
-                        if (parsedCircleId.isNotBlank()) {
-                            isJoining = true
-                            val uid = auth.currentUser?.uid
-                            if (uid != null) {
-                                com.google.firebase.ktx.Firebase.firestore.collection("circles").document(parsedCircleId)
-                                    .get()
-                                    .addOnSuccessListener { doc ->
-                                        if (doc.exists()) {
-                                            val members = doc.get("members") as? List<*> ?: emptyList<Any>()
-                                            val limit = doc.getLong("memberLimit")?.toInt() ?: 5 // Legacy fallback
-                                            val type = doc.getString("type") ?: "Group"
-
-                                            if (type == "Duo") {
-                                                isJoining = false
-                                                Toast.makeText(context, "This circle type is no longer supported.", Toast.LENGTH_LONG).show()
-                                            } else if (userPlan != "Premium" && userPlan != "OWL+") {
-                                                isJoining = false
-                                                Toast.makeText(context, "Upgrade to Premium to join family circles.", Toast.LENGTH_LONG).show()
-                                            } else if (members.size >= limit) {
-                                                isJoining = false
-                                                Toast.makeText(context, "This circle has reached its maximum member limit!", Toast.LENGTH_LONG).show()
-                                            } else {
-                                                com.google.firebase.ktx.Firebase.firestore.collection("circles").document(parsedCircleId)
-                                                    .update("members", com.google.firebase.firestore.FieldValue.arrayUnion(uid))
-                                                    .addOnSuccessListener {
-                                                        isJoining = false
-                                                        showLinkJoinDialog = false
-                                                        Toast.makeText(context, "Joined group!", Toast.LENGTH_SHORT).show()
-                                                        navController.navigate("chat/$parsedCircleId")
-                                                    }
-                                                    .addOnFailureListener { e ->
-                                                        isJoining = false
-                                                        Toast.makeText(context, "Failed: ${e.message}", Toast.LENGTH_LONG).show()
-                                                    }
-                                            }
-                                        } else {
-                                            isJoining = false
-                                            Toast.makeText(context, "Circle not found", Toast.LENGTH_SHORT).show()
-                                        }
-                                    }
-                                    .addOnFailureListener { e ->
-                                        isJoining = false
-                                        Toast.makeText(context, "Failed to join: ${e.message}", Toast.LENGTH_LONG).show()
-                                    }
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            val circleIdStr = if (linkInput.contains("/join/")) {
+                                linkInput.substringAfterLast("/join/")
+                            } else {
+                                linkInput // User might just paste the ID
                             }
+
+                            val parsedCircleId = circleIdStr.trim().removeSuffix("/")
+
+                            if (parsedCircleId.isNotBlank()) {
+                                isJoining = true
+                                val uid = auth.currentUser?.uid
+                                if (uid != null) {
+                                    com.google.firebase.ktx.Firebase.firestore.collection("circles")
+                                        .document(parsedCircleId)
+                                        .get()
+                                        .addOnSuccessListener { doc ->
+                                            if (doc.exists()) {
+                                                val members = doc.get("members") as? List<*>
+                                                    ?: emptyList<Any>()
+                                                val limit = doc.getLong("memberLimit")?.toInt()
+                                                    ?: 5 // Legacy fallback
+                                                val type = doc.getString("type") ?: "Group"
+
+                                                if (type == "Duo") {
+                                                    isJoining = false
+                                                    Toast.makeText(
+                                                        context,
+                                                        "This circle type is no longer supported.",
+                                                        Toast.LENGTH_LONG
+                                                    ).show()
+                                                } else if (userPlan != "Premium" && userPlan != "OWL+") {
+                                                    isJoining = false
+                                                    Toast.makeText(
+                                                        context,
+                                                        "Upgrade to Premium to join family circles.",
+                                                        Toast.LENGTH_LONG
+                                                    ).show()
+                                                } else if (members.size >= limit) {
+                                                    isJoining = false
+                                                    Toast.makeText(
+                                                        context,
+                                                        "This circle has reached its maximum member limit!",
+                                                        Toast.LENGTH_LONG
+                                                    ).show()
+                                                } else {
+                                                    com.google.firebase.ktx.Firebase.firestore.collection(
+                                                        "circles"
+                                                    ).document(parsedCircleId)
+                                                        .update(
+                                                            "members",
+                                                            com.google.firebase.firestore.FieldValue.arrayUnion(
+                                                                uid
+                                                            )
+                                                        )
+                                                        .addOnSuccessListener {
+                                                            isJoining = false
+                                                            showLinkJoinDialog = false
+                                                            Toast.makeText(
+                                                                context,
+                                                                "Joined group!",
+                                                                Toast.LENGTH_SHORT
+                                                            ).show()
+                                                            navController.navigate("chat/$parsedCircleId")
+                                                        }
+                                                        .addOnFailureListener { e ->
+                                                            isJoining = false
+                                                            Toast.makeText(
+                                                                context,
+                                                                "Failed: ${e.message}",
+                                                                Toast.LENGTH_LONG
+                                                            ).show()
+                                                        }
+                                                }
+                                            } else {
+                                                isJoining = false
+                                                Toast.makeText(
+                                                    context,
+                                                    "Circle not found",
+                                                    Toast.LENGTH_SHORT
+                                                ).show()
+                                            }
+                                        }
+                                        .addOnFailureListener { e ->
+                                            isJoining = false
+                                            Toast.makeText(
+                                                context,
+                                                "Failed to join: ${e.message}",
+                                                Toast.LENGTH_LONG
+                                            ).show()
+                                        }
+                                }
+                            } else {
+                                Toast.makeText(context, "Invalid join link", Toast.LENGTH_SHORT)
+                                    .show()
+                            }
+                        },
+                        enabled = linkInput.isNotBlank() && !isJoining,
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF29B6F6))
+                    ) {
+                        if (isJoining) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(24.dp),
+                                color = Color.White,
+                                strokeWidth = 2.dp
+                            )
                         } else {
-                            Toast.makeText(context, "Invalid join link", Toast.LENGTH_SHORT).show()
+                            Text("Join", color = Color.White)
                         }
-                    },
-                    enabled = linkInput.isNotBlank() && !isJoining,
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF29B6F6))
-                ) {
-                    if (isJoining) {
-                        CircularProgressIndicator(modifier = Modifier.size(24.dp), color = Color.White, strokeWidth = 2.dp)
-                    } else {
-                        Text("Join", color = Color.White)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showLinkJoinDialog = false }, enabled = !isJoining) {
+                        Text("Cancel", color = Color.Gray)
                     }
                 }
-            },
-            dismissButton = {
-                TextButton(onClick = { showLinkJoinDialog = false }, enabled = !isJoining) {
-                    Text("Cancel", color = Color.Gray)
-                }
-            }
-        )
-    }
-}
-
-@Composable
-fun SearchResultItem(result: SearchResult, onClick: () -> Unit) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(onClick = onClick)
-            .padding(vertical = 12.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Surface(
-            shape = CircleShape,
-            color = Color(0xFFF5F5F5),
-            modifier = Modifier.size(40.dp)
-        ) {
-            Box(contentAlignment = Alignment.Center) {
-                Icon(
-                    imageVector = Icons.Rounded.LocationOn,
-                    contentDescription = null,
-                    tint = Color.Gray,
-                    modifier = Modifier.size(20.dp)
-                )
-            }
-        }
-        Spacer(modifier = Modifier.width(16.dp))
-        Column {
-            Text(
-                text = result.name,
-                style = MaterialTheme.typography.bodyLarge,
-                fontWeight = FontWeight.Medium
-            )
-            Text(
-                text = result.address,
-                style = MaterialTheme.typography.bodySmall,
-                color = Color.Gray,
-                maxLines = 1
-            )
-            Text(
-                text = result.distance,
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.primary
             )
         }
     }
-}
 
-
-
-
-@Composable
-fun AlertOptionItem(
-    icon: androidx.compose.ui.graphics.vector.ImageVector,
-    label: String,
-    color: Color,
-    onClick: () -> Unit
-) {
-    Surface(
-        onClick = onClick,
-        shape = RoundedCornerShape(12.dp),
-        color = Color(0xFFF5F5F5),
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 6.dp)
-    ) {
+    @Composable
+    fun SearchResultItem(result: SearchResult, onClick: () -> Unit) {
         Row(
-            modifier = Modifier.padding(16.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onClick)
+                .padding(vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Surface(
                 shape = CircleShape,
-                color = color.copy(alpha = 0.1f),
-                modifier = Modifier.size(48.dp)
+                color = Color(0xFFF5F5F5),
+                modifier = Modifier.size(40.dp)
             ) {
                 Box(contentAlignment = Alignment.Center) {
                     Icon(
-                        imageVector = icon,
+                        imageVector = Icons.Rounded.LocationOn,
                         contentDescription = null,
-                        tint = color,
-                        modifier = Modifier.size(24.dp)
+                        tint = Color.Gray,
+                        modifier = Modifier.size(20.dp)
                     )
                 }
             }
             Spacer(modifier = Modifier.width(16.dp))
-            Text(
-                text = label,
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Medium
+            Column {
+                Text(
+                    text = result.name,
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = FontWeight.Medium
+                )
+                Text(
+                    text = result.address,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color.Gray,
+                    maxLines = 1
+                )
+                Text(
+                    text = result.distance,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
+        }
+    }
+
+
+    @Composable
+    fun AlertOptionItem(
+        icon: androidx.compose.ui.graphics.vector.ImageVector,
+        label: String,
+        color: Color,
+        onClick: () -> Unit
+    ) {
+        Surface(
+            onClick = onClick,
+            shape = RoundedCornerShape(12.dp),
+            color = Color(0xFFF5F5F5),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 6.dp)
+        ) {
+            Row(
+                modifier = Modifier.padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Surface(
+                    shape = CircleShape,
+                    color = color.copy(alpha = 0.1f),
+                    modifier = Modifier.size(48.dp)
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = icon,
+                            contentDescription = null,
+                            tint = color,
+                            modifier = Modifier.size(24.dp)
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.width(16.dp))
+                Text(
+                    text = label,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Medium
+                )
+            }
+        }
+    }
+
+    // Full-screen QR Scanner Overlay (appears on top of everything when active)
+    if (showScanner) {
+        Box(modifier = Modifier.fillMaxSize()) {
+            QRCodeScanner(
+                onQrCodeScanned = { result ->
+                    Log.d("UserQRScanner", "========== QR CODE SCANNED ==========")
+                    Log.d("UserQRScanner", "Raw result: $result")
+
+                    // Decode URL-encoded values
+                    val decodedResult = try {
+                        java.net.URLDecoder.decode(result, "UTF-8")
+                    } catch (e: Exception) {
+                        Log.e("UserQRScanner", "Decode error", e)
+                        result
+                    }
+                    Log.d("UserQRScanner", "Decoded result: $decodedResult")
+
+                    // Handle co-admin invite deep link first
+                    if (decodedResult.contains("safeko://invite")) {
+                        Log.d("UserQRScanner", "✓ Detected as safeko://invite deep link")
+                        try {
+                            val uri = android.net.Uri.parse(decodedResult)
+                            val token = uri.getQueryParameter("token")
+                            val lgcId = uri.getQueryParameter("lgcId")
+                            Log.d("UserQRScanner", "Parsed params - token: $token, lgcId: $lgcId")
+                            
+                            if (token != null && lgcId != null && token.isNotBlank() && lgcId.isNotBlank()) {
+                                Log.d("UserQRScanner", "✓ Valid token and lgcId - showing confirmation modal")
+                                // Store the invite details and show confirmation modal
+                                pendingInviteToken = token
+                                pendingInviteLgcId = lgcId
+                                showLguConfirmationModal = true
+                                Log.d("UserQRScanner", "✓ Modal state set to: $showLguConfirmationModal")
+                            } else {
+                                Log.e("UserQRScanner", "✗ Invalid or empty token/lgcId")
+                                Toast.makeText(context, "Invalid invite QR code format", Toast.LENGTH_SHORT).show()
+                                showScanner = false
+                            }
+                        } catch (e: Exception) {
+                            Log.e("UserQRScanner", "✗ Error parsing co-admin invite QR", e)
+                            Toast.makeText(context, "Error processing invite QR code: ${e.message}", Toast.LENGTH_SHORT).show()
+                            showScanner = false
+                        }
+                        Log.d("UserQRScanner", "========== END QR SCAN ==========")
+                        return@QRCodeScanner
+                    }
+
+                    // Try to handle circle join QR
+                    if (decodedResult.contains("/join/")) {
+                        var circleId = decodedResult.substringAfterLast("/join/")
+                        // Remove any trailing slashes or URL parameters
+                        circleId = circleId.split("[/?#]".toRegex()).firstOrNull() ?: circleId
+                        circleId = circleId.trim()
+                        
+                        Log.d("UserQRScanner", "Circle join detected. Circle ID extracted: '$circleId' (length: ${circleId.length})")
+                        
+                        if (circleId.isNotBlank()) {
+                            val currentUserId = auth.currentUser?.uid
+                            if (currentUserId != null) {
+                                com.google.firebase.ktx.Firebase.firestore.collection("circles")
+                                    .document(circleId)
+                                    .get()
+                                    .addOnSuccessListener { doc ->
+                                        if (doc.exists()) {
+                                            val members =
+                                                doc.get("members") as? List<*> ?: emptyList<Any>()
+                                            val limit = doc.getLong("memberLimit")?.toInt()
+                                                ?: 5 // Legacy fallback to 5
+                                            val type = doc.getString("type") ?: "Group"
+
+                                            if (type == "Duo") {
+                                                Toast.makeText(
+                                                    context,
+                                                    "This circle type is no longer supported.",
+                                                    Toast.LENGTH_LONG
+                                                ).show()
+                                            } else if (userPlan != "Premium" && userPlan != "OWL+") {
+                                                Toast.makeText(
+                                                    context,
+                                                    "Upgrade to Premium to join family circles.",
+                                                    Toast.LENGTH_LONG
+                                                ).show()
+                                            } else if (members.size >= limit) {
+                                                Toast.makeText(
+                                                    context,
+                                                    "This circle has reached its maximum member limit!",
+                                                    Toast.LENGTH_LONG
+                                                ).show()
+                                            } else {
+                                                com.google.firebase.ktx.Firebase.firestore.collection(
+                                                    "circles"
+                                                ).document(circleId)
+                                                    .update(
+                                                        "members",
+                                                        com.google.firebase.firestore.FieldValue.arrayUnion(
+                                                            currentUserId
+                                                        )
+                                                    )
+                                                    .addOnSuccessListener {
+                                                        Toast.makeText(
+                                                            context,
+                                                            "Joined group!",
+                                                            Toast.LENGTH_SHORT
+                                                        ).show()
+                                                        navController.navigate("chat/$circleId")
+                                                    }
+                                                    .addOnFailureListener { e ->
+                                                        Toast.makeText(
+                                                            context,
+                                                            "Failed: ${e.message}",
+                                                            Toast.LENGTH_LONG
+                                                        ).show()
+                                                    }
+                                            }
+                                        } else {
+                                            Log.e("UserQRScanner", "Circle not found in Firestore: $circleId")
+                                            Toast.makeText(
+                                                context,
+                                                "Circle not found",
+                                                Toast.LENGTH_SHORT
+                                            ).show()
+                                        }
+                                    }
+                                    .addOnFailureListener {
+                                        Toast.makeText(
+                                            context,
+                                            "Failed to join: ${it.message}",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                    }
+                            }
+                        } else {
+                            Log.e("UserQRScanner", "Failed to extract circle ID from: $decodedResult")
+                            Toast.makeText(context, "Invalid join link", Toast.LENGTH_SHORT).show()
+                        }
+                    } else {
+                        Log.d("UserQRScanner", "Scanned value doesn't contain /join/, attempting to parse as user/profile")
+                        val uid = if (decodedResult.contains("/user/")) {
+                            decodedResult.substringAfterLast("/user/")
+                        } else if (!decodedResult.startsWith("http")) {
+                            decodedResult
+                        } else {
+                            ""
+                        }
+                        Log.d("UserQRScanner", "Extracted UID: $uid")
+                        if (uid.isNotBlank() && !uid.contains("/")) {
+                            Log.d("UserQRScanner", "Navigation to public profile: $uid")
+                            navController.navigate("public_profile/$uid")
+                        } else {
+                            Log.e("UserQRScanner", "Invalid QR Code format: $decodedResult")
+                            Toast.makeText(context, "Invalid QR Code", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                },
+                onClose = { showScanner = false }
             )
         }
+    }
+
+    // LGU Membership Confirmation Modal - MUST be AFTER scanner so it renders on top
+    if (showLguConfirmationModal && pendingInviteToken != null && pendingInviteLgcId != null) {
+        AlertDialog(
+            onDismissRequest = { showLguConfirmationModal = false },
+            title = {
+                Text("Join LGU Membership")
+            },
+            text = {
+                Text("Are you sure you want to continue as an LGU member? You will gain additional administrative privileges and responsibilities.")
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showLguConfirmationModal = false
+                        lguApprovalProcessingState = LguApprovalState.Processing
+                        lguApprovalMessage = "Processing your LGU membership request..."
+                        showLguApprovalWaitingModal = true
+                        
+                        Log.d("LguConfirmation", "User confirmed, creating pending request with token=$pendingInviteToken, lgcId=$pendingInviteLgcId")
+                        
+                        // Create pending request in a coroutine
+                        scope.launch {
+                            try {
+                                val currentUser = auth.currentUser
+                                if (currentUser == null) {
+                                    lguApprovalProcessingState = LguApprovalState.Error("User not authenticated")
+                                    return@launch
+                                }
+                                
+                                val pendingRequest = mapOf(
+                                    "token" to (pendingInviteToken ?: ""),
+                                    "userId" to currentUser.uid,
+                                    "userName" to (currentUser.displayName ?: "User"),
+                                    "userEmail" to (currentUser.email ?: ""),
+                                    "lgcId" to (pendingInviteLgcId ?: ""),
+                                    "status" to "pending",
+                                    "createdAt" to com.google.firebase.Timestamp.now(),
+                                    "expiresAt" to com.google.firebase.Timestamp(java.util.Date(System.currentTimeMillis() + 7 * 24 * 60 * 60 * 1000))
+                                )
+                                
+                                // Check for existing pending requests
+                                val existingRequest = Firebase.firestore.collection("pending_admins")
+                                    .whereEqualTo("userId", currentUser.uid)
+                                    .whereEqualTo("lgcId", pendingInviteLgcId)
+                                    .whereEqualTo("status", "pending")
+                                    .get()
+                                    .await()
+                                
+                                if (existingRequest.documents.isNotEmpty()) {
+                                    lguApprovalProcessingState = LguApprovalState.Error("You already have a pending LGU membership request")
+                                    return@launch
+                                }
+                                
+                                // Create the pending request
+                                val docRef = Firebase.firestore.collection("pending_admins")
+                                    .add(pendingRequest)
+                                    .await()
+                                
+                                pendingLguRequestId = docRef.id
+                                lguApprovalProcessingState = LguApprovalState.Waiting
+                                lguApprovalMessage = "Waiting for admin approval..."
+                                
+                                Log.d("LguConfirmation", "Pending request created with ID: ${docRef.id}")
+                                
+                                // Set up real-time listener for approval
+                                Firebase.firestore.collection("pending_admins")
+                                    .document(docRef.id)
+                                    .addSnapshotListener { snapshot, error ->
+                                        if (error != null) {
+                                            Log.e("LguConfirmation", "Listener error", error)
+                                            return@addSnapshotListener
+                                        }
+                                        
+                                        if (snapshot != null && snapshot.exists()) {
+                                            val status = snapshot.getString("status")
+                                            Log.d("LguConfirmation", "Request status updated to: $status")
+                                            
+                                            when (status) {
+                                                "approved" -> {
+                                                    lguApprovalProcessingState = LguApprovalState.Success("You have been approved!")
+                                                    scope.launch {
+                                                        delay(2000)
+                                                        showLguApprovalWaitingModal = false
+                                                        pendingInviteToken = null
+                                                        pendingInviteLgcId = null
+                                                        lguApprovalProcessingState = LguApprovalState.Idle
+                                                    }
+                                                }
+                                                "declined" -> {
+                                                    lguApprovalProcessingState = LguApprovalState.Error("Your LGU membership request was declined")
+                                                }
+                                            }
+                                        }
+                                    }
+                            } catch (e: Exception) {
+                                Log.e("LguConfirmation", "Error creating pending request", e)
+                                lguApprovalProcessingState = LguApprovalState.Error("Error: ${e.message}")
+                            }
+                        }
+                    }
+                ) {
+                    Text("Continue")
+                }
+            },
+            dismissButton = {
+                Button(
+                    onClick = {
+                        showLguConfirmationModal = false
+                        pendingInviteToken = null
+                        pendingInviteLgcId = null
+                        Log.d("LguConfirmation", "User cancelled")
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
+                ) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+    
+    // LGU Approval Waiting Modal
+    if (showLguApprovalWaitingModal) {
+        // Auto-close modal when approval succeeds
+        LaunchedEffect(lguApprovalProcessingState) {
+            if (lguApprovalProcessingState is LguApprovalState.Success) {
+                Log.d("LguConfirmation", "Approval successful, closing modal in 3 seconds")
+                delay(3000)
+                showLguApprovalWaitingModal = false
+                showScanner = false  // Close QR scanner overlay
+                lguApprovalProcessingState = LguApprovalState.Idle
+                pendingInviteToken = null
+                pendingInviteLgcId = null
+            }
+        }
+        
+        AlertDialog(
+            onDismissRequest = { },
+            title = {
+                when (lguApprovalProcessingState) {
+                    LguApprovalState.Processing -> Text("Processing...")
+                    LguApprovalState.Waiting -> Text("Waiting for Approval")
+                    is LguApprovalState.Success -> Text("Success!")
+                    is LguApprovalState.Error -> Text("Error")
+                    LguApprovalState.Idle -> Text("Processing...")
+                }
+            },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth(),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center
+                ) {
+                    when (lguApprovalProcessingState) {
+                        LguApprovalState.Processing -> {
+                            CircularProgressIndicator()
+                            Spacer(modifier = Modifier.height(16.dp))
+                            Text(
+                                text = lguApprovalMessage,
+                                style = MaterialTheme.typography.bodyMedium,
+                                textAlign = TextAlign.Center
+                            )
+                        }
+                        LguApprovalState.Waiting -> {
+                            Icon(
+                                imageVector = Icons.Default.Schedule,
+                                contentDescription = "Waiting",
+                                modifier = Modifier.size(48.dp),
+                                tint = MaterialTheme.colorScheme.primary
+                            )
+                            Spacer(modifier = Modifier.height(16.dp))
+                            Text(
+                                text = lguApprovalMessage,
+                                style = MaterialTheme.typography.bodyMedium,
+                                textAlign = TextAlign.Center
+                            )
+                            Spacer(modifier = Modifier.height(12.dp))
+                            Text(
+                                text = "The LGU admin will review and approve your membership request shortly.",
+                                style = MaterialTheme.typography.labelSmall,
+                                textAlign = TextAlign.Center,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        is LguApprovalState.Success -> {
+                            Icon(
+                                imageVector = Icons.Default.CheckCircle,
+                                contentDescription = "Success",
+                                modifier = Modifier.size(48.dp),
+                                tint = MaterialTheme.colorScheme.primary
+                            )
+                            Spacer(modifier = Modifier.height(16.dp))
+                            Text(
+                                text = "You have been approved as an LGU member!",
+                                style = MaterialTheme.typography.bodyMedium,
+                                textAlign = TextAlign.Center
+                            )
+                            Spacer(modifier = Modifier.height(12.dp))
+                            Text(
+                                text = "Returning to home...",
+                                style = MaterialTheme.typography.labelSmall,
+                                textAlign = TextAlign.Center,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        is LguApprovalState.Error -> {
+                            Icon(
+                                imageVector = Icons.Default.Error,
+                                contentDescription = "Error",
+                                modifier = Modifier.size(48.dp),
+                                tint = MaterialTheme.colorScheme.error
+                            )
+                            Spacer(modifier = Modifier.height(16.dp))
+                            Text(
+                                text = (lguApprovalProcessingState as LguApprovalState.Error).message,
+                                style = MaterialTheme.typography.bodyMedium,
+                                textAlign = TextAlign.Center
+                            )
+                        }
+                        LguApprovalState.Idle -> {}
+                    }
+                }
+            },
+            confirmButton = {
+                when (lguApprovalProcessingState) {
+                    LguApprovalState.Waiting -> {
+                        Button(
+                            onClick = {
+                                Log.d("LguConfirmation", "User closed waiting modal manually")
+                                showLguApprovalWaitingModal = false
+                                showScanner = false  // Close QR scanner overlay
+                                lguApprovalProcessingState = LguApprovalState.Idle
+                                pendingInviteToken = null
+                                pendingInviteLgcId = null
+                            }
+                        ) {
+                            Text("Close")
+                        }
+                    }
+                    is LguApprovalState.Error -> {
+                        Button(
+                            onClick = {
+                                showLguApprovalWaitingModal = false
+                                showScanner = false  // Close QR scanner overlay
+                                lguApprovalProcessingState = LguApprovalState.Idle
+                                pendingInviteToken = null
+                                pendingInviteLgcId = null
+                            }
+                        ) {
+                            Text("OK")
+                        }
+                    }
+                    else -> {}
+                }
+            }
+        )
     }
 }

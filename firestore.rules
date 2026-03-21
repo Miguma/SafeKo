@@ -6,11 +6,16 @@ service cloud.firestore {
     match /users/{userId} {
       // Allow any logged-in user to read individual profiles
       allow read: if request.auth != null; 
-      // Only allow the owner of the profile to edit it, 
-      // OR allow the initial creation/update during login if the email matches
+      // Allow write if:
+      // 1. User is updating their own document, OR
+      // 2. During initial creation/update if email matches, OR
+      // 3. Only updating admin approval fields (role, lgc_id, department)
       allow write: if request.auth != null && (
         request.auth.uid == userId || 
-        (request.resource.data.email == request.auth.token.email)
+        (request.resource.data.email == request.auth.token.email) ||
+        (
+          request.writeFields.hasOnly(['role', 'lgc_id', 'department'])
+        )
       );
     }
     
@@ -47,6 +52,28 @@ service cloud.firestore {
     match /circles/{circleId}/messages/{messageId} {
       // Allow read/write for any authenticated user
       allow read, write: if request.auth != null;
+    }
+
+    // Pending co-admin invite requests
+    match /pending_admins/{docId} {
+      // Admin can read their own pending requests
+      // User can read requests they submitted
+      allow read: if request.auth != null && 
+                     (request.auth.uid == resource.data.lgcId || 
+                      request.auth.uid == resource.data.userId);
+      
+      // Users can create their own pending requests
+      allow create: if request.auth != null && 
+                       request.auth.uid == request.resource.data.userId;
+      
+      // Allow update if the current user is the lgcId (admin)
+      // This allows the admin to approve or decline requests
+      allow update: if request.auth != null && 
+                       request.auth.uid == resource.data.lgcId;
+      
+      // Only the admin can delete requests
+      allow delete: if request.auth != null && 
+                       request.auth.uid == resource.data.lgcId;
     }
   }
 }

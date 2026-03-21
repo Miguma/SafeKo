@@ -57,6 +57,14 @@
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="https" android:host="safeko-3ca46.web.app" android:pathPrefix="/user/" />
             </intent-filter>
+
+            <!-- Deep Link Intent Filter for Co-Admin Invites -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="safeko" android:host="invite" />
+            </intent-filter>
         </activity>
 
         <service

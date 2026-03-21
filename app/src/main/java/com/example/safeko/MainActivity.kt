@@ -1,6 +1,7 @@
 package com.example.safeko
 
 import android.os.Bundle
+import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
@@ -230,6 +231,31 @@ class MainActivity : ComponentActivity() {
                     val uid = backStackEntry.arguments?.getString("uid")
                     if (uid != null) {
                         PublicProfileScreen(uid = uid, onBack = { navController.popBackStack() })
+                    }
+                }
+                composable(
+                    "process_invite",
+                    deepLinks = listOf(navDeepLink { uriPattern = "safeko://invite?token={token}&lgcId={lgcId}" })
+                ) { backStackEntry ->
+                    val token = backStackEntry.arguments?.getString("token")
+                    val lgcId = backStackEntry.arguments?.getString("lgcId")
+                    if (!token.isNullOrBlank() && !lgcId.isNullOrBlank()) {
+                        ProcessCoAdminInviteScreen(
+                            token = token,
+                            lgcId = lgcId,
+                            onSuccess = {
+                                // After approval, navigate to home which will auto-show admin overview for new co-admins
+                                navController.navigate("home") {
+                                    popUpTo("process_invite") { inclusive = true }
+                                }
+                            },
+                            onError = {
+                                navController.popBackStack()
+                            }
+                        )
+                    } else {
+                        Log.w("ProcessInviteRoute", "Invalid parameters received - token: $token, lgcId: $lgcId")
+                        navController.popBackStack()
                     }
                 }
             }
