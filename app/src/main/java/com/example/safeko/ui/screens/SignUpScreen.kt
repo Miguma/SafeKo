@@ -87,6 +87,8 @@ fun SignUpScreen(
                                 "fullName" to (user.displayName ?: ""),
                                 "email" to (user.email ?: ""),
                                 "role" to "user",
+                                "emailVerified" to false,
+                                "lgc_id" to "",
                                 "profilePhoto" to (user.photoUrl?.toString()),
                                 "createdAt" to System.currentTimeMillis()
                             )
@@ -276,6 +278,8 @@ fun SignUpScreen(
                                         "fullName" to fullName,
                                         "email" to email,
                                         "role" to "user",
+                                        "emailVerified" to false,
+                                        "lgc_id" to "",
                                         "createdAt" to System.currentTimeMillis()
                                     )
                                     Firebase.firestore.collection("users").document(user.uid)

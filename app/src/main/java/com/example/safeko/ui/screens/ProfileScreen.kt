@@ -277,6 +277,7 @@ fun ProfileScreen(
             initialPhoneNumber = userPhoneNumber,
             currentLocation = "Location not available", // Simplified for now
             isPhoneVerified = isPhoneVerified,
+            userRole = userRole, // NEW: Pass user role for password change feature
             onChangePhoto = {
                 pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
             },

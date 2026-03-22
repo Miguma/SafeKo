@@ -1,7 +1,10 @@
 package com.example.safeko.ui.screens
 
+import android.util.Log
 import android.widget.Toast
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -24,6 +27,7 @@ import com.google.firebase.auth.ktx.auth
 import com.google.firebase.firestore.ktx.firestore
 import com.google.firebase.ktx.Firebase
 import kotlinx.coroutines.tasks.await
+import java.util.*
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -31,11 +35,13 @@ fun AdminManagementScreen(
     onBack: () -> Unit
 ) {
     val firestore = Firebase.firestore
+    val auth = Firebase.auth
     val context = LocalContext.current
     var isLoading by remember { mutableStateOf(true) }
     var admins by remember { mutableStateOf<List<UserDataExtended>>(emptyList()) }
     var filteredAdmins by remember { mutableStateOf<List<UserDataExtended>>(emptyList()) }
     var searchQuery by remember { mutableStateOf("") }
+    var currentUserRole by remember { mutableStateOf("user") }
     
     // Add Admin Dialog state
     var showAddDialog by remember { mutableStateOf(false) }
@@ -47,6 +53,19 @@ fun AdminManagementScreen(
     var isLguAccount by remember { mutableStateOf(false) }
     var expanded by remember { mutableStateOf(false) }
     var isAdding by remember { mutableStateOf(false) }
+
+    // Get current user's role
+    LaunchedEffect(Unit) {
+        val uid = auth.currentUser?.uid
+        if (uid != null) {
+            try {
+                val userDoc = firestore.collection("users").document(uid).get().await()
+                currentUserRole = userDoc.getString("role") ?: "user"
+            } catch (e: Exception) {
+                Log.e("AdminManagement", "Error fetching user role: ${e.message}")
+            }
+        }
+    }
 
     LaunchedEffect(Unit) {
         try {
@@ -162,20 +181,58 @@ fun AdminManagementScreen(
                                 auth.createUserWithEmailAndPassword(newAdminEmail, newAdminPassword)
                                     .addOnSuccessListener { authResult ->
                                         val uid = authResult.user?.uid ?: ""
+                                        val user = authResult.user
+                                        
+                                        // Set Firebase Auth displayName
+                                        val profileUpdates = com.google.firebase.auth.UserProfileChangeRequest.Builder()
+                                            .setDisplayName(newAdminName)
+                                            .build()
+                                        
+                                        user?.updateProfile(profileUpdates)?.addOnCompleteListener { profileTask ->
+                                            if (!profileTask.isSuccessful) {
+                                                Log.w("AdminManagement", "Failed to update profile: ${profileTask.exception}")
+                                            }
+                                        }
+                                        
                                         val lguData = hashMapOf(
                                             "uid" to uid,
                                             "fullName" to newAdminName,
                                             "email" to newAdminEmail,
                                             "role" to "lgu_admin",
+                                            "lgc_id" to uid,
                                             "department" to selectedLguType,
                                             "plan" to "LGU",
+                                            "emailVerified" to true,
                                             "createdAt" to System.currentTimeMillis()
                                         )
                                         
                                         firestore.collection("users").document(uid)
                                             .set(lguData)
                                             .addOnSuccessListener {
-                                                Toast.makeText(context, "$selectedLguType Admin Created!", Toast.LENGTH_SHORT).show()
+                                                // 🎯 Auto-create group chat for LGU
+                                                val circleId = UUID.randomUUID().toString()
+                                                val groupChat = hashMapOf(
+                                                    "id" to circleId,
+                                                    "name" to "$selectedLguType Group",
+                                                    "ownerId" to uid,
+                                                    "members" to listOf(uid),
+                                                    "memberLimit" to 20,
+                                                    "type" to "Group",
+                                                    "createdAt" to System.currentTimeMillis(),
+                                                    "imageUrl" to ""
+                                                )
+                                                
+                                                firestore.collection("circles").document(circleId)
+                                                    .set(groupChat)
+                                                    .addOnSuccessListener {
+                                                        Log.d("LguAdminCreation", "✅ Group chat created for $selectedLguType: $circleId")
+                                                        Toast.makeText(context, "$selectedLguType Admin Created + Group Chat! 🎉", Toast.LENGTH_SHORT).show()
+                                                    }
+                                                    .addOnFailureListener { e ->
+                                                        Log.e("LguAdminCreation", "❌ Failed to create group chat: ${e.message}")
+                                                        Toast.makeText(context, "$selectedLguType Admin Created (Chat creation failed)", Toast.LENGTH_SHORT).show()
+                                                    }
+                                                
                                                 showAddDialog = false
                                                 isAdding = false
                                                 newAdminEmail = ""
@@ -294,7 +351,17 @@ fun AdminManagementScreen(
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     items(filteredAdmins) { admin ->
-                        AdminItem(admin)
+                        AdminItem(
+                            admin = admin,
+                            currentUserRole = currentUserRole,
+                            firestore = firestore,
+                            context = context,
+                            onAdminDeleted = {
+                                // Refresh the list after deletion
+                                filteredAdmins = filteredAdmins.filter { it.id != admin.id }
+                                admins = admins.filter { it.id != admin.id }
+                            }
+                        )
                     }
                 }
             }
@@ -302,10 +369,75 @@ fun AdminManagementScreen(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
-fun AdminItem(admin: UserDataExtended) {
+fun AdminItem(
+    admin: UserDataExtended,
+    currentUserRole: String = "user",
+    firestore: com.google.firebase.firestore.FirebaseFirestore? = null,
+    context: android.content.Context? = null,
+    onAdminDeleted: () -> Unit = {}
+) {
+    var showDeleteDialog by remember { mutableStateOf(false) }
+    var isDeleting by remember { mutableStateOf(false) }
+    
+    if (showDeleteDialog) {
+        AlertDialog(
+            onDismissRequest = { showDeleteDialog = false },
+            title = { Text("Delete Admin?") },
+            text = { Text("Are you sure you want to delete ${admin.fullName}? They will be converted back to a regular user.") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        isDeleting = true
+                        // Delete/demote the admin
+                        firestore?.collection("users")?.document(admin.id)
+                            ?.update(mapOf(
+                                "role" to "user",
+                                "lgc_id" to "",
+                                "department" to ""
+                            ))
+                            ?.addOnSuccessListener {
+                                isDeleting = false
+                                showDeleteDialog = false
+                                Toast.makeText(context, "${admin.fullName} has been removed as admin", Toast.LENGTH_SHORT).show()
+                                onAdminDeleted()
+                            }
+                            ?.addOnFailureListener { e ->
+                                isDeleting = false
+                                showDeleteDialog = false
+                                Toast.makeText(context, "Error: ${e.message}", Toast.LENGTH_SHORT).show()
+                                Log.e("AdminDelete", "Failed to delete admin: ${e.message}")
+                            }
+                    },
+                    enabled = !isDeleting,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD32F2F))
+                ) {
+                    Text("Delete", color = Color.White)
+                }
+            },
+            dismissButton = {
+                Button(
+                    onClick = { showDeleteDialog = false },
+                    enabled = !isDeleting
+                ) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+    
     Card(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .combinedClickable(
+                onClick = {},
+                onLongClick = {
+                    if (currentUserRole == "superadmin") {
+                        showDeleteDialog = true
+                    }
+                }
+            ),
         colors = CardDefaults.cardColors(containerColor = Color.White),
         elevation = CardDefaults.cardElevation(0.5.dp),
         shape = RoundedCornerShape(12.dp)

@@ -48,7 +48,6 @@ import android.util.Log
 @Composable
 fun LoginScreen(
     onLoginSuccess: (String) -> Unit,
-    onSignUpClick: () -> Unit,
     onSupportClick: () -> Unit
 ) {
     val context = LocalContext.current
@@ -434,8 +433,7 @@ fun LoginScreen(
                                         isLoading = false
                                         if (documents.isEmpty) {
                                             // Email not found
-                                            Toast.makeText(context, "Email not found, please sign up", Toast.LENGTH_SHORT).show()
-                                            onSignUpClick()
+                                            Toast.makeText(context, "Email not found", Toast.LENGTH_SHORT).show()
                                         } else {
                                             // Email found, show password field
                                             showPasswordField = true
@@ -503,30 +501,6 @@ fun LoginScreen(
             }
 
             Spacer(modifier = Modifier.height(16.dp))
-
-            // Add Sign Up Option for regular users only
-            if (!showPasswordField && !isSuperAdminEmail) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.Center,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = "Don't have an account? ",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = Color(0xFF757575)
-                    )
-                    Text(
-                        text = "Sign up",
-                        modifier = Modifier.clickable { onSignUpClick() },
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = Color(0xFF03A9F4),
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-
-                Spacer(modifier = Modifier.height(16.dp))
-            }
 
             // Back button when showing Password or for superadmin
             if (showPasswordField || isSuperAdminEmail) {

@@ -13,6 +13,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Email
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.Person
@@ -34,9 +36,17 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.activity.compose.BackHandler
+import android.widget.Toast
+import android.os.Handler
+import android.os.Looper
+import androidx.compose.foundation.BorderStroke
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import coil.transform.CircleCropTransformation
+import androidx.compose.material.icons.filled.Phone
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import com.google.firebase.auth.ktx.auth
+import com.google.firebase.ktx.Firebase
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -49,12 +59,21 @@ fun EditProfileDialog(
     initialPhoneNumber: String,
     currentLocation: String,
     isPhoneVerified: Boolean,
+    userRole: String = "user", // NEW: Add userRole parameter
     onChangePhoto: () -> Unit,
     onSave: (String, String) -> Unit // (newName, newPhone)
 ) {
     if (showDialog) {
         var phoneNumber by remember { mutableStateOf(initialPhoneNumber) }
         var fullName by remember { mutableStateOf(currentName) }
+        
+        // NEW: Password change states for LGU admins
+        var showPasswordSection by remember { mutableStateOf(false) }
+        var currentPassword by remember { mutableStateOf("") }
+        var newPassword by remember { mutableStateOf("") }
+        var confirmPassword by remember { mutableStateOf("") }
+        var isChangingPassword by remember { mutableStateOf(false) }
+        var passwordError by remember { mutableStateOf("") }
         
         // Use a full-screen Box with high Z-index to overlay everything
         // This avoids Window inset issues common with Dialog/Popup
@@ -384,6 +403,178 @@ fun EditProfileDialog(
                         }
                         
                         Spacer(modifier = Modifier.height(40.dp))
+                        
+                        // NEW: Change Password Section (LGU Admin Only)
+                        if (userRole == "lgu_admin") {
+                            HorizontalDivider(color = Color(0xFFEEEEEE), thickness = 1.dp)
+                            Spacer(modifier = Modifier.height(24.dp))
+                            
+                            Button(
+                                onClick = { showPasswordSection = !showPasswordSection },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(48.dp),
+                                shape = RoundedCornerShape(12.dp),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = Color(0xFFF5F5F5),
+                                    contentColor = Color(0xFF1565C0)
+                                ),
+                                border = BorderStroke(1.dp, Color(0xFFE0E0E0))
+                            ) {
+                                Icon(
+                                    imageVector = if (showPasswordSection) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                                    contentDescription = null,
+                                    modifier = Modifier
+                                        .size(20.dp)
+                                        .padding(end = 8.dp)
+                                )
+                                Text("Change Password", fontWeight = FontWeight.Bold)
+                            }
+                            
+                            if (showPasswordSection) {
+                                Spacer(modifier = Modifier.height(20.dp))
+                                
+                                // Current Password
+                                OutlinedTextField(
+                                    value = currentPassword,
+                                    onValueChange = { currentPassword = it },
+                                    label = { Text("Current Password") },
+                                    visualTransformation = PasswordVisualTransformation(),
+                                    modifier = Modifier.fillMaxWidth(),
+                                    shape = RoundedCornerShape(12.dp),
+                                    colors = OutlinedTextFieldDefaults.colors(
+                                        focusedBorderColor = Color(0xFF4285F4),
+                                        unfocusedBorderColor = Color(0xFFE0E0E0)
+                                    ),
+                                    enabled = !isChangingPassword
+                                )
+                                
+                                Spacer(modifier = Modifier.height(12.dp))
+                                
+                                // New Password
+                                OutlinedTextField(
+                                    value = newPassword,
+                                    onValueChange = { newPassword = it },
+                                    label = { Text("New Password") },
+                                    visualTransformation = PasswordVisualTransformation(),
+                                    modifier = Modifier.fillMaxWidth(),
+                                    shape = RoundedCornerShape(12.dp),
+                                    colors = OutlinedTextFieldDefaults.colors(
+                                        focusedBorderColor = Color(0xFF4285F4),
+                                        unfocusedBorderColor = Color(0xFFE0E0E0)
+                                    ),
+                                    enabled = !isChangingPassword
+                                )
+                                
+                                Spacer(modifier = Modifier.height(12.dp))
+                                
+                                // Confirm Password
+                                OutlinedTextField(
+                                    value = confirmPassword,
+                                    onValueChange = { confirmPassword = it },
+                                    label = { Text("Confirm Password") },
+                                    visualTransformation = PasswordVisualTransformation(),
+                                    modifier = Modifier.fillMaxWidth(),
+                                    shape = RoundedCornerShape(12.dp),
+                                    colors = OutlinedTextFieldDefaults.colors(
+                                        focusedBorderColor = Color(0xFF4285F4),
+                                        unfocusedBorderColor = Color(0xFFE0E0E0)
+                                    ),
+                                    enabled = !isChangingPassword
+                                )
+                                
+                                if (passwordError.isNotBlank()) {
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                    Text(
+                                        text = passwordError,
+                                        color = Color.Red,
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                }
+                                
+                                Spacer(modifier = Modifier.height(16.dp))
+                                
+                                // Update Password Button
+                                val context = LocalContext.current
+                                Button(
+                                    onClick = {
+                                        // Validate
+                                        passwordError = when {
+                                            currentPassword.isBlank() -> "Current password required"
+                                            newPassword.isBlank() -> "New password required"
+                                            confirmPassword.isBlank() -> "Confirm password required"
+                                            newPassword != confirmPassword -> "Passwords don't match"
+                                            newPassword.length < 6 -> "Password must be at least 6 characters"
+                                            else -> ""
+                                        }
+                                        
+                                        if (passwordError.isBlank()) {
+                                            isChangingPassword = true
+                                            val auth = Firebase.auth
+                                            val user = auth.currentUser
+                                            
+                                            if (user != null && user.email != null) {
+                                                // Reauthenticate first
+                                                val credential = com.google.firebase.auth.EmailAuthProvider.getCredential(
+                                                    user.email!!,
+                                                    currentPassword
+                                                )
+                                                
+                                                user.reauthenticate(credential)
+                                                    .addOnSuccessListener {
+                                                        user.updatePassword(newPassword)
+                                                            .addOnSuccessListener {
+                                                                passwordError = ""
+                                                                currentPassword = ""
+                                                                newPassword = ""
+                                                                confirmPassword = ""
+                                                                showPasswordSection = false
+                                                                isChangingPassword = false
+                                                                android.os.Handler(android.os.Looper.getMainLooper()).post {
+                                                                    Toast.makeText(context, "✅ Password updated successfully!", Toast.LENGTH_SHORT).show()
+                                                                }
+                                                            }
+                                                            .addOnFailureListener { e ->
+                                                                passwordError = "Error: ${e.message}"
+                                                                isChangingPassword = false
+                                                                android.os.Handler(android.os.Looper.getMainLooper()).post {
+                                                                    Toast.makeText(context, "❌ ${e.message}", Toast.LENGTH_SHORT).show()
+                                                                }
+                                                            }
+                                                    }
+                                                    .addOnFailureListener { e ->
+                                                        passwordError = "❌ Current password is incorrect"
+                                                        isChangingPassword = false
+                                                        android.os.Handler(android.os.Looper.getMainLooper()).post {
+                                                            Toast.makeText(context, "❌ Current password is incorrect", Toast.LENGTH_SHORT).show()
+                                                        }
+                                                    }
+                                            }
+                                        }
+                                    },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(44.dp),
+                                    shape = RoundedCornerShape(12.dp),
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = Color(0xFF4CAF50)
+                                    ),
+                                    enabled = !isChangingPassword
+                                ) {
+                                    if (isChangingPassword) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(20.dp),
+                                            color = Color.White,
+                                            strokeWidth = 2.dp
+                                        )
+                                    } else {
+                                        Text("Update Password", fontWeight = FontWeight.Bold)
+                                    }
+                                }
+                            }
+                            
+                            Spacer(modifier = Modifier.height(24.dp))
+                        }
                         
                         // Save Button
                         Button(

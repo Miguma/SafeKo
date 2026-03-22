@@ -128,16 +128,7 @@ class MainActivity : ComponentActivity() {
                                 }
                             }
                         },
-                        onSignUpClick = {
-                            navController.navigate("signup")
-                        },
                         onSupportClick = { /* TODO: Implement Support */ }
-                    )
-                }
-                composable("signup") {
-                    SignUpScreen(
-                        onSignUpSuccess = { navController.navigate("home") },
-                        onSignInClick = { navController.navigate("login") }
                     )
                 }
                 composable("admin_dashboard") {

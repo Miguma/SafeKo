@@ -24,5 +24,6 @@ data class RemoteAlert(
     val userName: String? = null,
     val userPhotoUrl: String? = null,
     val timestamp: Long = 0L,
-    val status: String = "active"
+    val status: String = "active",
+    val pingCount: Int = 1  // Track duplicates at same location
 )

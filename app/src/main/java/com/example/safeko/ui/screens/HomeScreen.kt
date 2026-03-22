@@ -28,6 +28,9 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.rememberScrollState
+
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -111,6 +114,9 @@ import com.example.safeko.model.SearchResult
 import com.example.safeko.ui.components.QRCodeScanner
 import com.example.safeko.utils.PlaceSearcher
 import com.example.safeko.utils.QRCodeUtils
+import com.example.safeko.utils.clusterAlerts
+import com.example.safeko.utils.getClusterColor
+import com.example.safeko.utils.calculateDistance
 import com.example.safeko.services.NavigationService
 import com.example.safeko.model.NavigationStep
 import com.example.safeko.model.RemoteAlert
@@ -277,6 +283,7 @@ fun HomeScreen(navController: NavController) {
     var userDepartment by remember { mutableStateOf("") }
     var userLgcId by remember { mutableStateOf("") }
     var showGlobalOverview by remember { mutableStateOf(false) }
+    var showMembersSheet by remember { mutableStateOf(false) }
 
     // Co-Admin Invite State
     var showCoAdminInvite by remember { mutableStateOf(false) }
@@ -305,42 +312,72 @@ fun HomeScreen(navController: NavController) {
     var coAdminsList by remember { mutableStateOf<List<Map<String, Any>>>(emptyList()) }
     var loadingCoAdmins by remember { mutableStateOf(false) }
 
+    // Group Owner State
+    var groupOwnerData by remember { mutableStateOf<Map<String, Any>?>(null) }
+    var loadingGroupOwner by remember { mutableStateOf(false) }
+
     DisposableEffect(Unit) {
         val uid = auth.currentUser?.uid
         val registration = if (uid != null) {
-            Firebase.firestore.collection("users").document(uid)
-                .addSnapshotListener { snapshot, _ ->
-                    if (snapshot != null && snapshot.exists()) {
-                        userPlan = snapshot.getString("plan") ?: "Free"
-                        userRole = snapshot.getString("role") ?: "user"
-                        userDepartment = snapshot.getString("department") ?: ""
-                        userLgcId = snapshot.getString("lgc_id") ?: ""
-
-                        // Auto-grant OWL+ to Admins and LGUs
-                        if ((userRole == "admin" || userRole == "superadmin" || userRole == "lgu_admin") && userPlan != "OWL+") {
-                            userPlan = "OWL+"
+            try {
+                Firebase.firestore.collection("users").document(uid)
+                    .addSnapshotListener { snapshot, error ->
+                        if (error != null) {
+                            Log.e("HomeScreen", "Firestore error: ${error.message}")
+                            return@addSnapshotListener
                         }
-
-                        // Silent Sync: If Firestore missing name but Firebase Auth has it, set it
-                        val dbName = snapshot.getString("name")
-                        val authName = Firebase.auth.currentUser?.displayName
-                        if (dbName.isNullOrBlank() && !authName.isNullOrBlank()) {
-                            Firebase.firestore.collection("users").document(uid)
-                                .update("name", authName)
+                        
+                        try {
+                            if (snapshot != null && snapshot.exists()) {
+                                val newRole = snapshot.getString("role") ?: "user"
+                                val oldRole = userRole
+                                
+                                userPlan = snapshot.getString("plan") ?: "Free"
+                                userRole = newRole
+                                userDepartment = snapshot.getString("department") ?: ""
+                                val lgcId = snapshot.getString("lgc_id")
+                                userLgcId = if (lgcId?.isNotEmpty() == true) lgcId else uid
+                                
+                                if (newRole != oldRole || newRole == "lgu_admin") {
+                                    Log.d("UserDataLoading", "🔄 ROLE UPDATED: $oldRole → $newRole (admin: ${newRole == "lgu_admin"})")
+                                }
+                                Log.d("UserDataLoading", "Loaded from Firestore: uid=$uid, role=$userRole, lgc_id=$userLgcId (raw from db: $lgcId), plan=$userPlan")
+                            } else {
+                                userPlan = "Free"
+                                Log.w("UserDataLoading", "User document does not exist in Firestore for uid=$uid")
+                            }
+                        } catch (e: Exception) {
+                            Log.e("UserDataLoading", "Error processing snapshot: ${e.message}", e)
                         }
-                    } else {
-                        userPlan = "Free"
                     }
-                }
+            } catch (e: Exception) {
+                Log.e("HomeScreen", "Error setting up listener: ${e.message}")
+                null
+            }
         } else null
-        onDispose { registration?.remove() }
+        onDispose { 
+            try {
+                registration?.remove()
+            } catch (e: Exception) {
+                Log.e("HomeScreen", "Error removing listener: ${e.message}")
+            }
+        }
     }
 
     // Auto-show admin overview when user becomes lgu_admin (after QR approval)
     LaunchedEffect(userRole) {
-        if ((userRole == "admin" || userRole == "superadmin" || userRole == "lgu_admin") && !showGlobalOverview) {
-            Log.d("HomeScreen", "User role is admin/superadmin/lgu_admin, automatically showing admin overview. userRole: $userRole")
+        Log.d("AdminAutoShow", "🔍 LaunchedEffect triggered. userRole=$userRole, showGlobalOverview=$showGlobalOverview")
+        
+        val isAdminRole = (userRole == "admin" || userRole == "superadmin" || userRole == "lgu_admin")
+        Log.d("AdminAutoShow", "   isAdminRole=$isAdminRole, showGlobalOverview=$showGlobalOverview, condition=!showGlobalOverview is ${!showGlobalOverview}")
+        
+        if (isAdminRole && !showGlobalOverview) {
+            Log.d("AdminAutoShow", "✅ SETTING showGlobalOverview = true (was: $showGlobalOverview)")
             showGlobalOverview = true
+        } else if (isAdminRole && showGlobalOverview) {
+            Log.d("AdminAutoShow", "⏭️ Already showing admin overview, skipping")
+        } else {
+            Log.d("AdminAutoShow", "❌ NOT admin role or condition failed: isAdminRole=$isAdminRole")
         }
     }
 
@@ -425,6 +462,9 @@ fun HomeScreen(navController: NavController) {
     var isMapReady by remember { mutableStateOf(false) }
     var alerts by remember { mutableStateOf<Map<String, RemoteAlert>>(emptyMap()) }
     var selectedAlert by remember { mutableStateOf<RemoteAlert?>(null) }
+    var clusteredAlerts by remember { mutableStateOf<List<com.example.safeko.utils.ClusteredAlert>>(emptyList()) }
+    var selectedCluster by remember { mutableStateOf<com.example.safeko.utils.ClusteredAlert?>(null) }
+    var showClusterModal by remember { mutableStateOf(false) }
     var showAlertDetails by remember { mutableStateOf(false) }
 
     // Unified Alert listener (Realtime)
@@ -1508,37 +1548,64 @@ fun HomeScreen(navController: NavController) {
         }
     }
 
-    // Update Map Markers when alerts change or map becomes ready
+    // Update Map Markers when alerts change or map becomes ready (with clustering)
     LaunchedEffect(alerts, isMapReady) {
         if (!isMapReady) return@LaunchedEffect
 
         val features = if (alerts.isNotEmpty()) {
             // Prepare features on background thread
             withContext(Dispatchers.Default) {
-                alerts.values.filter { it.status != "resolved" }.map { alert ->
-                    val point = Point.fromLngLat(alert.lon, alert.lat)
+                val activeAlerts = alerts.values.filter { it.status != "resolved" }
+                
+                // Cluster alerts by proximity
+                val clusters = clusterAlerts(activeAlerts)
+                clusteredAlerts = clusters
+                
+                // Create features for each cluster (only one marker per cluster)
+                clusters.map { cluster ->
+                    val point = Point.fromLngLat(cluster.centerLon, cluster.centerLat)
                     val feature = Feature.fromGeometry(point)
-                    feature.addStringProperty("id", alert.id)
-                    feature.addStringProperty("type", alert.type)
-
-                    // Map type to icon image ID
-                    val iconImage = when (alert.type) {
-                        "Fire Emergency" -> "icon-fire"
-                        "Road Accident" -> "icon-accident"
-                        "Emergency Rescue" -> "icon-rescue"
-                        else -> "icon-rescue"
+                    
+                    // Use cluster ID and highest severity type
+                    feature.addStringProperty("clusterId", cluster.clusterId)
+                    feature.addStringProperty("type", cluster.highestSeverityAlert.type)
+                    feature.addStringProperty("isCritical", cluster.isCritical.toString())
+                    feature.addNumberProperty("clusterSize", cluster.alerts.size.toLong())
+                    
+                    // Determine icon based on critical status
+                    val iconImage = if (cluster.isCritical) {
+                        "icon-critical"  // Red pulse icon for critical
+                    } else {
+                        when (cluster.highestSeverityAlert.type) {
+                            "Fire Emergency" -> "icon-fire"
+                            "Road Accident" -> "icon-accident"
+                            "Emergency Rescue" -> "icon-rescue"
+                            else -> "icon-rescue"
+                        }
                     }
                     feature.addStringProperty("icon-image", iconImage)
                     feature
                 }
             }
         } else {
+            clusteredAlerts = emptyList()
             emptyList()
         }
 
         mapLibreMap?.getStyle { style ->
             val source = style.getSourceAs<GeoJsonSource>("alerts-source")
             source?.setGeoJson(FeatureCollection.fromFeatures(features))
+            
+            // Force layer to refresh by updating paint properties
+            val layer = style.getLayer("alerts-layer") as? SymbolLayer
+            if (layer != null) {
+                // This forces the layer to re-evaluate icon expressions
+                layer.withProperties(
+                    PropertyFactory.iconAllowOverlap(true),
+                    PropertyFactory.iconIgnorePlacement(true)
+                )
+                Log.d("AlertSubmission", "🔄 Refreshed alerts layer with ${features.size} clusters")
+            }
         }
     }
 
@@ -1695,50 +1762,184 @@ fun HomeScreen(navController: NavController) {
 
         val userId = auth.currentUser?.uid
         val user = auth.currentUser
-        val body = JSONObject().apply {
-            put("type", type)
-            put("lat", location.latitude)
-            put("lon", location.longitude)
-            put("userId", userId ?: JSONObject.NULL)
-            put("userName", user?.displayName ?: "Unknown User")
-            put("userPhotoUrl", user?.photoUrl?.toString() ?: "")
-            put("timestamp", System.currentTimeMillis())
-        }.toString()
-
+        
         scope.launch(Dispatchers.IO) {
-            val token = try {
-                auth.currentUser?.getIdToken(false)?.await()?.token
-            } catch (e: Exception) {
-                Log.e("HomeScreen", "Error getting auth token", e)
-                null
-            }
-            val authParam = if (token != null) "?auth=$token" else ""
-            val url = URL("$rtdbBaseUrl/alerts.json$authParam")
-
-            val connection = (url.openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                doOutput = true
-                connectTimeout = 5000
-                readTimeout = 5000
-                setRequestProperty("Content-Type", "application/json; charset=utf-8")
-            }
-
             try {
-                connection.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
-                val code = connection.responseCode
-                if (code in 200..299) {
-                    withContext(Dispatchers.Main) {
-                        Toast.makeText(context, "Alert Sent: $type", Toast.LENGTH_SHORT).show()
-                        showAlertSheet = false
+                Log.d("AlertSubmission", "🔍 Checking for existing alert at (${location.latitude}, ${location.longitude})")
+                Log.d("AlertSubmission", "📊 Cached alerts: ${alerts.size}")
+                
+                // Small delay to let real-time listener catch up with previous update
+                if (alerts.isNotEmpty()) {
+                    delay(300)  // Wait 300ms for listener to receive update from Firebase
+                    Log.d("AlertSubmission", "⏳ After delay - cached alerts: ${alerts.size}")
+                }
+                
+                // Check for existing alert at same location from current (hopefully updated) state
+                val existingAlert = alerts.values.find { alert ->
+                    val distance = calculateDistance(alert.lat, alert.lon, location.latitude, location.longitude)
+                    val isSameType = alert.type == type
+                    val isActive = alert.status != "resolved"
+                    val isWithinRadius = distance <= com.example.safeko.utils.CLUSTER_RADIUS_METERS
+                    
+                    Log.d("AlertSubmission", "🔎 Alert ${alert.id}: type=$isSameType, distance=${String.format("%.1f", distance)}m, pingCount=${alert.pingCount}")
+                    
+                    isSameType && isActive && isWithinRadius
+                }
+                
+                if (existingAlert != null) {
+                    Log.d("AlertSubmission", "✅ FOUND existing alert: ${existingAlert.id} (pingCount=${existingAlert.pingCount})")
+                    
+                    // Get fresh token for this request
+                    val token = try {
+                        auth.currentUser?.getIdToken(true)?.await()?.token  // Force refresh
+                    } catch (e: Exception) {
+                        Log.e("AlertSubmission", "Error getting auth token", e)
+                        null
+                    }
+                    
+                    if (token == null) {
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(context, "❌ Authentication failed", Toast.LENGTH_SHORT).show()
+                            Log.e("AlertSubmission", "❌ No auth token available")
+                        }
+                        return@launch
+                    }
+                    
+                    val authParam = "?auth=$token"
+                    
+                    // Increment ping count for existing alert - Try writing entire object back
+                    val newPingCount = existingAlert.pingCount + 1
+                    val updatedAlert = existingAlert.copy(
+                        pingCount = newPingCount,
+                        timestamp = System.currentTimeMillis()
+                    )
+                    
+                    // Serialize the updated alert
+                    val gson = com.google.gson.Gson()
+                    val updateBody = gson.toJson(updatedAlert)
+                    
+                    val url = URL("$rtdbBaseUrl/alerts/${existingAlert.id}.json$authParam")
+                    Log.d("AlertSubmission", "📍 PUT URL: $url")
+                    Log.d("AlertSubmission", "📤 PUT body: $updateBody")
+                    
+                    try {
+                        val connection = (url.openConnection() as HttpURLConnection).apply {
+                            requestMethod = "PUT"  // Use PUT instead of PATCH
+                            doOutput = true
+                            connectTimeout = 5000
+                            readTimeout = 5000
+                            setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                        }
+                        
+                        connection.outputStream.use { it.write(updateBody.toByteArray(Charsets.UTF_8)) }
+                        val code = connection.responseCode
+                        
+                        // Read response from correct stream
+                        val response = if (code >= 400) {
+                            connection.errorStream?.bufferedReader()?.use { it.readText() } ?: "No error details"
+                        } else {
+                            connection.inputStream.bufferedReader().use { it.readText() }
+                        }
+                        
+                        Log.d("AlertSubmission", "📡 PUT response code: $code, response: $response")
+                        
+                        if (code in 200..299) {
+                            withContext(Dispatchers.Main) {
+                                Toast.makeText(context, "🔔 Alert pinged! (Count: $newPingCount)", Toast.LENGTH_SHORT).show()
+                                showAlertSheet = false
+                                Log.d("AlertSubmission", "✅ Successfully pinged alert with new count: $newPingCount")
+                            }
+                        } else {
+                            withContext(Dispatchers.Main) {
+                                Toast.makeText(context, "❌ Failed to ping alert (code: $code)", Toast.LENGTH_SHORT).show()
+                                Log.e("AlertSubmission", "❌ PUT failed with code $code: $response")
+                            }
+                        }
+                    } catch (e: Exception) {
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(context, "❌ Error pinging alert: ${e.message}", Toast.LENGTH_SHORT).show()
+                            Log.e("AlertSubmission", "❌ PUT exception: ${e.message}", e)
+                        }
                     }
                 } else {
-                    withContext(Dispatchers.Main) {
-                        Toast.makeText(context, "Failed to send alert", Toast.LENGTH_SHORT).show()
+                    Log.d("AlertSubmission", "➕ No existing alert found, creating new one...")
+                    
+                    // Get fresh token for this request
+                    val token = try {
+                        auth.currentUser?.getIdToken(true)?.await()?.token  // Force refresh
+                    } catch (e: Exception) {
+                        Log.e("AlertSubmission", "Error getting auth token", e)
+                        null
+                    }
+                    
+                    if (token == null) {
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(context, "❌ Authentication failed", Toast.LENGTH_SHORT).show()
+                            Log.e("AlertSubmission", "❌ No auth token available")
+                        }
+                        return@launch
+                    }
+                    
+                    val authParam = "?auth=$token"
+                    
+                    // Create new alert with pingCount = 1
+                    val body = JSONObject().apply {
+                        put("type", type)
+                        put("lat", location.latitude)
+                        put("lon", location.longitude)
+                        put("userId", userId ?: JSONObject.NULL)
+                        put("userName", user?.displayName ?: "Unknown User")
+                        put("userPhotoUrl", user?.photoUrl?.toString() ?: "")
+                        put("timestamp", System.currentTimeMillis())
+                        put("pingCount", 1)  // Initialize new alerts with pingCount = 1
+                    }.toString()
+                    
+                    val url = URL("$rtdbBaseUrl/alerts.json$authParam")
+                    Log.d("AlertSubmission", "📍 POST URL: $url")
+                    
+                    try {
+                        val connection = (url.openConnection() as HttpURLConnection).apply {
+                            requestMethod = "POST"
+                            doOutput = true
+                            connectTimeout = 5000
+                            readTimeout = 5000
+                            setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                        }
+                        
+                        connection.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+                        val code = connection.responseCode
+                        
+                        val response = if (code >= 400) {
+                            connection.errorStream?.bufferedReader()?.use { it.readText() } ?: "No error details"
+                        } else {
+                            connection.inputStream.bufferedReader().use { it.readText() }
+                        }
+                        
+                        Log.d("AlertSubmission", "📡 POST response code: $code, response: $response")
+                        
+                        if (code in 200..299) {
+                            withContext(Dispatchers.Main) {
+                                Toast.makeText(context, "🚨 Alert Sent: $type", Toast.LENGTH_SHORT).show()
+                                showAlertSheet = false
+                                Log.d("AlertSubmission", "✅ New alert created with pingCount = 1")
+                            }
+                        } else {
+                            withContext(Dispatchers.Main) {
+                                Toast.makeText(context, "❌ Failed to send alert (code: $code)", Toast.LENGTH_SHORT).show()
+                                Log.e("AlertSubmission", "❌ POST failed with code $code: $response")
+                            }
+                        }
+                    } catch (e: Exception) {
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(context, "❌ Error sending alert: ${e.message}", Toast.LENGTH_SHORT).show()
+                            Log.e("AlertSubmission", "❌ POST exception: ${e.message}", e)
+                        }
                     }
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
-                    Toast.makeText(context, "Error sending alert", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "❌ Error: ${e.message}", Toast.LENGTH_SHORT).show()
+                    Log.e("AlertSubmission", "Error: ${e.message}", e)
                 }
             }
         }
@@ -1901,6 +2102,14 @@ fun HomeScreen(navController: NavController) {
                                             64
                                         ) // Red for Medical
                                     )
+                                    // Critical/Red Pulse Icon (larger than normal)
+                                    style.addImage(
+                                        "icon-critical",
+                                        createColoredDot(
+                                            android.graphics.Color.parseColor("#D32F2F"),
+                                            92
+                                        ) // Dark red, larger for emphasis
+                                    )
                                     // Add Source and Layer for Alerts
                                     style.addSource(GeoJsonSource("alerts-source"))
                                     style.addLayer(
@@ -2016,53 +2225,21 @@ fun HomeScreen(navController: NavController) {
                                                 return@addOnMapClickListener true
                                             }
 
-                                            // 2. Check Alerts
+                                            // 3. Check Alerts (Clustered)
                                             val features = map.queryRenderedFeatures(
                                                 screenPoint,
                                                 "alerts-layer"
                                             )
                                             if (features.isNotEmpty()) {
                                                 val feature = features[0]
-                                                val id = feature.getStringProperty("id")
-                                                val alert = alerts[id]
-                                                if (alert != null) {
-                                                    selectedAlert = alert
-                                                    showAlertDetails = true
-
-                                                    // Fetch address if missing
-                                                    if (alert.address.isBlank()) {
-                                                        scope.launch {
-                                                            try {
-                                                                // Show loading state
-                                                                selectedAlert =
-                                                                    selectedAlert?.copy(address = "Loading address...")
-
-                                                                val address =
-                                                                    PlaceSearcher.reverseGeocode(
-                                                                        alert.lat,
-                                                                        alert.lon
-                                                                    )
-
-                                                                // Update if we are still viewing the same alert
-                                                                if (selectedAlert?.id == alert.id) {
-                                                                    if (address.isNotBlank()) {
-                                                                        selectedAlert =
-                                                                            selectedAlert?.copy(
-                                                                                address = address
-                                                                            )
-                                                                    } else {
-                                                                        // Revert to coordinates if failed
-                                                                        selectedAlert =
-                                                                            selectedAlert?.copy(
-                                                                                address = "${alert.lat}, ${alert.lon}"
-                                                                            )
-                                                                    }
-                                                                }
-                                                            } catch (e: Exception) {
-                                                                e.printStackTrace()
-                                                            }
-                                                        }
-                                                    }
+                                                val clusterId = feature.getStringProperty("clusterId")
+                                                
+                                                // Find the cluster and show cluster modal
+                                                val cluster = clusteredAlerts.find { it.clusterId == clusterId }
+                                                if (cluster != null) {
+                                                    selectedCluster = cluster
+                                                    showClusterModal = true
+                                                    Log.d("AlertSubmission", "📍 Cluster tapped: ${cluster.alerts.size} alerts (${cluster.highestSeverityAlert.type})")
                                                 }
                                                 true
                                             } else {
@@ -3075,6 +3252,136 @@ fun HomeScreen(navController: NavController) {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // Cluster Details Modal - Show all alerts in cluster
+    if (showClusterModal && selectedCluster != null) {
+        ModalBottomSheet(
+            onDismissRequest = { showClusterModal = false },
+            containerColor = Color.White,
+            shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
+            dragHandle = { BottomSheetDefaults.DragHandle() }
+        ) {
+            val cluster = selectedCluster!!
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp)
+                    .verticalScroll(rememberScrollState())
+            ) {
+                // Header
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 16.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        "${cluster.alerts.size} Alerts in Area",
+                        fontSize = 20.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Badge(
+                        modifier = Modifier
+                            .background(
+                                if (cluster.isCritical) Color.Red else Color.Gray,
+                                shape = CircleShape
+                            )
+                            .padding(8.dp)
+                    ) {
+                        Text(
+                            "${cluster.totalPings}",
+                            color = Color.White,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                // List of alerts in cluster
+                cluster.alerts.forEach { alert ->
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 8.dp)
+                            .clickable {
+                                // Open alert details
+                                selectedAlert = alert
+                                showAlertDetails = true
+                                showClusterModal = false
+                            },
+                        colors = CardDefaults.cardColors(
+                            containerColor = if (alert.pingCount >= 3) Color(0xFFFFE0E0) else Color(0xFFF5F5F5)
+                        )
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(12.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    alert.type,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 14.sp
+                                )
+                                Text(
+                                    "${alert.lat}, ${alert.lon}",
+                                    fontSize = 12.sp,
+                                    color = Color.Gray
+                                )
+                                if (alert.details.isNotBlank()) {
+                                    Text(
+                                        alert.details.take(50) + if (alert.details.length > 50) "..." else "",
+                                        fontSize = 11.sp,
+                                        maxLines = 1,
+                                        color = Color.DarkGray,
+                                        modifier = Modifier.padding(top = 4.dp)
+                                    )
+                                }
+                            }
+                            Column(
+                                horizontalAlignment = Alignment.End,
+                                modifier = Modifier.padding(start = 8.dp)
+                            ) {
+                                if (alert.pingCount >= 3) {
+                                    Badge(
+                                        modifier = Modifier
+                                            .background(Color.Red, shape = CircleShape)
+                                            .padding(6.dp)
+                                    ) {
+                                        Text(
+                                            "🔴 ${alert.pingCount}",
+                                            color= Color.White,
+                                            fontSize = 11.sp
+                                        )
+                                    }
+                                } else {
+                                    Text(
+                                        "📍 ${alert.pingCount}",
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                                Text(
+                                    alert.userName ?: "Unknown",
+                                    fontSize = 10.sp,
+                                    color = Color.Gray,
+                                    modifier = Modifier.padding(top = 4.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(20.dp))
             }
         }
     }
@@ -5059,6 +5366,14 @@ fun HomeScreen(navController: NavController) {
         }
     }
 
+    // Force-show admin overview for admins (this ensures it shows on login)
+    LaunchedEffect(userRole) {
+        val isAdmin = userRole == "admin" || userRole == "superadmin" || userRole == "lgu_admin"
+        if (isAdmin) {
+            Log.d("AdminForceShow", "✅ User is admin ($userRole), forcing showGlobalOverview = true")
+            showGlobalOverview = true
+        }
+    }
 
     // Admin Overview Bottom Sheet (Admin Only)
     if (showGlobalOverview && (userRole == "admin" || userRole == "superadmin" || userRole == "lgu_admin")) {
@@ -5096,6 +5411,7 @@ fun HomeScreen(navController: NavController) {
             if (showGlobalOverview) {
                 loadingPendingRequests = true
                 val currentLgcId = auth.currentUser?.uid ?: ""
+                Log.d("PendingAdmins", "Loading pending requests for lgcId=$currentLgcId")
                 
                 val listener = Firebase.firestore
                     .collection("pending_admins")
@@ -5103,23 +5419,32 @@ fun HomeScreen(navController: NavController) {
                     .whereEqualTo("status", "pending")
                     .addSnapshotListener { snapshot, error ->
                         if (error != null) {
-                            Log.e("PendingAdmins", "Error listening to pending requests: ${error.message}")
+                            Log.e("PendingAdmins", "❌ Error listening to pending requests: ${error.message}")
                             loadingPendingRequests = false
                             return@addSnapshotListener
                         }
                         
                         if (snapshot != null) {
+                            Log.d("PendingAdmins", "Found ${snapshot.documents.size} pending requests")
                             pendingCoAdmins = snapshot.documents.map { doc ->
+                                val userid = doc.getString("userId") ?: ""
+                                val username = doc.getString("userName") ?: ""
+                                Log.d("PendingAdmins", "Request: userId=$userid, userName=$username")
                                 mapOf(
                                     "id" to (doc.id as Any),
-                                    "userName" to (doc.getString("userName") ?: "" as Any),
+                                    "userName" to (username as Any),
                                     "userEmail" to (doc.getString("userEmail") ?: "" as Any),
-                                    "createdAt" to (doc.getTimestamp("createdAt")
-                                        ?: com.google.firebase.Timestamp.now() as Any),
-                                    "userId" to (doc.getString("userId") ?: "" as Any)
+                                    "createdAt" to (try {
+                                        doc.getTimestamp("createdAt") ?: com.google.firebase.Timestamp.now()
+                                    } catch (e: Exception) {
+                                        val ms = doc.getLong("createdAt") ?: 0L
+                                        if (ms > 0) com.google.firebase.Timestamp(ms / 1000, 0) else com.google.firebase.Timestamp.now()
+                                    } as Any),
+                                    "userId" to (userid as Any)
                                 )
                             }
                             loadingPendingRequests = false
+                            Log.d("PendingAdmins", "Loaded ${pendingCoAdmins.size} pending co-admins")
                         }
                     }
             }
@@ -5154,12 +5479,44 @@ fun HomeScreen(navController: NavController) {
                                     "displayName" to (doc.getString("displayName")
                                         ?: doc.getString("name") ?: "Unknown" as Any),
                                     "email" to (doc.getString("email") ?: "" as Any),
-                                    "createdAt" to (doc.getTimestamp("createdAt")
-                                        ?: doc.getTimestamp("joinedDate")
-                                        ?: com.google.firebase.Timestamp.now() as Any)
+                                    "createdAt" to (try {
+                                        doc.getTimestamp("createdAt") ?: doc.getTimestamp("joinedDate") ?: com.google.firebase.Timestamp.now()
+                                    } catch (e: Exception) {
+                                        val ms = doc.getLong("createdAt") ?: 0L
+                                        if (ms > 0) com.google.firebase.Timestamp(ms / 1000, 0) else com.google.firebase.Timestamp.now()
+                                    } as Any)
                                 )
                             }
                             loadingCoAdmins = false
+                        }
+                    }
+            }
+        }
+
+        // Set up real-time listener for Group Owner (only for lgu_admin users)
+        LaunchedEffect(showGlobalOverview, userRole, userLgcId) {
+            if (showGlobalOverview && userRole == "lgu_admin" && userLgcId.isNotEmpty()) {
+                loadingGroupOwner = true
+                // Fetch the group owner (the user where uid == lgc_id of current user)
+                val listener = Firebase.firestore
+                    .collection("users")
+                    .document(userLgcId)  // userLgcId is the boss's uid
+                    .addSnapshotListener { snapshot, error ->
+                        if (error != null) {
+                            Log.e("GroupOwner", "Error listening to group owner: ${error.message}")
+                            loadingGroupOwner = false
+                            return@addSnapshotListener
+                        }
+                        
+                        if (snapshot != null && snapshot.exists()) {
+                            groupOwnerData = mapOf(
+                                "id" to (snapshot.id as Any),
+                                "displayName" to (snapshot.getString("displayName")
+                                    ?: snapshot.getString("name") ?: "Unknown" as Any),
+                                "email" to (snapshot.getString("email") ?: "" as Any),
+                                "role" to (snapshot.getString("role") ?: "lgu_admin" as Any)
+                            )
+                            loadingGroupOwner = false
                         }
                     }
             }
@@ -5170,7 +5527,8 @@ fun HomeScreen(navController: NavController) {
             sheetState = overviewSheetState,
             containerColor = Color.White,
             shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
-            dragHandle = { BottomSheetDefaults.DragHandle() }
+            dragHandle = { BottomSheetDefaults.DragHandle() },
+            scrimColor = Color.Black.copy(alpha = 0.4f)
         ) {
             Column(
                 modifier = Modifier
@@ -5211,23 +5569,27 @@ fun HomeScreen(navController: NavController) {
                         }
                     }
 
-                    // QR and Link Icons (visible to all admins)
+                    // QR and Link Icons (visible to all admins, but QR restricted to group owners)
+                    val currentUid = auth.currentUser?.uid ?: "NULL"
+                    val isGroupOwner = userRole == "admin" || userRole == "superadmin" || (userRole == "lgu_admin" && currentUid == userLgcId)
+                    Log.d("AdminOverview", "QR Check - userRole=$userRole, currentUid=$currentUid, userLgcId=$userLgcId, Match=${currentUid == userLgcId}, isGroupOwner=$isGroupOwner")
                     if (userRole == "admin" || userRole == "superadmin" || userRole == "lgu_admin") {
                         Row(
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            // QR Icon - using clickable instead of IconButton
-                            Icon(
-                                imageVector = Icons.Rounded.QrCode2,
-                                contentDescription = "Show QR Code",
-                                tint = Color(0xFF1565C0),
-                                modifier = Modifier
-                                    .size(36.dp)
-                                    .padding(8.dp)
-                                    .clickable {
-                                        Log.d("QRIcon", "QR icon clicked, userRole: $userRole")
-                                        if (userRole == "admin" || userRole == "superadmin" || userRole == "lgu_admin") {
+                            // QR Icon - using clickable instead of IconButton (only visible to group owners)
+                            if (isGroupOwner) {
+                                Icon(
+                                    imageVector = Icons.Rounded.QrCode2,
+                                    contentDescription = "Show QR Code",
+                                    tint = Color(0xFF1565C0),
+                                    modifier = Modifier
+                                        .size(36.dp)
+                                        .padding(8.dp)
+                                        .clickable {
+                                            Log.d("QRIcon", "QR icon clicked, userRole: $userRole, isGroupOwner: $isGroupOwner")
+                                            if (userRole == "admin" || userRole == "superadmin" || userRole == "lgu_admin") {
                                             val lgcId = auth.currentUser?.uid ?: ""
                                             Log.d("QRIcon", "Generating QR for lgcId: $lgcId")
                                             val invite = QRCodeUtils.generateCoAdminInviteQR(lgcId)
@@ -5247,19 +5609,21 @@ fun HomeScreen(navController: NavController) {
                                             Log.d("QRIcon", "User role not admin: $userRole")
                                         }
                                     }
-                            )
+                                )
+                            }
 
-                            // Link Icon - using clickable instead of IconButton
-                            Icon(
-                                imageVector = Icons.Rounded.Link,
-                                contentDescription = "Copy Invite Link",
-                                tint = Color(0xFF1565C0),
-                                modifier = Modifier
-                                    .size(36.dp)
-                                    .padding(8.dp)
-                                    .clickable {
-                                        Log.d("LinkIcon", "Link icon clicked, userRole: $userRole")
-                                        if (userRole == "admin" || userRole == "superadmin" || userRole == "lgu_admin") {
+                            // Link Icon - using clickable instead of IconButton (only visible to group owners)
+                            if (isGroupOwner) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Link,
+                                    contentDescription = "Copy Invite Link",
+                                    tint = Color(0xFF1565C0),
+                                    modifier = Modifier
+                                        .size(36.dp)
+                                        .padding(8.dp)
+                                        .clickable {
+                                            Log.d("LinkIcon", "Link icon clicked, userRole: $userRole, isGroupOwner: $isGroupOwner")
+                                            if (isGroupOwner) {
                                             val lgcId = auth.currentUser?.uid ?: ""
                                             Log.d("LinkIcon", "Generating QR for lgcId: $lgcId")
                                             val invite = QRCodeUtils.generateCoAdminInviteQR(lgcId)
@@ -5275,10 +5639,11 @@ fun HomeScreen(navController: NavController) {
                                                 Toast.makeText(context, "Failed to generate QR code", Toast.LENGTH_SHORT).show()
                                             }
                                         } else {
-                                            Log.d("LinkIcon", "User role not admin: $userRole")
+                                            Log.d("LinkIcon", "User not group owner: userRole=$userRole, isGroupOwner=$isGroupOwner")
                                         }
                                     }
-                            )
+                                )
+                            }
                         }
                     }
                 }
@@ -5489,25 +5854,61 @@ fun HomeScreen(navController: NavController) {
                                                 ) {
                                                     Button(
                                                         onClick = {
-                                                            // Approve logic will be implemented in Step 5
+                                                            Toast.makeText(context, "🔄 Starting approval process...", Toast.LENGTH_SHORT).show()
+                                                            Log.d("ApprovalFlow", "=== APPROVAL BUTTON CLICKED ===")
                                                             scope.launch {
                                                                 try {
-                                                                    val currentLgcId =
-                                                                        auth.currentUser?.uid ?: ""
+                                                                    val currentLgcId = auth.currentUser?.uid ?: ""
+                                                                    Toast.makeText(context, "Approving as admin: $currentLgcId", Toast.LENGTH_SHORT).show()
+                                                                    Log.d("ApprovalFlow", "Starting approval for userId=$userId, lgcId=$currentLgcId")
 
-                                                                    // Update user role to lgu_admin
-                                                                    Firebase.firestore.collection("users")
+                                                                    // Step 1: Update user role to lgu_admin and set lgc_id using SET with merge (more reliable)
+                                                                    val updateData = mapOf(
+                                                                        "role" to "lgu_admin",
+                                                                        "lgc_id" to currentLgcId,
+                                                                        "department" to userDepartment
+                                                                    )
+                                                                    Log.d("ApprovalFlow", "Writing data: $updateData")
+                                                                    
+                                                                    try {
+                                                                        Firebase.firestore.collection("users")
+                                                                            .document(userId)
+                                                                            .set(updateData, com.google.firebase.firestore.SetOptions.merge())
+                                                                            .await()
+                                                                        Log.d("ApprovalFlow", "✓ User document updated successfully with SET+merge")
+                                                                    } catch (e: Exception) {
+                                                                        Log.e("ApprovalFlow", "✗ FAILED to update user document!", e)
+                                                                        Toast.makeText(
+                                                                            context,
+                                                                            "Error updating user: ${e.message}",
+                                                                            Toast.LENGTH_LONG
+                                                                        ).show()
+                                                                        throw e
+                                                                    }
+
+                                                                    // Step 2: Verify the update worked by reading back the document
+                                                                    Log.d("ApprovalFlow", "Step 2: Verifying update...")
+                                                                    val verifyDoc = Firebase.firestore.collection("users")
                                                                         .document(userId)
-                                                                        .update(
-                                                                            mapOf(
-                                                                                "role" to "lgu_admin",
-                                                                                "lgc_id" to currentLgcId,
-                                                                                "department" to userDepartment
-                                                                            )
-                                                                        )
+                                                                        .get()
                                                                         .await()
+                                                                    
+                                                                    val verifiedRole = verifyDoc.getString("role")
+                                                                    val verifiedLgcId = verifyDoc.getString("lgc_id")
+                                                                    Log.d("ApprovalFlow", "Database shows - role=$verifiedRole, lgc_id=$verifiedLgcId | Expected: role=lgu_admin, lgc_id=$currentLgcId")
+                                                                    
+                                                                    if (verifiedRole != "lgu_admin" || verifiedLgcId != currentLgcId) {
+                                                                        Log.e("ApprovalFlow", "❌ CRITICAL: Update did not persist! DB values don't match expected. This points to Firestore security rules or a write conflict.")
+                                                                        Toast.makeText(
+                                                                            context,
+                                                                            "⚠️ Update failed to persist. Check Firestore rules for users/$userId. Actual: role=$verifiedRole, lgc_id=$verifiedLgcId",
+                                                                            Toast.LENGTH_LONG
+                                                                        ).show()
+                                                                        return@launch
+                                                                    }
+                                                                    Log.d("ApprovalFlow", "✓✓ Verification PASSED - data persisted correctly!")
 
-                                                                    // Update request status to approved
+                                                                    // Step 3: Update request status to approved
                                                                     Firebase.firestore.collection("pending_admins")
                                                                         .document(requestId)
                                                                         .update(
@@ -5517,21 +5918,15 @@ fun HomeScreen(navController: NavController) {
                                                                             )
                                                                         )
                                                                         .await()
+                                                                    Log.d("ApprovalFlow", "Pending request marked as approved")
 
                                                                     // Refresh the pending requests list
-                                                                    val updatedResult =
-                                                                        Firebase.firestore
-                                                                            .collection("pending_admins")
-                                                                            .whereEqualTo(
-                                                                                "lgcId",
-                                                                                currentLgcId
-                                                                            )
-                                                                            .whereEqualTo(
-                                                                                "status",
-                                                                                "pending"
-                                                                            )
-                                                                            .get()
-                                                                            .await()
+                                                                    val updatedResult = Firebase.firestore
+                                                                        .collection("pending_admins")
+                                                                        .whereEqualTo("lgcId", currentLgcId)
+                                                                        .whereEqualTo("status", "pending")
+                                                                        .get()
+                                                                        .await()
 
                                                                     pendingCoAdmins =
                                                                         updatedResult.documents.map { doc ->
@@ -5543,10 +5938,14 @@ fun HomeScreen(navController: NavController) {
                                                                                 "userEmail" to (doc.getString(
                                                                                     "userEmail"
                                                                                 ) ?: "" as Any),
-                                                                                "createdAt" to (doc.getTimestamp(
-                                                                                    "createdAt"
-                                                                                )
-                                                                                    ?: com.google.firebase.Timestamp.now() as Any),
+                                                                                "createdAt" to (try {
+                                                                                    doc.getTimestamp(
+                                                                                        "createdAt"
+                                                                                    ) ?: com.google.firebase.Timestamp.now()
+                                                                                } catch (e: Exception) {
+                                                                                    val ms = doc.getLong("createdAt") ?: 0L
+                                                                                    if (ms > 0) com.google.firebase.Timestamp(ms / 1000, 0) else com.google.firebase.Timestamp.now()
+                                                                                } as Any),
                                                                                 "userId" to (doc.getString(
                                                                                     "userId"
                                                                                 ) ?: "" as Any)
@@ -5555,14 +5954,16 @@ fun HomeScreen(navController: NavController) {
 
                                                                     Toast.makeText(
                                                                         context,
-                                                                        "$userName approved as co-admin",
+                                                                        "$userName approved as co-admin ✓",
                                                                         Toast.LENGTH_SHORT
                                                                     ).show()
+                                                                    Log.d("ApprovalFlow", "Approval completed successfully")
                                                                 } catch (e: Exception) {
+                                                                    Log.e("ApprovalFlow", "Approval failed: ${e.message}", e)
                                                                     Toast.makeText(
                                                                         context,
                                                                         "Error approving request: ${e.message}",
-                                                                        Toast.LENGTH_SHORT
+                                                                        Toast.LENGTH_LONG
                                                                     ).show()
                                                                 }
                                                             }
@@ -5619,10 +6020,14 @@ fun HomeScreen(navController: NavController) {
                                                                                 "userEmail" to (doc.getString(
                                                                                     "userEmail"
                                                                                 ) ?: "" as Any),
-                                                                                "createdAt" to (doc.getTimestamp(
-                                                                                    "createdAt"
-                                                                                )
-                                                                                    ?: com.google.firebase.Timestamp.now() as Any),
+                                                                                "createdAt" to (try {
+                                                                                    doc.getTimestamp(
+                                                                                        "createdAt"
+                                                                                    ) ?: com.google.firebase.Timestamp.now()
+                                                                                } catch (e: Exception) {
+                                                                                    val ms = doc.getLong("createdAt") ?: 0L
+                                                                                    if (ms > 0) com.google.firebase.Timestamp(ms / 1000, 0) else com.google.firebase.Timestamp.now()
+                                                                                } as Any),
                                                                                 "userId" to (doc.getString(
                                                                                     "userId"
                                                                                 ) ?: "" as Any)
@@ -5681,218 +6086,104 @@ fun HomeScreen(navController: NavController) {
                     color = Color(0xFFEEEEEE)
                 )
 
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(bottom = 12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
+                // GROUP OWNER Section (only for lgu_admin users)
+                if (userRole == "lgu_admin") {
                     Text(
-                        text = "Co-Admins",
+                        text = "Group Owner",
                         style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(bottom = 12.dp)
                     )
 
-                    // Co-admin count badge
-                    Card(
-                        modifier = Modifier
-                            .wrapContentSize(),
-                        shape = RoundedCornerShape(12.dp),
-                        colors = CardDefaults.cardColors(containerColor = Color(0xFF1565C0))
-                    ) {
-                        Text(
-                            text = coAdminsList.size.toString(),
-                            style = MaterialTheme.typography.labelSmall,
-                            color = Color.White,
-                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                }
-
-                if (loadingCoAdmins) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(80.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        CircularProgressIndicator(modifier = Modifier.size(32.dp))
-                    }
-                } else if (coAdminsList.isEmpty()) {
-                    Card(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(80.dp),
-                        shape = RoundedCornerShape(12.dp),
-                        colors = CardDefaults.cardColors(containerColor = Color(0xFFF5F5F5))
-                    ) {
+                    if (loadingGroupOwner) {
                         Box(
-                            modifier = Modifier.fillMaxSize(),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(80.dp),
                             contentAlignment = Alignment.Center
                         ) {
-                            Text(
-                                text = "No co-admins yet",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = Color.Gray
-                            )
+                            CircularProgressIndicator(modifier = Modifier.size(32.dp))
                         }
-                    }
-                } else {
-                    LazyColumn(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        items(coAdminsList.size) { index ->
-                            val coAdmin = coAdminsList[index]
-                            val displayName = coAdmin["displayName"] as? String ?: "Unknown"
-                            val email = coAdmin["email"] as? String ?: ""
-                            val coAdminId = coAdmin["id"] as? String ?: ""
-                            val joinedDate =
-                                coAdmin["createdAt"] as? com.google.firebase.Timestamp
-                            val formattedDate = if (joinedDate != null) {
-                                java.text.DateFormat.getDateInstance(java.text.DateFormat.SHORT)
-                                    .format(joinedDate.toDate())
-                            } else {
-                                "Date unknown"
-                            }
+                    } else if (groupOwnerData != null) {
+                        val ownerName = groupOwnerData!!["displayName"] as? String ?: "Unknown"
+                        val ownerEmail = groupOwnerData!!["email"] as? String ?: ""
+                        val ownerId = groupOwnerData!!["id"] as? String ?: ""
 
-                            Card(
+                        Card(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(bottom = 16.dp),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFFF5F5F5)),
+                            elevation = CardDefaults.cardElevation(0.5.dp)
+                        ) {
+                            Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .padding(horizontal = 4.dp),
-                                shape = RoundedCornerShape(8.dp),
-                                colors = CardDefaults.cardColors(
-                                    containerColor = Color(
-                                        0xFFFAFAFA
-                                    )
-                                ),
-                                border = BorderStroke(1.dp, Color(0xFFE0E0E0))
+                                    .padding(12.dp),
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Row(
+                                // Avatar
+                                Box(
                                     modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(12.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.SpaceBetween
+                                        .size(44.dp)
+                                        .background(
+                                            Color(0xFF43A047),
+                                            CircleShape
+                                        ),
+                                    contentAlignment = Alignment.Center
                                 ) {
-                                    Column(
-                                        modifier = Modifier.weight(1f)
+                                    Text(
+                                        ownerName.take(1).uppercase(),
+                                        color = Color.White,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+
+                                Spacer(modifier = Modifier.width(12.dp))
+
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(ownerName, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                                    Text(ownerEmail, fontSize = 12.sp, color = Color.Gray)
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Surface(
+                                        color = Color(0xFF43A047).copy(alpha = 0.2f),
+                                        shape = RoundedCornerShape(4.dp)
                                     ) {
                                         Text(
-                                            text = displayName,
-                                            style = MaterialTheme.typography.labelLarge,
+                                            "GROUP OWNER",
+                                            color = Color(0xFF43A047),
+                                            fontSize = 10.sp,
                                             fontWeight = FontWeight.Bold,
-                                            color = Color.Black
+                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                                         )
-                                        Spacer(modifier = Modifier.height(2.dp))
-                                        Text(
-                                            text = email,
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = Color.Gray
-                                        )
-                                        Spacer(modifier = Modifier.height(4.dp))
-                                        Text(
-                                            text = "Joined: $formattedDate",
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = Color(0xFF666666),
-                                            fontSize = 10.sp
-                                        )
-                                    }
-
-                                    // Remove button - for admin, superadmin, and lgu_admin
-                                    if (userRole == "admin" || userRole == "superadmin" || userRole == "lgu_admin") {
-                                        Button(
-                                            onClick = {
-                                                scope.launch {
-                                                    try {
-                                                        // Change role back to user
-                                                        Firebase.firestore.collection("users")
-                                                            .document(coAdminId)
-                                                            .update(
-                                                                mapOf(
-                                                                    "role" to "user",
-                                                                    "lgc_id" to ""
-                                                                )
-                                                            )
-                                                            .await()
-
-                                                        // Refresh the co-admins list
-                                                        val currentLgcId =
-                                                            auth.currentUser?.uid ?: ""
-                                                        val updatedResult =
-                                                            Firebase.firestore
-                                                                .collection("users")
-                                                                .whereEqualTo(
-                                                                    "lgc_id",
-                                                                    currentLgcId
-                                                                )
-                                                                .whereEqualTo(
-                                                                    "role",
-                                                                    "lgu_admin"
-                                                                )
-                                                                .get()
-                                                                .await()
-
-                                                        coAdminsList =
-                                                            updatedResult.documents.map { doc ->
-                                                                mapOf(
-                                                                    "id" to (doc.id as Any),
-                                                                    "displayName" to (doc.getString(
-                                                                        "displayName"
-                                                                    )
-                                                                        ?: doc.getString("name")
-                                                                        ?: "Unknown" as Any),
-                                                                    "email" to (doc.getString(
-                                                                        "email"
-                                                                    ) ?: "" as Any),
-                                                                    "createdAt" to (doc.getTimestamp(
-                                                                        "createdAt"
-                                                                    ) ?: doc.getTimestamp(
-                                                                        "joinedDate"
-                                                                    )
-                                                                    ?: com.google.firebase.Timestamp.now() as Any)
-                                                                )
-                                                            }
-
-                                                        Toast.makeText(
-                                                            context,
-                                                            "$displayName has been removed as co-admin",
-                                                            Toast.LENGTH_SHORT
-                                                        ).show()
-                                                    } catch (e: Exception) {
-                                                        Toast.makeText(
-                                                            context,
-                                                            "Error removing co-admin: ${e.message}",
-                                                            Toast.LENGTH_SHORT
-                                                        ).show()
-                                                    }
-                                                }
-                                            },
-                                            modifier = Modifier
-                                                .height(36.dp)
-                                                .wrapContentWidth(),
-                                            colors = ButtonDefaults.buttonColors(
-                                                containerColor = Color(0xFFF44336)
-                                            ),
-                                            shape = RoundedCornerShape(6.dp),
-                                            contentPadding = PaddingValues(
-                                                horizontal = 12.dp,
-                                                vertical = 4.dp
-                                            )
-                                        ) {
-                                            Text(
-                                                text = "Remove",
-                                                color = Color.White,
-                                                style = MaterialTheme.typography.labelSmall
-                                            )
-                                        }
                                     }
                                 }
                             }
                         }
                     }
+
+                    // See Members Button
+                    Button(
+                        onClick = { showMembersSheet = true },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 16.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1565C0)),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.People,
+                            contentDescription = null,
+                            modifier = Modifier
+                                .size(18.dp)
+                                .padding(end = 8.dp),
+                            tint = Color.White
+                        )
+                        Text("See Members", color = Color.White, fontWeight = FontWeight.Bold)
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
                 }
 
                 Spacer(modifier = Modifier.height(24.dp))
@@ -6063,26 +6354,50 @@ fun HomeScreen(navController: NavController) {
                     Log.d("QRScanner", "QR code scanned: $scannedValue")
                     showQrScanner = false
                     // Parse the deep link and navigate to ProcessCoAdminInviteScreen
-                    if (!scannedValue.isNullOrBlank() && scannedValue.startsWith("safeko://invite")) {
-                        // Extract token and lgcId from the deep link
-                        try {
-                            val uri = android.net.Uri.parse(scannedValue)
-                            val token = uri.getQueryParameter("token")
-                            val lgcId = uri.getQueryParameter("lgcId")
-                            if (!token.isNullOrBlank() && !lgcId.isNullOrBlank()) {
-                                Log.d("QRScanner", "Navigating to process_invite with token=$token, lgcId=$lgcId")
-                                // Navigate using the route name defined in MainActivity
-                                navController.navigate("process_invite?token=${java.net.URLEncoder.encode(token, "UTF-8")}&lgcId=${java.net.URLEncoder.encode(lgcId, "UTF-8")}")
-                            } else {
-                                Toast.makeText(context, "Invalid QR code format - missing token or LGU ID", Toast.LENGTH_SHORT).show()
-                                Log.w("QRScanner", "Invalid QR format - token: $token, lgcId: $lgcId")
+                    if (!scannedValue.isNullOrBlank()) {
+                        Log.d("QRScanner", "Checking if starts with safeko://invite: ${scannedValue.startsWith("safeko://invite")}")
+                        
+                        when {
+                            scannedValue.startsWith("safeko://invite") -> {
+                                // Extract token and lgcId from the deep link
+                                try {
+                                    val uri = android.net.Uri.parse(scannedValue)
+                                    val token = uri.getQueryParameter("token")
+                                    val lgcId = uri.getQueryParameter("lgcId")
+                                    Log.d("QRScanner", "Extracted - token: $token, lgcId: $lgcId")
+                                    if (!token.isNullOrBlank() && !lgcId.isNullOrBlank()) {
+                                        Log.d("QRScanner", "Navigating to process_invite with token=$token, lgcId=$lgcId")
+                                        // Navigate using the route name defined in MainActivity
+                                        navController.navigate("process_invite?token=${java.net.URLEncoder.encode(token, "UTF-8")}&lgcId=${java.net.URLEncoder.encode(lgcId, "UTF-8")}")
+                                    } else {
+                                        Toast.makeText(context, "Invalid QR code format - missing token or LGU ID", Toast.LENGTH_SHORT).show()
+                                        Log.w("QRScanner", "Invalid QR format - token: $token, lgcId: $lgcId")
+                                    }
+                                } catch (e: Exception) {
+                                    Toast.makeText(context, "Error processing QR code: ${e.message}", Toast.LENGTH_SHORT).show()
+                                    Log.e("QRScanner", "Error parsing QR code", e)
+                                }
                             }
-                        } catch (e: Exception) {
-                            Toast.makeText(context, "Error processing QR code: ${e.message}", Toast.LENGTH_SHORT).show()
-                            Log.e("QRScanner", "Error parsing QR code", e)
+                            scannedValue.contains("safeko") && scannedValue.contains("invite") -> {
+                                Log.d("QRScanner", "Detected SafeKo invite but wrong format, trying to parse anyway")
+                                try {
+                                    val uri = android.net.Uri.parse(scannedValue)
+                                    val token = uri.getQueryParameter("token")
+                                    val lgcId = uri.getQueryParameter("lgcId")
+                                    if (!token.isNullOrBlank() && !lgcId.isNullOrBlank()) {
+                                        navController.navigate("process_invite?token=${java.net.URLEncoder.encode(token, "UTF-8")}&lgcId=${java.net.URLEncoder.encode(lgcId, "UTF-8")}")
+                                    } else {
+                                        Toast.makeText(context, "This is not a valid SafeKo invite QR code", Toast.LENGTH_SHORT).show()
+                                    }
+                                } catch (e: Exception) {
+                                    Toast.makeText(context, "Error: ${e.message}", Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                            else -> {
+                                Toast.makeText(context, "This is not a SafeKo invite QR code", Toast.LENGTH_SHORT).show()
+                                Log.d("QRScanner", "Not a SafeKo QR: $scannedValue")
+                            }
                         }
-                    } else {
-                        Toast.makeText(context, "This is not a SafeKo invite QR code", Toast.LENGTH_SHORT).show()
                     }
                 },
                 onClose = {
@@ -6105,6 +6420,7 @@ fun HomeScreen(navController: NavController) {
                 initialPhoneNumber = userPhoneNumber,
                 currentLocation = currentUserAddress,
                 isPhoneVerified = false, // Not using full auth flow here to save space, user should edit in Profile
+                userRole = userRole, // NEW: Pass user role for password change feature
                 onChangePhoto = {
                     pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
                 },
@@ -6359,6 +6675,135 @@ fun HomeScreen(navController: NavController) {
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Medium
                 )
+            }
+        }
+    }
+
+    // Members Sheet - displays all co-admins
+    if (showMembersSheet && userRole == "lgu_admin") {
+        val membersSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = false)
+        ModalBottomSheet(
+            onDismissRequest = { showMembersSheet = false },
+            sheetState = membersSheetState,
+            containerColor = Color.White,
+            shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
+            dragHandle = { BottomSheetDefaults.DragHandle() },
+            scrimColor = Color.Black.copy(alpha = 0.4f)
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(24.dp)
+            ) {
+                // Title
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 20.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.People,
+                        contentDescription = null,
+                        tint = Color(0xFF1565C0),
+                        modifier = Modifier.size(28.dp)
+                    )
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Text(
+                        text = "Team Members",
+                        style = MaterialTheme.typography.headlineMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.Black
+                    )
+                }
+
+                if (loadingCoAdmins) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(200.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        CircularProgressIndicator()
+                    }
+                } else if (coAdminsList.isEmpty()) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(200.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            "No co-admins yet",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = Color.Gray
+                        )
+                    }
+                } else {
+                    LazyColumn(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        items(coAdminsList.size) { index ->
+                            val admin = coAdminsList[index]
+                            val adminName = admin["displayName"] as? String ?: admin["fullName"] as? String ?: "Unknown"
+                            val adminEmail = admin["email"] as? String ?: ""
+
+                            Card(
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(12.dp),
+                                colors = CardDefaults.cardColors(containerColor = Color(0xFFF5F5F5)),
+                                elevation = CardDefaults.cardElevation(0.5.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(12.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    // Avatar
+                                    Box(
+                                        modifier = Modifier
+                                            .size(40.dp)
+                                            .background(
+                                                Color(0xFF1565C0),
+                                                CircleShape
+                                            ),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Text(
+                                            adminName.take(1).uppercase(),
+                                            color = Color.White,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
+
+                                    Spacer(modifier = Modifier.width(12.dp))
+
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(adminName, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                                        Text(adminEmail, fontSize = 12.sp, color = Color.Gray)
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        Surface(
+                                            color = Color(0xFF1565C0).copy(alpha = 0.2f),
+                                            shape = RoundedCornerShape(4.dp)
+                                        ) {
+                                            Text(
+                                                "CO-ADMIN",
+                                                color = Color(0xFF1565C0),
+                                                fontSize = 10.sp,
+                                                fontWeight = FontWeight.Bold,
+                                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
             }
         }
     }
