@@ -35,6 +35,7 @@ import com.example.safeko.services.FaceVerificationService
 import kotlinx.coroutines.launch
 import java.io.File
 import java.util.concurrent.Executor
+import kotlin.math.abs
 
 /**
  * Composable for face verification with camera capture
@@ -51,7 +52,9 @@ fun FaceVerificationModal(
     
     var hasCameraPermission by remember { mutableStateOf(false) }
     var isCapturing by remember { mutableStateOf(false) }
-    var captureStatus by remember { mutableStateOf("Position your face in the frame") }
+    var isAnalyzingFrame by remember { mutableStateOf(false) }
+    var stableFaceChecks by remember { mutableStateOf(0) }
+    var captureStatus by remember { mutableStateOf("Hold your face inside the frame") }
     var previewView: PreviewView? by remember { mutableStateOf(null) }
     var imageCapture: ImageCapture? by remember { mutableStateOf(null) }
     
@@ -73,6 +76,78 @@ fun FaceVerificationModal(
             hasCameraPermission = true
         } else {
             cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+        }
+    }
+
+    // Auto-scan loop: capture and evaluate snapshots until a stable, high-quality face is found.
+    LaunchedEffect(hasCameraPermission, imageCapture, isCapturing) {
+        if (!hasCameraPermission || imageCapture == null || isCapturing) {
+            return@LaunchedEffect
+        }
+
+        while (hasCameraPermission && imageCapture != null && !isCapturing) {
+            if (!isAnalyzingFrame) {
+                isAnalyzingFrame = true
+                captureFaceImage(
+                    imageCapture = imageCapture!!,
+                    context = context,
+                    lifecycleOwner = lifecycleOwner,
+                    onCaptureComplete = { bitmap ->
+                        scope.launch {
+                            try {
+                                val faceResult = faceVerificationService.detectFaces(bitmap)
+
+                                faceResult.onSuccess { faces ->
+                                    if (faces.isEmpty()) {
+                                        stableFaceChecks = 0
+                                        captureStatus = "No face detected. Center your face in the frame."
+                                        return@onSuccess
+                                    }
+
+                                    val faceData = faces[0]
+                                    val qualityResult = evaluateFaceQuality(faceData, bitmap)
+
+                                    if (qualityResult.first) {
+                                        stableFaceChecks += 1
+                                        captureStatus = "Good. Hold still... ${stableFaceChecks}/3"
+
+                                        if (stableFaceChecks >= 3) {
+                                            isCapturing = true
+                                            captureStatus = "Face locked. Finalizing verification..."
+                                            val embeddingString = faceVerificationService.embeddingToString(faceData.embedding)
+                                            onFaceVerified(embeddingString, bitmap)
+                                            onDismiss()
+                                        }
+                                    } else {
+                                        stableFaceChecks = 0
+                                        captureStatus = qualityResult.second
+                                    }
+                                }
+
+                                faceResult.onFailure { error ->
+                                    stableFaceChecks = 0
+                                    captureStatus = "${error.message ?: "Face check failed"}. Try again."
+                                    Log.e("FaceVerification", "Error: ${error.message}")
+                                }
+                            } catch (e: Exception) {
+                                stableFaceChecks = 0
+                                captureStatus = "Error processing face. Please try again."
+                                Log.e("FaceVerification", "Exception: ${e.message}")
+                            } finally {
+                                isAnalyzingFrame = false
+                            }
+                        }
+                    },
+                    onCaptureError = { errorMessage ->
+                        stableFaceChecks = 0
+                        captureStatus = "Camera capture failed. Adjust lighting and hold still."
+                        isAnalyzingFrame = false
+                        Log.e("FaceVerification", errorMessage)
+                    }
+                )
+            }
+
+            kotlinx.coroutines.delay(650)
         }
     }
     
@@ -175,12 +250,12 @@ fun FaceVerificationModal(
                                 style = MaterialTheme.typography.bodySmall
                             )
                             Text(
-                                "• Face must be clearly visible",
+                                "• Keep full face inside frame",
                                 color = Color(0xFFB0BEC5),
                                 style = MaterialTheme.typography.bodySmall
                             )
                             Text(
-                                "• Minimize head rotation",
+                                "• Hold still for auto scan",
                                 color = Color(0xFFB0BEC5),
                                 style = MaterialTheme.typography.bodySmall
                             )
@@ -195,71 +270,85 @@ fun FaceVerificationModal(
                         }
                     }
                 }
-                
-                // Capture Button
-                FloatingActionButton(
-                    onClick = {
-                        if (!isCapturing && imageCapture != null) {
-                            isCapturing = true
-                            captureStatus = "Capturing face..."
-                            captureFaceImage(
-                                imageCapture!!,
-                                context,
-                                lifecycleOwner
-                            ) { bitmap ->
-                                scope.launch {
-                                    try {
-                                        val faceResult = faceVerificationService.detectFaces(bitmap)
-                                        
-                                        faceResult.onSuccess { faces ->
-                                            if (faces.isNotEmpty()) {
-                                                val faceData = faces[0]
-                                                
-                                                // Check confidence
-                                                if (faceData.confidenceScore >= 0.5f) {
-                                                    val embeddingString = faceVerificationService.embeddingToString(
-                                                        faceData.embedding
-                                                    )
-                                                    captureStatus = "✅ Face verified! Processing..."
-                                                    
-                                                    kotlinx.coroutines.delay(500)
-                                                    onFaceVerified(embeddingString, bitmap)
-                                                    onDismiss()
-                                                } else {
-                                                    captureStatus = "❌ Face quality too low. Try again."
-                                                    isCapturing = false
-                                                }
-                                            }
-                                        }
-                                        
-                                        faceResult.onFailure { error ->
-                                            captureStatus = "❌ ${error.message}"
-                                            isCapturing = false
-                                            Log.e("FaceVerification", "Error: ${error.message}")
-                                        }
-                                    } catch (e: Exception) {
-                                        captureStatus = "❌ Error processing face"
-                                        isCapturing = false
-                                        Log.e("FaceVerification", "Exception: ${e.message}")
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    modifier = Modifier.size(64.dp),
-                    shape = CircleShape,
-                    containerColor = Color(0xFF29B6F6),
-                    contentColor = Color.White
+
+                Surface(
+                    shape = RoundedCornerShape(24.dp),
+                    color = Color(0xFF29B6F6),
+                    modifier = Modifier.height(48.dp)
                 ) {
-                    Icon(
-                        Icons.Filled.PhotoCamera,
-                        contentDescription = "Capture",
-                        modifier = Modifier.size(32.dp)
-                    )
+                    Row(
+                        modifier = Modifier
+                            .padding(horizontal = 18.dp)
+                            .fillMaxHeight(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        if (!isCapturing) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                color = Color.White,
+                                strokeWidth = 2.dp
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Text(
+                                text = "Auto scanning...",
+                                color = Color.White,
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                        } else {
+                            Text(
+                                text = "Processing...",
+                                color = Color.White,
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+private fun evaluateFaceQuality(
+    faceData: FaceVerificationService.FaceData,
+    bitmap: Bitmap
+): Pair<Boolean, String> {
+    val face = faceData.face
+
+    if (faceData.confidenceScore < 0.6f) {
+        return false to "Face quality too low. Improve lighting."
+    }
+
+    if (abs(face.headEulerAngleX) > 18 || abs(face.headEulerAngleY) > 18 || abs(face.headEulerAngleZ) > 18) {
+        return false to "Keep your head straight and still."
+    }
+
+    val box = face.boundingBox
+    val width = bitmap.width.toFloat()
+    val height = bitmap.height.toFloat()
+
+    val marginX = width * 0.04f
+    val marginY = height * 0.04f
+    if (box.left < marginX || box.top < marginY || box.right > width - marginX || box.bottom > height - marginY) {
+        return false to "Move your face fully inside the frame."
+    }
+
+    val faceAreaRatio = (box.width() * box.height()).toFloat() / (width * height)
+    if (faceAreaRatio < 0.08f) {
+        return false to "Move closer to the camera."
+    }
+    if (faceAreaRatio > 0.6f) {
+        return false to "Move slightly farther from the camera."
+    }
+
+    val faceCenterX = box.exactCenterX()
+    val faceCenterY = box.exactCenterY()
+    val centerDx = abs(faceCenterX - width / 2f)
+    val centerDy = abs(faceCenterY - height / 2f)
+    if (centerDx > width * 0.2f || centerDy > height * 0.2f) {
+        return false to "Center your face in the frame."
+    }
+
+    return true to "Good"
 }
 
 /**
@@ -315,7 +404,8 @@ private fun captureFaceImage(
     imageCapture: ImageCapture,
     context: Context,
     lifecycleOwner: LifecycleOwner,
-    onCaptureComplete: (Bitmap) -> Unit
+    onCaptureComplete: (Bitmap) -> Unit,
+    onCaptureError: (String) -> Unit
 ) {
     val outputFile = File(context.cacheDir, "face_capture.jpg")
     val outputFileOptions = ImageCapture.OutputFileOptions.Builder(outputFile).build()
@@ -330,15 +420,21 @@ private fun captureFaceImage(
                     if (bitmap != null) {
                         onCaptureComplete(bitmap)
                     } else {
-                        Log.e("FaceVerification", "Failed to decode bitmap")
+                        val error = "Failed to decode captured image"
+                        Log.e("FaceVerification", error)
+                        onCaptureError(error)
                     }
                 } catch (e: Exception) {
-                    Log.e("FaceVerification", "Error processing captured image: ${e.message}")
+                    val error = "Error processing captured image: ${e.message}"
+                    Log.e("FaceVerification", error)
+                    onCaptureError(error)
                 }
             }
             
             override fun onError(exception: ImageCaptureException) {
-                Log.e("FaceVerification", "Photo capture error: ${exception.message}")
+                val error = "Photo capture error: ${exception.message}"
+                Log.e("FaceVerification", error)
+                onCaptureError(error)
             }
         }
     )

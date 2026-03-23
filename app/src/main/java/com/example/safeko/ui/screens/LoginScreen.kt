@@ -3,6 +3,9 @@ package com.example.safeko.ui.screens
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
@@ -28,6 +31,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -56,12 +60,9 @@ fun LoginScreen(
     
     var email by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
-    var showPasswordField by remember { mutableStateOf(false) }
+    var isAdminLoginMode by remember { mutableStateOf(false) }
     var isPasswordVisible by remember { mutableStateOf(false) }
     var isLoading by remember { mutableStateOf(false) }
-    
-    // Check if this is a superadmin login attempt
-    val isSuperAdminEmail = email == "superadmin@test.com"
     
     // Configure Google Sign In
     val gso = remember {
@@ -127,6 +128,8 @@ fun LoginScreen(
         ),
         label = "floating_offset"
     )
+    val density = LocalDensity.current
+    val isKeyboardVisible = WindowInsets.ime.getBottom(density) > 0
 
     Column(
         modifier = Modifier
@@ -137,7 +140,7 @@ fun LoginScreen(
         Box(
             modifier = Modifier
                 .fillMaxWidth()
-                .weight(0.40f) // Increased weight to push things down a bit
+                .weight(0.47f)
                 .padding(top = 24.dp, start = 8.dp, end = 8.dp, bottom = 8.dp) // Added top padding
         ) {
             // This is a placeholder for the image frames collage
@@ -274,261 +277,41 @@ fun LoginScreen(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .weight(0.60f) 
+                .weight(0.53f)
                 .padding(horizontal = 24.dp, vertical = 8.dp)
+                .imePadding()
                 .verticalScroll(rememberScrollState()),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Top
         ) {
             Spacer(modifier = Modifier.height(12.dp))
             
-            Text(
-                text = "You're never off the map",
-                style = MaterialTheme.typography.headlineMedium, // Slightly larger
-                fontWeight = FontWeight.ExtraBold, // Extra bold for impact
-                color = Color.Black
-            )
-            Text(
-                text = "Safety, right where you are",
-                style = MaterialTheme.typography.bodyMedium, // Slightly larger
-                color = Color(0xFF757575),
-                modifier = Modifier.padding(top = 4.dp)
-            )
+            AnimatedVisibility(
+                visible = !isKeyboardVisible,
+                enter = fadeIn(animationSpec = tween(180)),
+                exit = fadeOut(animationSpec = tween(140))
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        text = "You're never off the map",
+                        style = MaterialTheme.typography.headlineMedium, // Slightly larger
+                        fontWeight = FontWeight.ExtraBold, // Extra bold for impact
+                        color = Color.Black
+                    )
+                    Text(
+                        text = "Safety, right where you are",
+                        style = MaterialTheme.typography.bodyMedium, // Slightly larger
+                        color = Color(0xFF757575),
+                        modifier = Modifier.padding(top = 4.dp)
+                    )
+                }
+            }
 
             Spacer(modifier = Modifier.height(24.dp))
 
-            OutlinedTextField(
-                value = email,
-                onValueChange = { email = it.trim() },
-                modifier = Modifier.fillMaxWidth(),
-                placeholder = { Text("Email", color = Color(0xFFBDBDBD)) },
-                shape = RoundedCornerShape(12.dp), // More rounded
-                singleLine = true,
-                enabled = !showPasswordField,
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedBorderColor = Color(0xFF2962FF),
-                    unfocusedBorderColor = Color(0xFFE0E0E0)
-                )
-            )
-
-            Spacer(modifier = Modifier.height(12.dp))
-
-            // Show password field for superadmin or registered users
-            if (isSuperAdminEmail) {
-                OutlinedTextField(
-                    value = password,
-                    onValueChange = { password = it },
-                    modifier = Modifier.fillMaxWidth(),
-                    placeholder = { Text("Enter password", color = Color(0xFFBDBDBD)) },
-                    shape = RoundedCornerShape(12.dp),
-                    singleLine = true,
-                    visualTransformation = if (isPasswordVisible) VisualTransformation.None else PasswordVisualTransformation(),
-                    trailingIcon = {
-                        val icon = if (isPasswordVisible) Icons.Filled.VisibilityOff else Icons.Filled.Visibility
-                        IconButton(onClick = { isPasswordVisible = !isPasswordVisible }) {
-                            Icon(imageVector = icon, contentDescription = null, tint = Color(0xFF9E9E9E), modifier = Modifier.size(20.dp))
-                        }
-                    },
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = Color(0xFF2962FF),
-                        unfocusedBorderColor = Color(0xFFE0E0E0)
-                    )
-                )
-            } else if (showPasswordField) {
-                OutlinedTextField(
-                    value = password,
-                    onValueChange = { password = it },
-                    modifier = Modifier.fillMaxWidth(),
-                    placeholder = { Text("Enter password", color = Color(0xFFBDBDBD)) },
-                    shape = RoundedCornerShape(12.dp),
-                    singleLine = true,
-                    visualTransformation = if (isPasswordVisible) VisualTransformation.None else PasswordVisualTransformation(),
-                    trailingIcon = {
-                        val icon = if (isPasswordVisible) Icons.Filled.VisibilityOff else Icons.Filled.Visibility
-                        IconButton(onClick = { isPasswordVisible = !isPasswordVisible }) {
-                            Icon(imageVector = icon, contentDescription = null, tint = Color(0xFF9E9E9E), modifier = Modifier.size(20.dp))
-                        }
-                    },
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = Color(0xFF2962FF),
-                        unfocusedBorderColor = Color(0xFFE0E0E0)
-                    )
-                )
-            }
-
-            Spacer(modifier = Modifier.height(12.dp))
-
-            Button(
-                onClick = {
-                    if (isSuperAdminEmail) {
-                        // Superadmin password login
-                        if (email.isBlank() || password.isBlank()) {
-                            Toast.makeText(context, "Please enter email and password", Toast.LENGTH_SHORT).show()
-                            return@Button
-                        }
-                        
-                        // Check hardcoded superadmin credentials
-                        if (password == "admin123") {
-                            isLoading = true
-                            Log.d("LoginScreen", "Attempting superadmin login: $email")
-                            // Authenticate with Firebase Auth
-                            auth.signInWithEmailAndPassword(email, password)
-                                .addOnCompleteListener { task ->
-                                    if (task.isSuccessful) {
-                                        Log.d("LoginScreen", "Superadmin auth successful, UID: ${auth.currentUser?.uid}")
-                                        val uid = auth.currentUser?.uid ?: "superadmin"
-                                        
-                                        // Create/update Firestore record for superadmin
-                                        val superadminData = hashMapOf(
-                                            "uid" to uid,
-                                            "fullName" to "Super Administrator",
-                                            "email" to email,
-                                            "role" to "superadmin",
-                                            "name" to "Super Administrator",
-                                            "createdAt" to System.currentTimeMillis()
-                                        )
-                                        Log.d("LoginScreen", "Saving superadmin to Firestore: $superadminData")
-                                        
-                                        firestore.collection("users")
-                                            .document(uid)
-                                            .set(superadminData, SetOptions.merge())
-                                            .addOnSuccessListener {
-                                                Log.d("LoginScreen", "✓ Superadmin data saved successfully")
-                                                isLoading = false
-                                                Toast.makeText(context, "Superadmin logged in successfully", Toast.LENGTH_SHORT).show()
-                                                onLoginSuccess(email)
-                                            }
-                                            .addOnFailureListener { error ->
-                                                Log.e("LoginScreen", "✗ Failed to save superadmin data: ${error.message}", error)
-                                                isLoading = false
-                                                Toast.makeText(context, "Error saving superadmin data: ${error.message}", Toast.LENGTH_SHORT).show()
-                                            }
-                                    } else {
-                                        Log.e("LoginScreen", "✗ Auth failed: ${task.exception?.message}")
-                                        isLoading = false
-                                        Toast.makeText(context, "Invalid superadmin credentials: ${task.exception?.message}", Toast.LENGTH_SHORT).show()
-                                    }
-                                }
-                        } else {
-                            Toast.makeText(context, "Invalid password", Toast.LENGTH_SHORT).show()
-                        }
-                    } else if (!showPasswordField) {
-                        // Regular user: Check if email exists in database
-                        if (email.isBlank()) {
-                            Toast.makeText(context, "Please enter your email", Toast.LENGTH_SHORT).show()
-                            return@Button
-                        }
-                        
-                        isLoading = true
-                        // Check if email exists in users collection
-                        firestore.collection("users")
-                            .limit(1) // Just need to check existence
-                            .get()
-                            .addOnSuccessListener { _ ->
-                                // We have read access to the collection, now check the email
-                                firestore.collection("users")
-                                    .whereEqualTo("email", email)
-                                    .get()
-                                    .addOnSuccessListener { documents ->
-                                        isLoading = false
-                                        if (documents.isEmpty) {
-                                            // Email not found
-                                            Toast.makeText(context, "Email not found", Toast.LENGTH_SHORT).show()
-                                        } else {
-                                            // Email found, show password field
-                                            showPasswordField = true
-                                            password = ""
-                                        }
-                                    }
-                                    .addOnFailureListener { e ->
-                                        isLoading = false
-                                        Toast.makeText(context, "Error: ${e.message}", Toast.LENGTH_SHORT).show()
-                                    }
-                            }
-                            .addOnFailureListener { e ->
-                                // If we get permission denied here, it's likely a rules issue with collection-level queries
-                                // Fallback: Allow login attempt anyway, or handle specifically
-                                Log.w("LoginScreen", "Initial collection check failed: ${e.message}")
-                                
-                                // Alternative: Since we can't search THE WHOLE collection without a filter sometimes,
-                                // we just let the user try to log in with password if the first email check fails 
-                                // because of a simple 'PERMISSION_DENIED' on a filtered query.
-                                showPasswordField = true 
-                                isLoading = false
-                            }
-                    } else {
-                        // Regular user: Verify password
-                        if (password.isBlank()) {
-                            Toast.makeText(context, "Please enter password", Toast.LENGTH_SHORT).show()
-                            return@Button
-                        }
-                        
-                        isLoading = true
-                        auth.signInWithEmailAndPassword(email, password)
-                            .addOnCompleteListener { task ->
-                                isLoading = false
-                                if (task.isSuccessful) {
-                                    onLoginSuccess(email)
-                                } else {
-                                    Toast.makeText(context, "Invalid password", Toast.LENGTH_SHORT).show()
-                                }
-                            }
-                            .addOnFailureListener { e ->
-                                isLoading = false
-                                Toast.makeText(context, "Login failed: ${e.message}", Toast.LENGTH_SHORT).show()
-                            }
-                    }
-                },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(54.dp), // Slightly taller
-                shape = RoundedCornerShape(27.dp), // Pill shaped
-                enabled = !isLoading,
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2962FF))
-            ) {
-                Text(
-                    text = if (isSuperAdminEmail) {
-                        if (isLoading) "Signing in..." else "Sign In"
-                    } else if (!showPasswordField) {
-                        if (isLoading) "Checking email..." else "Continue"
-                    } else {
-                        if (isLoading) "Signing in..." else "Sign In"
-                    },
-                    color = Color.White,
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold
-                )
-            }
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            // Back button when showing Password or for superadmin
-            if (showPasswordField || isSuperAdminEmail) {
-                TextButton(onClick = {
-                    showPasswordField = false
-                    password = ""
-                    email = ""
-                }, modifier = Modifier.padding(bottom = 12.dp)) {
-                    Text(text = "← Back to Email", color = Color(0xFF2962FF), fontWeight = FontWeight.Bold)
-                }
-            }
-
-            // Show divider and Google only for regular users (not when showing password)
-            if (!isSuperAdminEmail && !showPasswordField) {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    HorizontalDivider(modifier = Modifier.weight(1f), color = Color(0xFFEEEEEE), thickness = 1.dp)
-                    Text(text = "OR", color = Color(0xFFBDBDBD), modifier = Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.bodySmall)
-                    HorizontalDivider(modifier = Modifier.weight(1f), color = Color(0xFFEEEEEE), thickness = 1.dp)
-                }
-
-                Spacer(modifier = Modifier.height(16.dp))
-
-                // Google Button
+            if (!isAdminLoginMode) {
                 OutlinedButton(
-                    onClick = { 
+                    onClick = {
                         googleSignInClient.signOut().addOnCompleteListener {
                             launcher.launch(googleSignInClient.signInIntent)
                         }
@@ -547,40 +330,147 @@ fun LoginScreen(
                         )
                         Spacer(modifier = Modifier.width(12.dp))
                         Text(
-                            text = "Continue with Google", 
+                            text = "Continue with Google",
                             color = Color.Black,
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Medium
                         )
                     }
                 }
-
-                Spacer(modifier = Modifier.height(24.dp))
-            }
-
-            // Footer Support Text (only for regular users)
-            if (!isSuperAdminEmail) {
-                Row(
+            } else {
+                OutlinedTextField(
+                    value = email,
+                    onValueChange = { email = it.trim() },
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.Center,
-                    verticalAlignment = Alignment.CenterVertically
+                    placeholder = { Text("Admin email", color = Color(0xFFBDBDBD)) },
+                    shape = RoundedCornerShape(12.dp),
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = Color(0xFF2962FF),
+                        unfocusedBorderColor = Color(0xFFE0E0E0)
+                    )
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    placeholder = { Text("Password", color = Color(0xFFBDBDBD)) },
+                    shape = RoundedCornerShape(12.dp),
+                    singleLine = true,
+                    visualTransformation = if (isPasswordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                    trailingIcon = {
+                        val icon = if (isPasswordVisible) Icons.Filled.VisibilityOff else Icons.Filled.Visibility
+                        IconButton(onClick = { isPasswordVisible = !isPasswordVisible }) {
+                            Icon(
+                                imageVector = icon,
+                                contentDescription = null,
+                                tint = Color(0xFF9E9E9E),
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                    },
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = Color(0xFF2962FF),
+                        unfocusedBorderColor = Color(0xFFE0E0E0)
+                    )
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                Button(
+                    onClick = {
+                        if (email.isBlank() || password.isBlank()) {
+                            Toast.makeText(context, "Please enter admin email and password", Toast.LENGTH_SHORT).show()
+                            return@Button
+                        }
+
+                        isLoading = true
+                        auth.signInWithEmailAndPassword(email, password)
+                            .addOnCompleteListener { task ->
+                                if (task.isSuccessful) {
+                                    val uid = auth.currentUser?.uid
+                                    if (uid == null) {
+                                        isLoading = false
+                                        Toast.makeText(context, "Admin login failed", Toast.LENGTH_SHORT).show()
+                                        return@addOnCompleteListener
+                                    }
+
+                                    firestore.collection("users").document(uid).get()
+                                        .addOnSuccessListener { doc ->
+                                            val role = doc.getString("role") ?: "user"
+                                            isLoading = false
+                                            if (role == "lgu_admin" || role == "superadmin") {
+                                                onLoginSuccess(email)
+                                            } else {
+                                                auth.signOut()
+                                                Toast.makeText(context, "This account is not an admin", Toast.LENGTH_SHORT).show()
+                                            }
+                                        }
+                                        .addOnFailureListener { e ->
+                                            isLoading = false
+                                            auth.signOut()
+                                            Toast.makeText(context, "Failed to verify admin role: ${e.message}", Toast.LENGTH_SHORT).show()
+                                        }
+                                } else {
+                                    isLoading = false
+                                    Toast.makeText(context, "Invalid admin credentials", Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                            .addOnFailureListener { e ->
+                                isLoading = false
+                                Toast.makeText(context, "Login failed: ${e.message}", Toast.LENGTH_SHORT).show()
+                            }
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(54.dp),
+                    shape = RoundedCornerShape(27.dp),
+                    enabled = !isLoading,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2962FF))
                 ) {
                     Text(
-                        text = "Can't sign in? ",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = Color(0xFF757575)
-                    )
-                    Text(
-                        text = "Customer Support",
-                        modifier = Modifier.clickable { onSupportClick() },
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = Color(0xFF03A9F4),
+                        text = if (isLoading) "Signing in..." else "Login as Admin",
+                        color = Color.White,
+                        style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
                     )
                 }
             }
+
+            Spacer(modifier = Modifier.height(24.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.Center,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = if (isAdminLoginMode) "Back to user login? " else "Need admin access? ",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Color(0xFF757575)
+                )
+                Text(
+                    text = if (isAdminLoginMode) "Continue with Google" else "Login as Admin",
+                    modifier = Modifier.clickable {
+                        val nextAdminMode = !isAdminLoginMode
+                        isAdminLoginMode = nextAdminMode
+                        email = ""
+                        password = ""
+                        // In admin mode, show typed password by default for easier entry.
+                        isPasswordVisible = nextAdminMode
+                        isLoading = false
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Color(0xFF03A9F4),
+                    fontWeight = FontWeight.Bold
+                )
+            }
             
-            Spacer(modifier = Modifier.height(32.dp))
+            Spacer(modifier = Modifier.height(12.dp))
         }
     }
 }

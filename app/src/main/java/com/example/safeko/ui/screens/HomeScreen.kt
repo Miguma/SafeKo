@@ -122,7 +122,6 @@ import com.example.safeko.services.NavigationService
 import com.example.safeko.services.ResponderTrackingService
 import com.example.safeko.services.FaceVerificationService
 import com.example.safeko.ui.components.ResponderApproachingModal
-import com.example.safeko.ui.components.FaceVerificationModal
 import com.example.safeko.model.NavigationStep
 import com.example.safeko.model.RemoteAlert
 import com.example.safeko.model.ActiveResponse
@@ -422,6 +421,7 @@ fun HomeScreen(navController: NavController) {
     var selectedLocation by remember { mutableStateOf<SearchResult?>(null) }
     var showLocationModal by remember { mutableStateOf(false) }
     var isNavigating by remember { mutableStateOf(false) }
+    var showCancelNavConfirm by remember { mutableStateOf(false) }
     var navigationSteps by remember { mutableStateOf<List<NavigationStep>>(emptyList()) }
     var currentStepIndex by remember { mutableStateOf(0) }
     var distanceToNextTurn by remember { mutableStateOf(0.0) }
@@ -634,6 +634,85 @@ fun HomeScreen(navController: NavController) {
         initial = emptyList()
     ) ?: mutableStateOf(emptyList())
 
+    fun applyDrivingCameraMode(target: LatLng? = null) {
+        mapLibreMap?.let { map ->
+            val lastKnown = map.locationComponent.lastKnownLocation
+            val focus = target ?: lastKnown?.let { LatLng(it.latitude, it.longitude) }
+            if (focus != null) {
+                val bearing =
+                    if (lastKnown != null && lastKnown.hasBearing()) lastKnown.bearing.toDouble() else map.cameraPosition.bearing
+                map.animateCamera(
+                    CameraUpdateFactory.newCameraPosition(
+                        CameraPosition.Builder()
+                            .target(focus)
+                            .zoom(18.0)
+                            .tilt(60.0)
+                            .bearing(bearing)
+                            .build()
+                    ),
+                    900
+                )
+            }
+            try {
+                map.locationComponent.cameraMode = CameraMode.TRACKING
+                map.locationComponent.renderMode = RenderMode.COMPASS
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    fun applyNormalCameraMode(recenter: Boolean) {
+        mapLibreMap?.let { map ->
+            try {
+                map.locationComponent.cameraMode = CameraMode.TRACKING
+                map.locationComponent.renderMode = RenderMode.COMPASS
+            } catch (_: Exception) {
+            }
+
+            val lastKnown = map.locationComponent.lastKnownLocation
+            if (recenter && lastKnown != null) {
+                map.animateCamera(
+                    CameraUpdateFactory.newCameraPosition(
+                        CameraPosition.Builder()
+                            .target(LatLng(lastKnown.latitude, lastKnown.longitude))
+                            .zoom(16.0)
+                            .tilt(0.0)
+                            .bearing(0.0)
+                            .build()
+                    ),
+                    700
+                )
+            }
+        }
+    }
+
+    fun cancelNavigationAndClearDestination() {
+        showLocationModal = false
+
+        // Stop service-driven navigation state
+        navigationService?.stopNavigation()
+
+        // Clear local navigation UI state immediately
+        isNavigating = false
+        navigationSteps = emptyList()
+        currentStepIndex = 0
+        distanceToNextTurn = 0.0
+
+        // Remove destination/search marker
+        selectedLocation = null
+        mapLibreMap?.getStyle { style ->
+            val searchSource = style.getSourceAs<GeoJsonSource>("search-result-source")
+            searchSource?.setGeoJson(FeatureCollection.fromFeatures(emptyList()))
+            if (style.getLayer("route-layer") != null) style.removeLayer("route-layer")
+            if (style.getSource("route-source") != null) style.removeSource("route-source")
+        }
+
+        // Return to normal map camera after navigation cancel
+        applyNormalCameraMode(recenter = true)
+
+        Toast.makeText(context, "Navigation Canceled", Toast.LENGTH_SHORT).show()
+    }
+
     LaunchedEffect(
         serviceIsNavigating,
         serviceSteps,
@@ -643,7 +722,11 @@ fun HomeScreen(navController: NavController) {
         mapLibreMap
     ) {
         if (serviceIsNavigating) {
+            val wasNavigating = isNavigating
             isNavigating = true
+            if (!wasNavigating) {
+                applyDrivingCameraMode()
+            }
             if (serviceSteps.isNotEmpty()) {
                 navigationSteps = serviceSteps
             }
@@ -712,6 +795,7 @@ fun HomeScreen(navController: NavController) {
                     if (style.getLayer("route-layer") != null) style.removeLayer("route-layer")
                     if (style.getSource("route-source") != null) style.removeSource("route-source")
                 }
+                applyNormalCameraMode(recenter = true)
                 Toast.makeText(context, "Navigation Ended", Toast.LENGTH_SHORT).show()
             }
         }
@@ -748,7 +832,6 @@ fun HomeScreen(navController: NavController) {
     var isUploadingPhoto by remember { mutableStateOf(false) }
     
     // Face Verification State
-    var showFaceVerificationModal by remember { mutableStateOf(false) }
     var isFaceVerified by remember { mutableStateOf(false) }
     var faceEmbedding by remember { mutableStateOf("") }
 
@@ -1194,41 +1277,6 @@ fun HomeScreen(navController: NavController) {
                 }
             }
         }
-
-    fun cancelNavigationAndClearDestination() {
-        showLocationModal = false
-
-        // Stop service-driven navigation state
-        navigationService?.stopNavigation()
-
-        // Clear local navigation UI state immediately
-        isNavigating = false
-        navigationSteps = emptyList()
-        currentStepIndex = 0
-        distanceToNextTurn = 0.0
-
-        // Remove destination/search marker
-        selectedLocation = null
-        mapLibreMap?.getStyle { style ->
-            val searchSource = style.getSourceAs<GeoJsonSource>("search-result-source")
-            searchSource?.setGeoJson(FeatureCollection.fromFeatures(emptyList()))
-            if (style.getLayer("route-layer") != null) style.removeLayer("route-layer")
-            if (style.getSource("route-source") != null) style.removeSource("route-source")
-        }
-
-        // Recenter on user's current location
-        val userLocation = mapLibreMap?.locationComponent?.lastKnownLocation
-        if (userLocation != null) {
-            mapLibreMap?.animateCamera(
-                CameraUpdateFactory.newLatLngZoom(
-                    LatLng(userLocation.latitude, userLocation.longitude),
-                    16.0
-                )
-            )
-        }
-
-        Toast.makeText(context, "Navigation Canceled", Toast.LENGTH_SHORT).show()
-    }
 
     // Handle Back Press to prevent white screen and handle overlays
     var backPressState by remember { mutableStateOf(0L) }
@@ -1736,6 +1784,33 @@ fun HomeScreen(navController: NavController) {
         }
     }
 
+    fun buildClusterFeatures(clusters: List<com.example.safeko.utils.ClusteredAlert>): List<Feature> {
+        return clusters.map { cluster ->
+            val point = Point.fromLngLat(cluster.centerLon, cluster.centerLat)
+            val feature = Feature.fromGeometry(point)
+
+            // Use cluster ID and highest severity type
+            feature.addStringProperty("clusterId", cluster.clusterId)
+            feature.addStringProperty("type", cluster.highestSeverityAlert.type)
+            feature.addStringProperty("isCritical", cluster.isCritical.toString())
+            feature.addNumberProperty("clusterSize", cluster.alerts.size.toLong())
+
+            // Determine icon based on critical status
+            val iconImage = if (cluster.isCritical) {
+                "icon-critical"
+            } else {
+                when (cluster.highestSeverityAlert.type) {
+                    "Fire Emergency" -> "icon-fire"
+                    "Road Accident" -> "icon-accident"
+                    "Emergency Rescue" -> "icon-rescue"
+                    else -> "icon-rescue"
+                }
+            }
+            feature.addStringProperty("icon-image", iconImage)
+            feature
+        }
+    }
+
     // Update Map Markers when alerts change or map becomes ready (with clustering)
     LaunchedEffect(alerts, isMapReady) {
         if (!isMapReady) return@LaunchedEffect
@@ -1748,32 +1823,8 @@ fun HomeScreen(navController: NavController) {
                 // Cluster alerts by proximity
                 val clusters = clusterAlerts(activeAlerts)
                 clusteredAlerts = clusters
-                
-                // Create features for each cluster (only one marker per cluster)
-                clusters.map { cluster ->
-                    val point = Point.fromLngLat(cluster.centerLon, cluster.centerLat)
-                    val feature = Feature.fromGeometry(point)
-                    
-                    // Use cluster ID and highest severity type
-                    feature.addStringProperty("clusterId", cluster.clusterId)
-                    feature.addStringProperty("type", cluster.highestSeverityAlert.type)
-                    feature.addStringProperty("isCritical", cluster.isCritical.toString())
-                    feature.addNumberProperty("clusterSize", cluster.alerts.size.toLong())
-                    
-                    // Determine icon based on critical status
-                    val iconImage = if (cluster.isCritical) {
-                        "icon-critical"  // Red pulse icon for critical
-                    } else {
-                        when (cluster.highestSeverityAlert.type) {
-                            "Fire Emergency" -> "icon-fire"
-                            "Road Accident" -> "icon-accident"
-                            "Emergency Rescue" -> "icon-rescue"
-                            else -> "icon-rescue"
-                        }
-                    }
-                    feature.addStringProperty("icon-image", iconImage)
-                    feature
-                }
+
+                buildClusterFeatures(clusters)
             }
         } else {
             clusteredAlerts = emptyList()
@@ -1794,39 +1845,6 @@ fun HomeScreen(navController: NavController) {
                 )
                 Log.d("AlertSubmission", "🔄 Refreshed alerts layer with ${features.size} clusters")
             }
-        }
-    }
-
-    // Critical alert pulse animation (red pulse only, marker size stays normal)
-    LaunchedEffect(isMapReady) {
-        if (!isMapReady) return@LaunchedEffect
-
-        val pulseFrames = listOf(0.0f, 0.2f, 0.4f, 0.65f, 0.9f, 1.0f, 0.9f, 0.65f, 0.4f, 0.2f)
-        var frameIndex = 0
-
-        while (isActive) {
-            if (clusteredAlerts.any { it.isCritical }) {
-                val pulse = pulseFrames[frameIndex]
-                mapLibreMap?.getStyle { style ->
-                    try {
-                        if (style.getImage("icon-critical") != null) {
-                            style.removeImage("icon-critical")
-                        }
-                        style.addImage(
-                            "icon-critical",
-                            createCriticalPulseDot(
-                                android.graphics.Color.parseColor("#D32F2F"),
-                                64,
-                                pulse
-                            )
-                        )
-                    } catch (e: Exception) {
-                        Log.e("AlertSubmission", "Critical pulse frame update failed", e)
-                    }
-                }
-                frameIndex = (frameIndex + 1) % pulseFrames.size
-            }
-            delay(160)
         }
     }
 
@@ -2484,6 +2502,21 @@ fun HomeScreen(navController: NavController) {
                                             false
                                         }
                                     }
+
+                                    // Refresh alert symbols when camera movement settles (helps prevent marker dropouts after rotate)
+                                    map.addOnCameraIdleListener {
+                                        if (!clusteredAlerts.isEmpty()) {
+                                            map.getStyle { idleStyle ->
+                                                val idleSource = idleStyle.getSourceAs<GeoJsonSource>("alerts-source")
+                                                idleSource?.setGeoJson(
+                                                    FeatureCollection.fromFeatures(
+                                                        buildClusterFeatures(clusteredAlerts)
+                                                    )
+                                                )
+                                            }
+                                        }
+                                    }
+
                                     isMapReady = true
                                 } // Close setStyle
                             } catch (e: Exception) {
@@ -2740,6 +2773,25 @@ fun HomeScreen(navController: NavController) {
                     .align(Alignment.BottomCenter)
                     .fillMaxWidth()
             ) {
+                if (isNavigating) {
+                    SmallFloatingActionButton(
+                        onClick = { showCancelNavConfirm = true },
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            .padding(end = 18.dp, bottom = 92.dp)
+                            .size(52.dp),
+                        containerColor = Color(0xFFF1F3F4),
+                        contentColor = Color(0xFF2B2B2B),
+                        shape = CircleShape
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Close,
+                            contentDescription = "Cancel Navigation",
+                            modifier = Modifier.size(22.dp)
+                        )
+                    }
+                }
+
                 // White Navigation Bar
                 Surface(
                     modifier = Modifier
@@ -3054,6 +3106,39 @@ fun HomeScreen(navController: NavController) {
                 )
             }
         }
+    }
+
+    if (showCancelNavConfirm) {
+        AlertDialog(
+            onDismissRequest = { showCancelNavConfirm = false },
+            title = {
+                Text(
+                    text = "Cancel Navigation",
+                    fontWeight = FontWeight.Bold
+                )
+            },
+            text = {
+                Text("Are you sure you want to cancel navigation?")
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showCancelNavConfirm = false
+                        cancelNavigationAndClearDestination()
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD32F2F))
+                ) {
+                    Text("Yes, Cancel", color = Color.White)
+                }
+            },
+            dismissButton = {
+                OutlinedButton(onClick = { showCancelNavConfirm = false }) {
+                    Text("Keep Navigating")
+                }
+            },
+            containerColor = Color.White,
+            shape = RoundedCornerShape(16.dp)
+        )
     }
 
     // Search Bottom Sheet (Drawer Style)
@@ -3492,8 +3577,10 @@ fun HomeScreen(navController: NavController) {
 
     // Cluster Details Modal - Show all alerts in cluster
     if (showClusterModal && selectedCluster != null) {
+        val clusterSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = false)
         ModalBottomSheet(
             onDismissRequest = { showClusterModal = false },
+            sheetState = clusterSheetState,
             containerColor = Color.White,
             shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
             dragHandle = { BottomSheetDefaults.DragHandle() }
@@ -3502,6 +3589,7 @@ fun HomeScreen(navController: NavController) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .fillMaxHeight(0.85f)
                     .padding(16.dp)
                     .verticalScroll(rememberScrollState())
             ) {
@@ -3569,66 +3657,6 @@ fun HomeScreen(navController: NavController) {
         ResponderApproachingModal(
             distance = responderDistance,
             onDismiss = { showResponderApproachingModal = false }
-        )
-    }
-
-    // Face Verification Modal
-    if (showFaceVerificationModal) {
-        FaceVerificationModal(
-            onDismiss = {
-                showFaceVerificationModal = false
-            },
-            onFaceVerified = { embedding, bitmap ->
-                // Save face embedding to Firestore
-                val userId = auth.currentUser?.uid
-                if (userId != null) {
-                    scope.launch {
-                        try {
-                            // Upload face image
-                            val storageRef = FirebaseStorage.getInstance()
-                                .reference.child("face_verifications/$userId.jpg")
-                            
-                            val baos = java.io.ByteArrayOutputStream()
-                            bitmap.compress(Bitmap.CompressFormat.JPEG, 85, baos)
-                            val imageData = baos.toByteArray()
-                            
-                            storageRef.putBytes(imageData).await()
-                            val facePhotoUrl = storageRef.downloadUrl.await().toString()
-                            
-                            // Update Firestore user document
-                            Firebase.firestore.collection("users").document(userId).update(
-                                mapOf(
-                                    "faceVerified" to true,
-                                    "faceEmbedding" to embedding,
-                                    "faceVerifiedAt" to System.currentTimeMillis(),
-                                    "facePhotoUrl" to facePhotoUrl
-                                )
-                            ).await()
-                            
-                            isFaceVerified = true
-                            showFaceVerificationModal = false
-                            Toast.makeText(
-                                context,
-                                "✅ Face verification successful! You are now fully verified.",
-                                Toast.LENGTH_LONG
-                            ).show()
-                            
-                            Log.d("FaceVerification", "✅ Face verification completed for user $userId")
-                        } catch (e: Exception) {
-                            Log.e("FaceVerification", "Failed to save face verification: ${e.message}")
-                            Toast.makeText(
-                                context,
-                                "Failed to save face verification: ${e.message}",
-                                Toast.LENGTH_SHORT
-                            ).show()
-                        }
-                    }
-                }
-            },
-            onError = { error ->
-                Toast.makeText(context, "❌ $error", Toast.LENGTH_SHORT).show()
-                showFaceVerificationModal = false
-            }
         )
     }
 
@@ -4242,13 +4270,8 @@ fun HomeScreen(navController: NavController) {
                                             )
                                             style.addLayer(layer)
 
-                                            // Zoom to start
-                                            mapLibreMap?.animateCamera(
-                                                CameraUpdateFactory.newLatLngZoom(
-                                                    start,
-                                                    16.0
-                                                )
-                                            )
+                                            // Enter driving camera mode immediately
+                                            applyDrivingCameraMode(start)
                                             isNavigating = true
                                         }
                                         showAlertDetails = false
@@ -5059,13 +5082,8 @@ fun HomeScreen(navController: NavController) {
                                     )
                                     style.addLayer(layer)
 
-                                    // Zoom to start
-                                    mapLibreMap?.animateCamera(
-                                        CameraUpdateFactory.newLatLngZoom(
-                                            start,
-                                            16.0
-                                        )
-                                    )
+                                    // Enter driving camera mode immediately
+                                    applyDrivingCameraMode(start)
                                 }
                             } else {
                                 Toast.makeText(
@@ -5799,32 +5817,11 @@ fun HomeScreen(navController: NavController) {
     // Admin Overview Bottom Sheet (Admin Only)
     if (showGlobalOverview && (userRole == "admin" || userRole == "superadmin" || userRole == "lgu_admin")) {
         val overviewSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = false)
-        var totalAlerts by remember { mutableStateOf(0) }
-        var activeAlerts by remember { mutableStateOf(0) }
-
-        LaunchedEffect(Unit) {
-            scope.launch {
-                try {
-                    val alertsResult = Firebase.firestore.collection("alerts").get().await()
-                    var alertCount = 0
-                    var activeCount = 0
-
-                    for (alertDoc in alertsResult) {
-                        alertCount++
-                        val status = alertDoc.getString("status") ?: "active"
-                        if (status == "active" || status.isEmpty()) {
-                            activeCount++
-                        }
-                    }
-
-                    totalAlerts = alertCount
-                    activeAlerts = activeCount
-                } catch (e: Exception) {
-                    Log.e("GlobalOverview", "Error fetching alerts: ${e.message}")
-                    totalAlerts = 0
-                    activeAlerts = 0
-                }
-            }
+        val alertItems = remember(alerts) { alerts.values.toList() }
+        val totalAlerts = alertItems.size
+        val activeAlerts = alertItems.count {
+            val status = it.status.lowercase()
+            status != "resolved" && status != "closed" && status != "cancelled"
         }
 
         // Set up real-time listener for Pending Co-Admin Requests
@@ -6137,47 +6134,115 @@ fun HomeScreen(navController: NavController) {
                     }
                 }
 
-                // Recent Activity Section
-                Text(
-                    text = "Recent Activity",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier.padding(bottom = 12.dp)
-                )
+                Spacer(modifier = Modifier.height(8.dp))
 
-                // Activity Placeholder
-                Card(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(120.dp),
-                    shape = RoundedCornerShape(12.dp),
-                    colors = CardDefaults.cardColors(containerColor = Color(0xFFF5F5F5))
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize(),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Column(
-                            horizontalAlignment = Alignment.CenterHorizontally
+                // GROUP OWNER Section (only for lgu_admin users)
+                if (userRole == "lgu_admin") {
+                    HorizontalDivider(
+                        modifier = Modifier.padding(vertical = 12.dp),
+                        color = Color(0xFFEEEEEE)
+                    )
+
+                    Text(
+                        text = "Group Owner",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(bottom = 12.dp)
+                    )
+
+                    if (loadingGroupOwner) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(80.dp),
+                            contentAlignment = Alignment.Center
                         ) {
-                            Icon(
-                                imageVector = Icons.Rounded.BarChart,
-                                contentDescription = null,
-                                tint = Color.Gray,
-                                modifier = Modifier.size(40.dp)
-                            )
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Text(
-                                text = "No recent activity",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = Color.Gray
-                            )
+                            CircularProgressIndicator(modifier = Modifier.size(32.dp))
+                        }
+                    } else if (groupOwnerData != null) {
+                        val ownerName = groupOwnerData!!["displayName"] as? String ?: "Unknown"
+                        val ownerEmail = groupOwnerData!!["email"] as? String ?: ""
+
+                        Card(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(bottom = 16.dp),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFFF5F5F5)),
+                            elevation = CardDefaults.cardElevation(0.5.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(12.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                // Avatar
+                                Box(
+                                    modifier = Modifier
+                                        .size(44.dp)
+                                        .background(
+                                            Color(0xFF43A047),
+                                            CircleShape
+                                        ),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        ownerName.take(1).uppercase(),
+                                        color = Color.White,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+
+                                Spacer(modifier = Modifier.width(12.dp))
+
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(ownerName, fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                                    Text(ownerEmail, fontSize = 12.sp, color = Color.Gray)
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Surface(
+                                        color = Color(0xFF43A047).copy(alpha = 0.2f),
+                                        shape = RoundedCornerShape(4.dp)
+                                    ) {
+                                        Text(
+                                            "GROUP OWNER",
+                                            color = Color(0xFF43A047),
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                        )
+                                    }
+                                }
+                            }
                         }
                     }
-                }
 
-                Spacer(modifier = Modifier.height(24.dp))
+                    // See Members Button
+                    Button(
+                        onClick = {
+                            // Avoid stacked bottom sheets; open members sheet as the primary sheet.
+                            showGlobalOverview = false
+                            showMembersSheet = true
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 16.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1565C0)),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.People,
+                            contentDescription = null,
+                            modifier = Modifier
+                                .size(18.dp)
+                                .padding(end = 8.dp),
+                            tint = Color.White
+                        )
+                        Text("See Members", color = Color.White, fontWeight = FontWeight.Bold)
+                    }
+
+                    Spacer(modifier = Modifier.height(4.dp))
+                }
 
                 // Pending Co-Admin Requests Section - NOW OUTSIDE CARD
                 if (userRole == "admin" || userRole == "superadmin" || userRole == "lgu_admin") {
@@ -6283,6 +6348,24 @@ fun HomeScreen(navController: NavController) {
                                                                     Toast.makeText(context, "Approving as admin: $currentLgcId", Toast.LENGTH_SHORT).show()
                                                                     Log.d("ApprovalFlow", "Starting approval for userId=$userId, lgcId=$currentLgcId")
 
+                                                                    val firestore = Firebase.firestore
+
+                                                                    // Step 0: Enforce one LGU assignment per user.
+                                                                    val targetUserDoc = firestore.collection("users")
+                                                                        .document(userId)
+                                                                        .get()
+                                                                        .await()
+                                                                    val existingLgcId = targetUserDoc.getString("lgc_id")?.trim().orEmpty()
+                                                                    if (existingLgcId.isNotBlank() && existingLgcId != currentLgcId) {
+                                                                        Toast.makeText(
+                                                                            context,
+                                                                            "User is already assigned to another LGU.",
+                                                                            Toast.LENGTH_LONG
+                                                                        ).show()
+                                                                        Log.w("ApprovalFlow", "Blocked approval: user $userId already assigned to lgc_id=$existingLgcId")
+                                                                        return@launch
+                                                                    }
+
                                                                     // Step 1: Update user role to lgu_admin and set lgc_id using SET with merge (more reliable)
                                                                     val updateData = mapOf(
                                                                         "role" to "lgu_admin",
@@ -6292,7 +6375,7 @@ fun HomeScreen(navController: NavController) {
                                                                     Log.d("ApprovalFlow", "Writing data: $updateData")
                                                                     
                                                                     try {
-                                                                        Firebase.firestore.collection("users")
+                                                                        firestore.collection("users")
                                                                             .document(userId)
                                                                             .set(updateData, com.google.firebase.firestore.SetOptions.merge())
                                                                             .await()
@@ -6309,7 +6392,7 @@ fun HomeScreen(navController: NavController) {
 
                                                                     // Step 2: Verify the update worked by reading back the document
                                                                     Log.d("ApprovalFlow", "Step 2: Verifying update...")
-                                                                    val verifyDoc = Firebase.firestore.collection("users")
+                                                                    val verifyDoc = firestore.collection("users")
                                                                         .document(userId)
                                                                         .get()
                                                                         .await()
@@ -6329,13 +6412,67 @@ fun HomeScreen(navController: NavController) {
                                                                     }
                                                                     Log.d("ApprovalFlow", "✓✓ Verification PASSED - data persisted correctly!")
 
-                                                                    // Step 3: Update request status to approved
-                                                                    Firebase.firestore.collection("pending_admins")
+                                                                    // Step 3: Auto-join approved user to this LGU's group chat.
+                                                                    val ownerCircleQuery = firestore.collection("circles")
+                                                                        .whereEqualTo("ownerId", currentLgcId)
+                                                                        .whereEqualTo("type", "Group")
+                                                                        .limit(1)
+                                                                        .get()
+                                                                        .await()
+
+                                                                    val lguCircleId = if (ownerCircleQuery.documents.isNotEmpty()) {
+                                                                        ownerCircleQuery.documents.first().id
+                                                                    } else {
+                                                                        val newCircleId = UUID.randomUUID().toString()
+                                                                        val groupChat = hashMapOf(
+                                                                            "id" to newCircleId,
+                                                                            "name" to "${userDepartment.ifBlank { "LGU" }} Group",
+                                                                            "ownerId" to currentLgcId,
+                                                                            "members" to listOf(currentLgcId),
+                                                                            "memberLimit" to 20,
+                                                                            "type" to "Group",
+                                                                            "createdAt" to System.currentTimeMillis(),
+                                                                            "imageUrl" to ""
+                                                                        )
+                                                                        firestore.collection("circles").document(newCircleId)
+                                                                            .set(groupChat)
+                                                                            .await()
+                                                                        newCircleId
+                                                                    }
+
+                                                                    firestore.collection("circles")
+                                                                        .document(lguCircleId)
+                                                                        .update(
+                                                                            "members",
+                                                                            com.google.firebase.firestore.FieldValue.arrayUnion(userId)
+                                                                        )
+                                                                        .await()
+
+                                                                    val joinMsgId = UUID.randomUUID().toString()
+                                                                    val joinMsg = mapOf(
+                                                                        "id" to joinMsgId,
+                                                                        "senderId" to "system",
+                                                                        "senderName" to "System",
+                                                                        "text" to "${userName.ifBlank { "User" }} joined the chat",
+                                                                        "timestamp" to System.currentTimeMillis()
+                                                                    )
+                                                                    firestore.collection("circles")
+                                                                        .document(lguCircleId)
+                                                                        .collection("messages")
+                                                                        .document(joinMsgId)
+                                                                        .set(joinMsg)
+                                                                        .await()
+
+                                                                    Log.d("ApprovalFlow", "User auto-joined LGU circle: $lguCircleId")
+
+                                                                    // Step 4: Update request status to approved
+                                                                    firestore.collection("pending_admins")
                                                                         .document(requestId)
                                                                         .update(
                                                                             mapOf(
                                                                                 "status" to "approved",
-                                                                                "approvedBy" to auth.currentUser?.uid
+                                                                                "approvedBy" to auth.currentUser?.uid,
+                                                                                "joinedCircleId" to lguCircleId
                                                                             )
                                                                         )
                                                                         .await()
@@ -6498,113 +6635,6 @@ fun HomeScreen(navController: NavController) {
                                 }
                             }
                         }
-                }
-
-                Spacer(modifier = Modifier.height(24.dp))
-
-                HorizontalDivider(
-                    modifier = Modifier.padding(vertical = 12.dp),
-                    color = Color(0xFFEEEEEE)
-                )
-
-                // GROUP OWNER Section (only for lgu_admin users)
-                if (userRole == "lgu_admin") {
-                    Text(
-                        text = "Group Owner",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier.padding(bottom = 12.dp)
-                    )
-
-                    if (loadingGroupOwner) {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(80.dp),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            CircularProgressIndicator(modifier = Modifier.size(32.dp))
-                        }
-                    } else if (groupOwnerData != null) {
-                        val ownerName = groupOwnerData!!["displayName"] as? String ?: "Unknown"
-                        val ownerEmail = groupOwnerData!!["email"] as? String ?: ""
-                        val ownerId = groupOwnerData!!["id"] as? String ?: ""
-
-                        Card(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(bottom = 16.dp),
-                            shape = RoundedCornerShape(12.dp),
-                            colors = CardDefaults.cardColors(containerColor = Color(0xFFF5F5F5)),
-                            elevation = CardDefaults.cardElevation(0.5.dp)
-                        ) {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(12.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                // Avatar
-                                Box(
-                                    modifier = Modifier
-                                        .size(44.dp)
-                                        .background(
-                                            Color(0xFF43A047),
-                                            CircleShape
-                                        ),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Text(
-                                        ownerName.take(1).uppercase(),
-                                        color = Color.White,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                }
-
-                                Spacer(modifier = Modifier.width(12.dp))
-
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(ownerName, fontWeight = FontWeight.Bold, fontSize = 15.sp)
-                                    Text(ownerEmail, fontSize = 12.sp, color = Color.Gray)
-                                    Spacer(modifier = Modifier.height(4.dp))
-                                    Surface(
-                                        color = Color(0xFF43A047).copy(alpha = 0.2f),
-                                        shape = RoundedCornerShape(4.dp)
-                                    ) {
-                                        Text(
-                                            "GROUP OWNER",
-                                            color = Color(0xFF43A047),
-                                            fontSize = 10.sp,
-                                            fontWeight = FontWeight.Bold,
-                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // See Members Button
-                    Button(
-                        onClick = { showMembersSheet = true },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(bottom = 16.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1565C0)),
-                        shape = RoundedCornerShape(8.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.People,
-                            contentDescription = null,
-                            modifier = Modifier
-                                .size(18.dp)
-                                .padding(end = 8.dp),
-                            tint = Color.White
-                        )
-                        Text("See Members", color = Color.White, fontWeight = FontWeight.Bold)
-                    }
-
-                    Spacer(modifier = Modifier.height(12.dp))
                 }
 
                 Spacer(modifier = Modifier.height(24.dp))
@@ -6847,7 +6877,53 @@ fun HomeScreen(navController: NavController) {
                     pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
                 },
                 onFaceVerificationStart = {
-                    showFaceVerificationModal = true
+                    Log.d("FaceVerification", "Starting face verification from Edit Profile")
+                },
+                onFaceVerified = { embedding, bitmap ->
+                    val userId = auth.currentUser?.uid
+                    if (userId != null) {
+                        scope.launch {
+                            try {
+                                val storageRef = FirebaseStorage.getInstance()
+                                    .reference.child("face_verification/$userId.jpg")
+
+                                val baos = java.io.ByteArrayOutputStream()
+                                bitmap.compress(Bitmap.CompressFormat.JPEG, 85, baos)
+                                val imageData = baos.toByteArray()
+
+                                storageRef.putBytes(imageData).await()
+                                val facePhotoUrl = storageRef.downloadUrl.await().toString()
+
+                                Firebase.firestore.collection("users").document(userId).update(
+                                    mapOf(
+                                        "faceVerified" to true,
+                                        "faceEmbedding" to embedding,
+                                        "faceVerifiedAt" to System.currentTimeMillis(),
+                                        "facePhotoUrl" to facePhotoUrl
+                                    )
+                                ).await()
+
+                                isFaceVerified = true
+                                Toast.makeText(
+                                    context,
+                                    "✅ Face verification successful! You are now fully verified.",
+                                    Toast.LENGTH_LONG
+                                ).show()
+
+                                Log.d("FaceVerification", "✅ Face verification completed for user $userId")
+                            } catch (e: Exception) {
+                                Log.e("FaceVerification", "Failed to save face verification: ${e.message}")
+                                Toast.makeText(
+                                    context,
+                                    "Failed to save face verification: ${e.message}",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                        }
+                    }
+                },
+                onFaceVerificationError = { error ->
+                    Toast.makeText(context, "❌ $error", Toast.LENGTH_SHORT).show()
                 },
                 onSave = { newName, newPhone ->
                     userPhoneNumber = newPhone
@@ -7108,7 +7184,10 @@ fun HomeScreen(navController: NavController) {
     if (showMembersSheet && userRole == "lgu_admin") {
         val membersSheetState = rememberModalBottomSheetState(skipPartiallyExpanded = false)
         ModalBottomSheet(
-            onDismissRequest = { showMembersSheet = false },
+            onDismissRequest = {
+                showMembersSheet = false
+                showGlobalOverview = true
+            },
             sheetState = membersSheetState,
             containerColor = Color.White,
             shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
@@ -7118,6 +7197,7 @@ fun HomeScreen(navController: NavController) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .fillMaxHeight(0.88f)
                     .padding(24.dp)
             ) {
                 // Title

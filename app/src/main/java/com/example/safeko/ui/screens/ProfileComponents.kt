@@ -1,5 +1,6 @@
 package com.example.safeko.ui.screens
 
+import android.graphics.Bitmap
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -45,6 +46,7 @@ import coil.request.ImageRequest
 import coil.transform.CircleCropTransformation
 import androidx.compose.material.icons.filled.Phone
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import com.example.safeko.ui.components.FaceVerificationModal
 import com.google.firebase.auth.ktx.auth
 import com.google.firebase.ktx.Firebase
 
@@ -62,12 +64,14 @@ fun EditProfileDialog(
     userRole: String = "user", // NEW: Add userRole parameter
     isFaceVerified: Boolean = false, // NEW: Face verification status
     onChangePhoto: () -> Unit,
-    onFaceVerificationStart: () -> Unit = {}, // NEW: Callback for face scan
+    onFaceVerificationStart: () -> Unit = {}, // Optional external callback
+    onFaceVerified: (faceEmbedding: String, bitmap: Bitmap) -> Unit = { _, _ -> },
+    onFaceVerificationError: (String) -> Unit = {},
     onSave: (String, String) -> Unit // (newName, newPhone)
 ) {
     if (showDialog) {
         var phoneNumber by remember { mutableStateOf(initialPhoneNumber) }
-        var fullName by remember { mutableStateOf(currentName) }
+        var showFaceVerificationModal by remember { mutableStateOf(false) }
         
         // NEW: Password change states for LGU admins
         var showPasswordSection by remember { mutableStateOf(false) }
@@ -236,19 +240,36 @@ fun EditProfileDialog(
                                 modifier = Modifier.padding(bottom = 8.dp)
                             )
                             OutlinedTextField(
-                                value = fullName,
-                                onValueChange = { fullName = it },
+                                value = currentName,
+                                onValueChange = {},
+                                readOnly = true,
+                                enabled = false,
                                 modifier = Modifier.fillMaxWidth(),
                                 shape = RoundedCornerShape(12.dp),
                                 colors = OutlinedTextFieldDefaults.colors(
-                                    focusedBorderColor = Color(0xFF4285F4),
-                                    unfocusedBorderColor = Color(0xFFE0E0E0),
-                                    focusedContainerColor = Color.White,
-                                    unfocusedContainerColor = Color.White,
-                                    cursorColor = Color(0xFF4285F4)
+                                    disabledTextColor = Color(0xFF5F6368),
+                                    disabledBorderColor = Color.Transparent,
+                                    disabledContainerColor = Color(0xFFF5F5F5)
                                 ),
                                 singleLine = true
                             )
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(
+                                    imageVector = Icons.Filled.Lock,
+                                    contentDescription = null,
+                                    tint = Color.Gray,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    text = "Name is linked to your Google account",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = Color.Gray
+                                )
+                            }
                         }
 
                         Spacer(modifier = Modifier.height(20.dp))
@@ -419,20 +440,30 @@ fun EditProfileDialog(
                         
                         // Face Verification Button
                         Button(
-                            onClick = { onFaceVerificationStart() },
+                            onClick = {
+                                if (!isFaceVerified) {
+                                    onFaceVerificationStart()
+                                    showFaceVerificationModal = true
+                                }
+                            },
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(48.dp),
+                            enabled = !isFaceVerified,
                             shape = RoundedCornerShape(12.dp),
                             colors = if (isFaceVerified) {
                                 ButtonDefaults.buttonColors(
                                     containerColor = Color(0xFFE8F5E9),
-                                    contentColor = Color(0xFF2E7D32)
+                                    contentColor = Color(0xFF2E7D32),
+                                    disabledContainerColor = Color(0xFFE8F5E9),
+                                    disabledContentColor = Color(0xFF2E7D32)
                                 )
                             } else {
                                 ButtonDefaults.buttonColors(
                                     containerColor = Color(0xFFF5F5F5),
-                                    contentColor = Color(0xFF1565C0)
+                                    contentColor = Color(0xFF1565C0),
+                                    disabledContainerColor = Color(0xFFF5F5F5),
+                                    disabledContentColor = Color(0xFF1565C0)
                                 )
                             },
                             border = if (isFaceVerified) {
@@ -450,13 +481,6 @@ fun EditProfileDialog(
                                     if (isFaceVerified) "✅ Face Verified" else "Add Face Verification",
                                     fontWeight = FontWeight.Bold
                                 )
-                                if (isFaceVerified) {
-                                    Text(
-                                        "Change",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = Color(0xFF2E7D32)
-                                    )
-                                }
                             }
                         }
                         
@@ -473,6 +497,15 @@ fun EditProfileDialog(
                                 text = if (isFaceVerified) "Fully verified - Phone + Face" else "Phone + Face verification = Fully Verified",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = if (isFaceVerified) Color(0xFF2E7D32) else Color.Gray
+                            )
+                        }
+
+                        if (isFaceVerified) {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = "Face verification is permanent and cannot be changed.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color(0xFF2E7D32)
                             )
                         }
                         
@@ -652,7 +685,7 @@ fun EditProfileDialog(
                         
                         // Save Button
                         Button(
-                            onClick = { onSave(fullName, phoneNumber) },
+                            onClick = { onSave(currentName, phoneNumber) },
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .height(56.dp),
@@ -675,6 +708,20 @@ fun EditProfileDialog(
                         
                         Spacer(modifier = Modifier.height(24.dp))
                 }
+            }
+
+            if (showFaceVerificationModal) {
+                FaceVerificationModal(
+                    onDismiss = { showFaceVerificationModal = false },
+                    onFaceVerified = { embedding, bitmap ->
+                        onFaceVerified(embedding, bitmap)
+                        showFaceVerificationModal = false
+                    },
+                    onError = { error ->
+                        onFaceVerificationError(error)
+                        showFaceVerificationModal = false
+                    }
+                )
             }
         }
     }

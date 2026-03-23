@@ -94,7 +94,9 @@ fun ProfileScreen(
     var userPhoneNumber by remember { 
         mutableStateOf(sharedPreferences.getString("user_phone_number_$currentUserId", "") ?: "") 
     }
-    val isFaceVerified = sharedPreferences.getBoolean("is_face_verified_$currentUserId", false)
+    var isFaceVerified by remember {
+        mutableStateOf(sharedPreferences.getBoolean("is_face_verified_$currentUserId", false))
+    }
     var isPhoneVerified by remember { mutableStateOf(false) }
 
     var showOtpDialog by remember { mutableStateOf(false) }
@@ -127,6 +129,10 @@ fun ProfileScreen(
                         sharedPreferences.edit().putString("user_phone_number_$currentUserId", userPhoneNumber).apply()
                     }
                     isPhoneVerified = snapshot.getBoolean("phoneVerified") ?: false
+                    isFaceVerified = snapshot.getBoolean("faceVerified") ?: false
+                    sharedPreferences.edit()
+                        .putBoolean("is_face_verified_$currentUserId", isFaceVerified)
+                        .apply()
                 } else {
                      userPlan = "Free"
                 }
@@ -278,8 +284,55 @@ fun ProfileScreen(
             currentLocation = "Location not available", // Simplified for now
             isPhoneVerified = isPhoneVerified,
             userRole = userRole, // NEW: Pass user role for password change feature
+            isFaceVerified = isFaceVerified,
             onChangePhoto = {
                 pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+            },
+            onFaceVerificationStart = {
+                Toast.makeText(context, "Auto face scan started", Toast.LENGTH_SHORT).show()
+            },
+            onFaceVerified = { embedding, bitmap ->
+                val userId = auth.currentUser?.uid
+                if (userId != null) {
+                    scope.launch {
+                        try {
+                            val storageRef = FirebaseStorage.getInstance()
+                                .reference.child("face_verification/$userId.jpg")
+
+                            val baos = java.io.ByteArrayOutputStream()
+                            bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, baos)
+                            val imageData = baos.toByteArray()
+
+                            storageRef.putBytes(imageData).await()
+                            val facePhotoUrl = storageRef.downloadUrl.await().toString()
+
+                            Firebase.firestore.collection("users").document(userId).update(
+                                mapOf(
+                                    "faceVerified" to true,
+                                    "faceEmbedding" to embedding,
+                                    "faceVerifiedAt" to System.currentTimeMillis(),
+                                    "facePhotoUrl" to facePhotoUrl
+                                )
+                            ).await()
+
+                            isFaceVerified = true
+                            sharedPreferences.edit()
+                                .putBoolean("is_face_verified_$currentUserId", true)
+                                .apply()
+
+                            Toast.makeText(context, "Face verification completed", Toast.LENGTH_SHORT).show()
+                        } catch (e: Exception) {
+                            Toast.makeText(
+                                context,
+                                "Failed to save face verification: ${e.message}",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                    }
+                }
+            },
+            onFaceVerificationError = { error ->
+                Toast.makeText(context, error, Toast.LENGTH_SHORT).show()
             },
             onSave = { newName, rawPhone ->
                 val userId = auth.currentUser?.uid
@@ -561,7 +614,8 @@ fun ProfileScreen(
             }
             
             // 2. Banner (Get Verified)
-            if (!isFaceVerified) {
+            val isFullyVerified = isPhoneVerified && isFaceVerified
+            if (!isFullyVerified) {
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -571,7 +625,8 @@ fun ProfileScreen(
                                 Toast.makeText(context, "Please verify your phone number in Edit Profile first", Toast.LENGTH_LONG).show()
                                 showEditProfile = true
                             } else {
-                                onVerifyFace() 
+                                showEditProfile = true
+                                Toast.makeText(context, "Tap Add Face Verification in Edit Profile", Toast.LENGTH_SHORT).show()
                             }
                         },
                     shape = RoundedCornerShape(16.dp),
