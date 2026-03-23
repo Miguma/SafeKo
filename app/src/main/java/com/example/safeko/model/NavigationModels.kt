@@ -27,3 +27,15 @@ data class RemoteAlert(
     val status: String = "active",
     val pingCount: Int = 1  // Track duplicates at same location
 )
+
+/**
+ * Represents an active responder heading to an alert location
+ */
+data class ActiveResponse(
+    val responderId: String = "",
+    val responderLat: Double = 0.0,
+    val responderLon: Double = 0.0,
+    val alertLat: Double = 0.0,
+    val alertLon: Double = 0.0,
+    val lastUpdate: Long = 0L
+)

@@ -60,7 +60,9 @@ fun EditProfileDialog(
     currentLocation: String,
     isPhoneVerified: Boolean,
     userRole: String = "user", // NEW: Add userRole parameter
+    isFaceVerified: Boolean = false, // NEW: Face verification status
     onChangePhoto: () -> Unit,
+    onFaceVerificationStart: () -> Unit = {}, // NEW: Callback for face scan
     onSave: (String, String) -> Unit // (newName, newPhone)
 ) {
     if (showDialog) {
@@ -400,6 +402,78 @@ fun EditProfileDialog(
                                     color = Color.Gray
                                 )
                             }
+                        }
+                        
+                        Spacer(modifier = Modifier.height(40.dp))
+                        
+                        // NEW: Face Verification Section
+                        HorizontalDivider(color = Color(0xFFEEEEEE), thickness = 1.dp)
+                        Spacer(modifier = Modifier.height(24.dp))
+                        
+                        Text(
+                            text = "Identity Verification",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = Color.Gray,
+                            modifier = Modifier.padding(bottom = 12.dp)
+                        )
+                        
+                        // Face Verification Button
+                        Button(
+                            onClick = { onFaceVerificationStart() },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(48.dp),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = if (isFaceVerified) {
+                                ButtonDefaults.buttonColors(
+                                    containerColor = Color(0xFFE8F5E9),
+                                    contentColor = Color(0xFF2E7D32)
+                                )
+                            } else {
+                                ButtonDefaults.buttonColors(
+                                    containerColor = Color(0xFFF5F5F5),
+                                    contentColor = Color(0xFF1565C0)
+                                )
+                            },
+                            border = if (isFaceVerified) {
+                                BorderStroke(1.dp, Color(0xFF4CAF50))
+                            } else {
+                                BorderStroke(1.dp, Color(0xFFE0E0E0))
+                            }
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    if (isFaceVerified) "✅ Face Verified" else "Add Face Verification",
+                                    fontWeight = FontWeight.Bold
+                                )
+                                if (isFaceVerified) {
+                                    Text(
+                                        "Change",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = Color(0xFF2E7D32)
+                                    )
+                                }
+                            }
+                        }
+                        
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Filled.Lock,
+                                contentDescription = null,
+                                tint = if (isFaceVerified) Color(0xFF4CAF50) else Color.Gray,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = if (isFaceVerified) "Fully verified - Phone + Face" else "Phone + Face verification = Fully Verified",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (isFaceVerified) Color(0xFF2E7D32) else Color.Gray
+                            )
                         }
                         
                         Spacer(modifier = Modifier.height(40.dp))

@@ -117,9 +117,15 @@ import com.example.safeko.utils.QRCodeUtils
 import com.example.safeko.utils.clusterAlerts
 import com.example.safeko.utils.getClusterColor
 import com.example.safeko.utils.calculateDistance
+import com.example.safeko.utils.DistanceUtils
 import com.example.safeko.services.NavigationService
+import com.example.safeko.services.ResponderTrackingService
+import com.example.safeko.services.FaceVerificationService
+import com.example.safeko.ui.components.ResponderApproachingModal
+import com.example.safeko.ui.components.FaceVerificationModal
 import com.example.safeko.model.NavigationStep
 import com.example.safeko.model.RemoteAlert
+import com.example.safeko.model.ActiveResponse
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
 import com.google.firebase.auth.ktx.auth
@@ -467,6 +473,13 @@ fun HomeScreen(navController: NavController) {
     var showClusterModal by remember { mutableStateOf(false) }
     var showAlertDetails by remember { mutableStateOf(false) }
 
+    // Responder Tracking State
+    val responderTrackingService = remember { ResponderTrackingService() }
+    var showResponderApproachingModal by remember { mutableStateOf(false) }
+    var responderDistance by remember { mutableStateOf("") }
+    var incomingResponseAlertId by remember { mutableStateOf<String?>(null) }
+    var activeResponses by remember { mutableStateOf<Map<String, ActiveResponse>>(emptyMap()) }
+
     // Unified Alert listener (Realtime)
     LaunchedEffect(userRole, userDepartment) {
         val database = FirebaseDatabase.getInstance(rtdbBaseUrl)
@@ -507,6 +520,7 @@ fun HomeScreen(navController: NavController) {
                     val phoneNumber =
                         alertSnapshot.child("phoneNumber").getValue(String::class.java) ?: ""
                     val notes = alertSnapshot.child("notes").getValue(String::class.java) ?: ""
+                    val pingCount = alertSnapshot.child("pingCount").getValue(Int::class.java) ?: 1
 
                     newAlerts[id] = RemoteAlert(
                         id = id,
@@ -521,7 +535,8 @@ fun HomeScreen(navController: NavController) {
                         address = address,
                         photoBase64 = photoBase64,
                         details = details,
-                        notes = notes
+                        notes = notes,
+                        pingCount = pingCount
                     )
                 }
                 alerts = newAlerts
@@ -533,6 +548,76 @@ fun HomeScreen(navController: NavController) {
         }
         alertsRef.addValueEventListener(listener)
     }
+
+    // Listener for Active Responder Tracking
+    LaunchedEffect(auth.currentUser?.uid) {
+        val userId = auth.currentUser?.uid ?: return@LaunchedEffect
+        val database = FirebaseDatabase.getInstance(rtdbBaseUrl)
+        val activeResponsesRef = database.getReference("activeResponses")
+
+        val responseListener = object : ValueEventListener {
+            override fun onDataChange(snapshot: DataSnapshot) {
+                val responses = mutableMapOf<String, ActiveResponse>()
+                
+                for (alertSnapshot in snapshot.children) {
+                    val alertId = alertSnapshot.key ?: continue
+                    
+                    // Check if this alert belongs to current user
+                    val alertData = alerts[alertId]
+                    if (alertData?.userId != userId) continue  // Not their alert
+                    
+                    try {
+                        val responderId = alertSnapshot.child("responderId").getValue(String::class.java) ?: ""
+                        val responderLat = alertSnapshot.child("responderLat").getValue(Double::class.java) ?: 0.0
+                        val responderLon = alertSnapshot.child("responderLon").getValue(Double::class.java) ?: 0.0
+                        val alertLat = alertSnapshot.child("alertLat").getValue(Double::class.java) ?: 0.0
+                        val alertLon = alertSnapshot.child("alertLon").getValue(Double::class.java) ?: 0.0
+                        val lastUpdate = alertSnapshot.child("lastUpdate").getValue(Long::class.java) ?: 0L
+                        
+                        responses[alertId] = ActiveResponse(
+                            responderId = responderId,
+                            responderLat = responderLat,
+                            responderLon = responderLon,
+                            alertLat = alertLat,
+                            alertLon = alertLon,
+                            lastUpdate = lastUpdate
+                        )
+                        
+                        // Calculate distance
+                        val distance = DistanceUtils.haversineDistance(responderLat, responderLon, alertLat, alertLon)
+                        
+                        // Update modal state
+                        if (!showResponderApproachingModal) {
+                            incomingResponseAlertId = alertId
+                            responderDistance = DistanceUtils.formatDistance(distance)
+                            showResponderApproachingModal = true
+                            Log.d("ResponderTracking", "🚨 Responder approaching alert $alertId: $responderDistance away")
+                        } else {
+                            responderDistance = DistanceUtils.formatDistance(distance)
+                        }
+                        
+                        // Check if responder reached destination
+                        if (DistanceUtils.hasReachedDestination(distance)) {
+                            Log.d("ResponderTracking", "✅ Responder reached destination for alert $alertId")
+                            showResponderApproachingModal = false
+                        }
+                        
+                    } catch (e: Exception) {
+                        Log.e("ResponderTracking", "Error parsing active response", e)
+                    }
+                }
+                
+                activeResponses = responses
+            }
+
+            override fun onCancelled(error: DatabaseError) {
+                Log.e("ResponderTracking", "Active responses listener cancelled", error.toException())
+            }
+        }
+        
+        activeResponsesRef.addValueEventListener(responseListener)
+    }
+
 
     // Sync with Service
     val serviceIsNavigating by navigationService?.isNavigating?.collectAsState(initial = false)
@@ -614,6 +699,14 @@ fun HomeScreen(navController: NavController) {
                 navigationSteps = emptyList()
                 currentStepIndex = 0
                 distanceToNextTurn = 0.0
+                
+                // 🚨 STOP RESPONDER TRACKING when navigation ends
+                val currentAlertId = incomingResponseAlertId
+                if (currentAlertId != null) {
+                    responderTrackingService.stopTracking(currentAlertId)
+                    Log.d("ResponderTracking", "🔴 Stopped responder tracking for alert $currentAlertId")
+                }
+                showResponderApproachingModal = false
 
                 mapLibreMap?.getStyle { style ->
                     if (style.getLayer("route-layer") != null) style.removeLayer("route-layer")
@@ -653,6 +746,27 @@ fun HomeScreen(navController: NavController) {
     }
     var currentUserAddress by remember { mutableStateOf("Locating...") }
     var isUploadingPhoto by remember { mutableStateOf(false) }
+    
+    // Face Verification State
+    var showFaceVerificationModal by remember { mutableStateOf(false) }
+    var isFaceVerified by remember { mutableStateOf(false) }
+    var faceEmbedding by remember { mutableStateOf("") }
+
+    // Load Face Verification Status from Firestore
+    LaunchedEffect(auth.currentUser?.uid) {
+        val userId = auth.currentUser?.uid ?: return@LaunchedEffect
+        Firebase.firestore.collection("users").document(userId).get()
+            .addOnSuccessListener { document ->
+                if (document.exists()) {
+                    isFaceVerified = document.getBoolean("faceVerified") ?: false
+                    faceEmbedding = document.getString("faceEmbedding") ?: ""
+                    Log.d("FaceVerification", "Loaded face verification status: $isFaceVerified")
+                }
+            }
+            .addOnFailureListener { e ->
+                Log.e("FaceVerification", "Failed to load face verification status: ${e.message}")
+            }
+    }
 
     // Image Picker Launcher
     val pickMedia =
@@ -1005,6 +1119,11 @@ fun HomeScreen(navController: NavController) {
         }
     }
 
+    // Pre-send flow state (reuse existing alert details bottom sheet)
+    val preSendAlertId = "__pending_alert__"
+    var isPreSendAlertFlow by remember { mutableStateOf(false) }
+    var selectedAlertType by remember { mutableStateOf("") }
+
     // Add Details State
     var showAddDetails by remember { mutableStateOf(false) }
     var detailsText by remember { mutableStateOf("") }
@@ -1053,10 +1172,6 @@ fun HomeScreen(navController: NavController) {
     val cameraLauncher =
         rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { success ->
             if (success && capturedImageUri != null) {
-                // Trigger reload via LaunchedEffect by toggling or just let it handle it?
-                // Actually LaunchedEffect(capturedImageUri) might not trigger if uri didn't change reference but content did.
-                // But here uri is constant for the capture session.
-                // So we should load it here explicitly too.
                 try {
                     val inputStream = context.contentResolver.openInputStream(capturedImageUri!!)
                     var bitmap = BitmapFactory.decodeStream(inputStream)
@@ -1079,6 +1194,41 @@ fun HomeScreen(navController: NavController) {
                 }
             }
         }
+
+    fun cancelNavigationAndClearDestination() {
+        showLocationModal = false
+
+        // Stop service-driven navigation state
+        navigationService?.stopNavigation()
+
+        // Clear local navigation UI state immediately
+        isNavigating = false
+        navigationSteps = emptyList()
+        currentStepIndex = 0
+        distanceToNextTurn = 0.0
+
+        // Remove destination/search marker
+        selectedLocation = null
+        mapLibreMap?.getStyle { style ->
+            val searchSource = style.getSourceAs<GeoJsonSource>("search-result-source")
+            searchSource?.setGeoJson(FeatureCollection.fromFeatures(emptyList()))
+            if (style.getLayer("route-layer") != null) style.removeLayer("route-layer")
+            if (style.getSource("route-source") != null) style.removeSource("route-source")
+        }
+
+        // Recenter on user's current location
+        val userLocation = mapLibreMap?.locationComponent?.lastKnownLocation
+        if (userLocation != null) {
+            mapLibreMap?.animateCamera(
+                CameraUpdateFactory.newLatLngZoom(
+                    LatLng(userLocation.latitude, userLocation.longitude),
+                    16.0
+                )
+            )
+        }
+
+        Toast.makeText(context, "Navigation Canceled", Toast.LENGTH_SHORT).show()
+    }
 
     // Handle Back Press to prevent white screen and handle overlays
     var backPressState by remember { mutableStateOf(0L) }
@@ -1104,14 +1254,7 @@ fun HomeScreen(navController: NavController) {
 
             selectedLocation != null -> selectedLocation = null
             isNavigating -> {
-                isNavigating = false
-                navigationSteps = emptyList()
-                currentStepIndex = 0
-                mapLibreMap?.getStyle { style ->
-                    if (style.getLayer("route-layer") != null) style.removeLayer("route-layer")
-                    if (style.getSource("route-source") != null) style.removeSource("route-source")
-                }
-                Toast.makeText(context, "Navigation Canceled", Toast.LENGTH_SHORT).show()
+                cancelNavigationAndClearDestination()
             }
 
             else -> {
@@ -1185,6 +1328,49 @@ fun HomeScreen(navController: NavController) {
 
         val dotPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
         dotPaint.color = color
+        canvas.drawCircle(radius, radius, radius * 0.42f, dotPaint)
+
+        return bitmap
+    }
+
+    // Critical marker pulse frame (same marker size, animated glow/ring only)
+    fun createCriticalPulseDot(color: Int, size: Int = 64, pulse: Float = 0f): Bitmap {
+        val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        val radius = size / 2f
+
+        val glowAlpha = (60 + (120 * pulse)).toInt().coerceIn(0, 255)
+        val glowRadius = radius * (0.72f + (0.24f * pulse))
+        val glowPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            shader = android.graphics.RadialGradient(
+                radius,
+                radius,
+                glowRadius,
+                intArrayOf(
+                    android.graphics.Color.argb(
+                        glowAlpha,
+                        android.graphics.Color.red(color),
+                        android.graphics.Color.green(color),
+                        android.graphics.Color.blue(color)
+                    ),
+                    android.graphics.Color.TRANSPARENT
+                ),
+                floatArrayOf(0.0f, 1.0f),
+                android.graphics.Shader.TileMode.CLAMP
+            )
+        }
+        canvas.drawCircle(radius, radius, glowRadius, glowPaint)
+
+        val ringPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            style = android.graphics.Paint.Style.STROKE
+            strokeWidth = size * (0.06f + (0.04f * pulse))
+            this.color = android.graphics.Color.WHITE
+        }
+        canvas.drawCircle(radius, radius, radius * (0.54f + (0.07f * pulse)), ringPaint)
+
+        val dotPaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            this.color = color
+        }
         canvas.drawCircle(radius, radius, radius * 0.42f, dotPaint)
 
         return bitmap
@@ -1306,6 +1492,7 @@ fun HomeScreen(navController: NavController) {
                     val userPhotoUrl = obj.optString("userPhotoUrl", null)
                     val timestamp = obj.optLong("timestamp", 0L)
                     var status = obj.optString("status", "active")
+                    val pingCount = obj.optInt("pingCount", 1)
                     val maxAgeMs = 24L * 60L * 60L * 1000L
                     if (timestamp > 0L && status != "resolved") {
                         val ageMs = System.currentTimeMillis() - timestamp
@@ -1329,7 +1516,8 @@ fun HomeScreen(navController: NavController) {
                             userName = userName,
                             userPhotoUrl = userPhotoUrl,
                             timestamp = timestamp,
-                            status = status
+                            status = status,
+                            pingCount = pingCount
                         )
                     }
                 }
@@ -1609,6 +1797,39 @@ fun HomeScreen(navController: NavController) {
         }
     }
 
+    // Critical alert pulse animation (red pulse only, marker size stays normal)
+    LaunchedEffect(isMapReady) {
+        if (!isMapReady) return@LaunchedEffect
+
+        val pulseFrames = listOf(0.0f, 0.2f, 0.4f, 0.65f, 0.9f, 1.0f, 0.9f, 0.65f, 0.4f, 0.2f)
+        var frameIndex = 0
+
+        while (isActive) {
+            if (clusteredAlerts.any { it.isCritical }) {
+                val pulse = pulseFrames[frameIndex]
+                mapLibreMap?.getStyle { style ->
+                    try {
+                        if (style.getImage("icon-critical") != null) {
+                            style.removeImage("icon-critical")
+                        }
+                        style.addImage(
+                            "icon-critical",
+                            createCriticalPulseDot(
+                                android.graphics.Color.parseColor("#D32F2F"),
+                                64,
+                                pulse
+                            )
+                        )
+                    } catch (e: Exception) {
+                        Log.e("AlertSubmission", "Critical pulse frame update failed", e)
+                    }
+                }
+                frameIndex = (frameIndex + 1) % pulseFrames.size
+            }
+            delay(160)
+        }
+    }
+
     // Route Animation Effect
     // Optimize: Throttle updates to ~30fps to reduce Main Thread load
     LaunchedEffect(isNavigating) {
@@ -1753,7 +1974,110 @@ fun HomeScreen(navController: NavController) {
         }
     }
 
-    fun sendAlert(type: String) {
+    fun findExistingUserAlert(type: String, lat: Double, lon: Double): RemoteAlert? {
+        val userId = auth.currentUser?.uid ?: return null
+        return alerts.values.find { alert ->
+            val distance = calculateDistance(alert.lat, alert.lon, lat, lon)
+            val isSameType = alert.type == type
+            val isActive = alert.status != "resolved"
+            val isWithinRadius = distance <= com.example.safeko.utils.CLUSTER_RADIUS_METERS
+            val isSameUser = alert.userId == userId
+            isSameType && isActive && isWithinRadius && isSameUser
+        }
+    }
+
+    fun incrementExistingAlert(existingAlert: RemoteAlert) {
+        if (existingAlert.pingCount >= 3) {
+            Toast.makeText(context, "Maximum severity reached for this alert", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        scope.launch(Dispatchers.IO) {
+            val token = try {
+                auth.currentUser?.getIdToken(true)?.await()?.token
+            } catch (e: Exception) {
+                Log.e("AlertSubmission", "Error getting auth token", e)
+                null
+            }
+
+            if (token == null) {
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(context, "Authentication failed", Toast.LENGTH_SHORT).show()
+                }
+                return@launch
+            }
+
+            val authParam = "?auth=$token"
+            val newPingCount = (existingAlert.pingCount + 1).coerceAtMost(3)
+            val updatedAlert = existingAlert.copy(
+                pingCount = newPingCount,
+                timestamp = System.currentTimeMillis()
+            )
+            val updateBody = com.google.gson.Gson().toJson(updatedAlert)
+            val url = URL("$rtdbBaseUrl/alerts/${existingAlert.id}.json$authParam")
+
+            try {
+                val connection = (url.openConnection() as HttpURLConnection).apply {
+                    requestMethod = "PUT"
+                    doOutput = true
+                    connectTimeout = 5000
+                    readTimeout = 5000
+                    setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                }
+                connection.outputStream.use { it.write(updateBody.toByteArray(Charsets.UTF_8)) }
+                val code = connection.responseCode
+
+                withContext(Dispatchers.Main) {
+                    if (code in 200..299) {
+                        Toast.makeText(context, "Alert severity increased ($newPingCount/3)", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(context, "Failed to update alert", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(context, "Error updating alert", Toast.LENGTH_SHORT).show()
+                }
+                Log.e("AlertSubmission", "Error incrementing existing alert", e)
+            }
+        }
+    }
+
+    fun handleAlertSelection(type: String) {
+        val location = mapLibreMap?.locationComponent?.lastKnownLocation
+        if (location == null) {
+            Toast.makeText(context, "Waiting for location...", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val existingAlert = findExistingUserAlert(type, location.latitude, location.longitude)
+        if (existingAlert != null) {
+            incrementExistingAlert(existingAlert)
+            return
+        }
+
+        // First alert for this user+type+area: open details form
+        val currentUser = auth.currentUser
+        selectedAlertType = type
+        isPreSendAlertFlow = true
+        capturedBitmap = null
+        capturedImageUri = null
+        selectedAlert = RemoteAlert(
+            id = preSendAlertId,
+            type = type,
+            lat = location.latitude,
+            lon = location.longitude,
+            userId = currentUser?.uid,
+            userName = currentUser?.displayName ?: "Unknown User",
+            userPhotoUrl = currentUser?.photoUrl?.toString() ?: "",
+            timestamp = System.currentTimeMillis(),
+            status = "active",
+            pingCount = 1
+        )
+        showAlertDetails = true
+    }
+
+    fun sendAlertWithDetails(type: String, phone: String, details: String, photoBase64: String?) {
         val location = mapLibreMap?.locationComponent?.lastKnownLocation
         if (location == null) {
             Toast.makeText(context, "Waiting for location...", Toast.LENGTH_SHORT).show()
@@ -1765,175 +2089,84 @@ fun HomeScreen(navController: NavController) {
         
         scope.launch(Dispatchers.IO) {
             try {
-                Log.d("AlertSubmission", "🔍 Checking for existing alert at (${location.latitude}, ${location.longitude})")
-                Log.d("AlertSubmission", "📊 Cached alerts: ${alerts.size}")
+                Log.d("AlertSubmission", "🔍 Creating new alert with details at (${location.latitude}, ${location.longitude})")
                 
-                // Small delay to let real-time listener catch up with previous update
-                if (alerts.isNotEmpty()) {
-                    delay(300)  // Wait 300ms for listener to receive update from Firebase
-                    Log.d("AlertSubmission", "⏳ After delay - cached alerts: ${alerts.size}")
+                // Get fresh token for this request
+                val token = try {
+                    auth.currentUser?.getIdToken(true)?.await()?.token
+                } catch (e: Exception) {
+                    Log.e("AlertSubmission", "Error getting auth token", e)
+                    null
                 }
                 
-                // Check for existing alert at same location from current (hopefully updated) state
-                val existingAlert = alerts.values.find { alert ->
-                    val distance = calculateDistance(alert.lat, alert.lon, location.latitude, location.longitude)
-                    val isSameType = alert.type == type
-                    val isActive = alert.status != "resolved"
-                    val isWithinRadius = distance <= com.example.safeko.utils.CLUSTER_RADIUS_METERS
-                    
-                    Log.d("AlertSubmission", "🔎 Alert ${alert.id}: type=$isSameType, distance=${String.format("%.1f", distance)}m, pingCount=${alert.pingCount}")
-                    
-                    isSameType && isActive && isWithinRadius
+                if (token == null) {
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(context, "❌ Authentication failed", Toast.LENGTH_SHORT).show()
+                        Log.e("AlertSubmission", "❌ No auth token available")
+                    }
+                    return@launch
                 }
                 
-                if (existingAlert != null) {
-                    Log.d("AlertSubmission", "✅ FOUND existing alert: ${existingAlert.id} (pingCount=${existingAlert.pingCount})")
-                    
-                    // Get fresh token for this request
-                    val token = try {
-                        auth.currentUser?.getIdToken(true)?.await()?.token  // Force refresh
-                    } catch (e: Exception) {
-                        Log.e("AlertSubmission", "Error getting auth token", e)
-                        null
+                val authParam = "?auth=$token"
+                
+                // Create new alert WITH details, phone, and photo
+                val body = JSONObject().apply {
+                    put("type", type)
+                    put("lat", location.latitude)
+                    put("lon", location.longitude)
+                    put("userId", userId ?: JSONObject.NULL)
+                    put("userName", user?.displayName ?: "Unknown User")
+                    put("userPhotoUrl", user?.photoUrl?.toString() ?: "")
+                    put("timestamp", System.currentTimeMillis())
+                    put("pingCount", 1)
+                    put("details", details)
+                    put("phoneNumber", phone)
+                    if (!photoBase64.isNullOrBlank()) {
+                        put("photoBase64", photoBase64)
+                    }
+                }.toString()
+                
+                val url = URL("$rtdbBaseUrl/alerts.json$authParam")
+                Log.d("AlertSubmission", "📍 POST URL: $url")
+                
+                try {
+                    val connection = (url.openConnection() as HttpURLConnection).apply {
+                        requestMethod = "POST"
+                        doOutput = true
+                        connectTimeout = 5000
+                        readTimeout = 5000
+                        setRequestProperty("Content-Type", "application/json; charset=utf-8")
                     }
                     
-                    if (token == null) {
+                    connection.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+                    val code = connection.responseCode
+                    
+                    val response = if (code >= 400) {
+                        connection.errorStream?.bufferedReader()?.use { it.readText() } ?: "No error details"
+                    } else {
+                        connection.inputStream.bufferedReader().use { it.readText() }
+                    }
+                    
+                    Log.d("AlertSubmission", "📡 POST response code: $code, response: $response")
+                    
+                    if (code in 200..299) {
                         withContext(Dispatchers.Main) {
-                            Toast.makeText(context, "❌ Authentication failed", Toast.LENGTH_SHORT).show()
-                            Log.e("AlertSubmission", "❌ No auth token available")
+                            Toast.makeText(context, "🚨 Alert Sent: $type", Toast.LENGTH_SHORT).show()
+                            Log.d("AlertSubmission", "✅ New alert created with details and photo")
+                            // Reset shared capture state after send
+                            capturedBitmap = null
+                            capturedImageUri = null
                         }
-                        return@launch
-                    }
-                    
-                    val authParam = "?auth=$token"
-                    
-                    // Increment ping count for existing alert - Try writing entire object back
-                    val newPingCount = existingAlert.pingCount + 1
-                    val updatedAlert = existingAlert.copy(
-                        pingCount = newPingCount,
-                        timestamp = System.currentTimeMillis()
-                    )
-                    
-                    // Serialize the updated alert
-                    val gson = com.google.gson.Gson()
-                    val updateBody = gson.toJson(updatedAlert)
-                    
-                    val url = URL("$rtdbBaseUrl/alerts/${existingAlert.id}.json$authParam")
-                    Log.d("AlertSubmission", "📍 PUT URL: $url")
-                    Log.d("AlertSubmission", "📤 PUT body: $updateBody")
-                    
-                    try {
-                        val connection = (url.openConnection() as HttpURLConnection).apply {
-                            requestMethod = "PUT"  // Use PUT instead of PATCH
-                            doOutput = true
-                            connectTimeout = 5000
-                            readTimeout = 5000
-                            setRequestProperty("Content-Type", "application/json; charset=utf-8")
-                        }
-                        
-                        connection.outputStream.use { it.write(updateBody.toByteArray(Charsets.UTF_8)) }
-                        val code = connection.responseCode
-                        
-                        // Read response from correct stream
-                        val response = if (code >= 400) {
-                            connection.errorStream?.bufferedReader()?.use { it.readText() } ?: "No error details"
-                        } else {
-                            connection.inputStream.bufferedReader().use { it.readText() }
-                        }
-                        
-                        Log.d("AlertSubmission", "📡 PUT response code: $code, response: $response")
-                        
-                        if (code in 200..299) {
-                            withContext(Dispatchers.Main) {
-                                Toast.makeText(context, "🔔 Alert pinged! (Count: $newPingCount)", Toast.LENGTH_SHORT).show()
-                                showAlertSheet = false
-                                Log.d("AlertSubmission", "✅ Successfully pinged alert with new count: $newPingCount")
-                            }
-                        } else {
-                            withContext(Dispatchers.Main) {
-                                Toast.makeText(context, "❌ Failed to ping alert (code: $code)", Toast.LENGTH_SHORT).show()
-                                Log.e("AlertSubmission", "❌ PUT failed with code $code: $response")
-                            }
-                        }
-                    } catch (e: Exception) {
+                    } else {
                         withContext(Dispatchers.Main) {
-                            Toast.makeText(context, "❌ Error pinging alert: ${e.message}", Toast.LENGTH_SHORT).show()
-                            Log.e("AlertSubmission", "❌ PUT exception: ${e.message}", e)
+                            Toast.makeText(context, "❌ Failed to send alert (code: $code)", Toast.LENGTH_SHORT).show()
+                            Log.e("AlertSubmission", "❌ POST failed with code $code: $response")
                         }
                     }
-                } else {
-                    Log.d("AlertSubmission", "➕ No existing alert found, creating new one...")
-                    
-                    // Get fresh token for this request
-                    val token = try {
-                        auth.currentUser?.getIdToken(true)?.await()?.token  // Force refresh
-                    } catch (e: Exception) {
-                        Log.e("AlertSubmission", "Error getting auth token", e)
-                        null
-                    }
-                    
-                    if (token == null) {
-                        withContext(Dispatchers.Main) {
-                            Toast.makeText(context, "❌ Authentication failed", Toast.LENGTH_SHORT).show()
-                            Log.e("AlertSubmission", "❌ No auth token available")
-                        }
-                        return@launch
-                    }
-                    
-                    val authParam = "?auth=$token"
-                    
-                    // Create new alert with pingCount = 1
-                    val body = JSONObject().apply {
-                        put("type", type)
-                        put("lat", location.latitude)
-                        put("lon", location.longitude)
-                        put("userId", userId ?: JSONObject.NULL)
-                        put("userName", user?.displayName ?: "Unknown User")
-                        put("userPhotoUrl", user?.photoUrl?.toString() ?: "")
-                        put("timestamp", System.currentTimeMillis())
-                        put("pingCount", 1)  // Initialize new alerts with pingCount = 1
-                    }.toString()
-                    
-                    val url = URL("$rtdbBaseUrl/alerts.json$authParam")
-                    Log.d("AlertSubmission", "📍 POST URL: $url")
-                    
-                    try {
-                        val connection = (url.openConnection() as HttpURLConnection).apply {
-                            requestMethod = "POST"
-                            doOutput = true
-                            connectTimeout = 5000
-                            readTimeout = 5000
-                            setRequestProperty("Content-Type", "application/json; charset=utf-8")
-                        }
-                        
-                        connection.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
-                        val code = connection.responseCode
-                        
-                        val response = if (code >= 400) {
-                            connection.errorStream?.bufferedReader()?.use { it.readText() } ?: "No error details"
-                        } else {
-                            connection.inputStream.bufferedReader().use { it.readText() }
-                        }
-                        
-                        Log.d("AlertSubmission", "📡 POST response code: $code, response: $response")
-                        
-                        if (code in 200..299) {
-                            withContext(Dispatchers.Main) {
-                                Toast.makeText(context, "🚨 Alert Sent: $type", Toast.LENGTH_SHORT).show()
-                                showAlertSheet = false
-                                Log.d("AlertSubmission", "✅ New alert created with pingCount = 1")
-                            }
-                        } else {
-                            withContext(Dispatchers.Main) {
-                                Toast.makeText(context, "❌ Failed to send alert (code: $code)", Toast.LENGTH_SHORT).show()
-                                Log.e("AlertSubmission", "❌ POST failed with code $code: $response")
-                            }
-                        }
-                    } catch (e: Exception) {
-                        withContext(Dispatchers.Main) {
-                            Toast.makeText(context, "❌ Error sending alert: ${e.message}", Toast.LENGTH_SHORT).show()
-                            Log.e("AlertSubmission", "❌ POST exception: ${e.message}", e)
-                        }
+                } catch (e: Exception) {
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(context, "❌ Error sending alert: ${e.message}", Toast.LENGTH_SHORT).show()
+                        Log.e("AlertSubmission", "❌ POST exception: ${e.message}", e)
                     }
                 }
             } catch (e: Exception) {
@@ -2102,13 +2335,14 @@ fun HomeScreen(navController: NavController) {
                                             64
                                         ) // Red for Medical
                                     )
-                                    // Critical/Red Pulse Icon (larger than normal)
+                                    // Critical icon (normal size; animation frames are updated in a loop)
                                     style.addImage(
                                         "icon-critical",
-                                        createColoredDot(
+                                        createCriticalPulseDot(
                                             android.graphics.Color.parseColor("#D32F2F"),
-                                            92
-                                        ) // Dark red, larger for emphasis
+                                            64,
+                                            0f
+                                        )
                                     )
                                     // Add Source and Layer for Alerts
                                     style.addSource(GeoJsonSource("alerts-source"))
@@ -2754,7 +2988,7 @@ fun HomeScreen(navController: NavController) {
                                                         // Up
                                                         dragging = false
                                                         if (radialSelection != null) {
-                                                            // Execute selection
+                                                            // Execute selection - Open alert form instead of sending directly
                                                             val alertType = when (radialSelection) {
                                                                 "Rescue" -> "Emergency Rescue"
                                                                 "Fire" -> "Fire Emergency"
@@ -2762,7 +2996,7 @@ fun HomeScreen(navController: NavController) {
                                                                 else -> null
                                                             }
                                                             if (alertType != null) {
-                                                                sendAlert(alertType)
+                                                                handleAlertSelection(alertType)
                                                             }
                                                             showRadialMenu = false
                                                             radialSelection = null
@@ -3006,7 +3240,7 @@ fun HomeScreen(navController: NavController) {
                     "Accident" -> "Road Accident"
                     else -> type
                 }
-                sendAlert(alertType)
+                handleAlertSelection(alertType)
                 showRadialMenu = false
             }
         )
@@ -3272,34 +3506,12 @@ fun HomeScreen(navController: NavController) {
                     .verticalScroll(rememberScrollState())
             ) {
                 // Header
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(bottom = 16.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        "${cluster.alerts.size} Alerts in Area",
-                        fontSize = 20.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Badge(
-                        modifier = Modifier
-                            .background(
-                                if (cluster.isCritical) Color.Red else Color.Gray,
-                                shape = CircleShape
-                            )
-                            .padding(8.dp)
-                    ) {
-                        Text(
-                            "${cluster.totalPings}",
-                            color = Color.White,
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                }
+                Text(
+                    "Alerts in Area",
+                    fontSize = 20.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(bottom = 16.dp)
+                )
 
                 Spacer(modifier = Modifier.height(12.dp))
 
@@ -3316,67 +3528,33 @@ fun HomeScreen(navController: NavController) {
                                 showClusterModal = false
                             },
                         colors = CardDefaults.cardColors(
-                            containerColor = if (alert.pingCount >= 3) Color(0xFFFFE0E0) else Color(0xFFF5F5F5)
-                        )
+                            containerColor = Color.White
+                        ),
+                        border = BorderStroke(1.dp, Color.LightGray),
+                        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
                     ) {
-                        Row(
+                        Column(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(12.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
+                                .padding(14.dp)
                         ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    alert.type,
-                                    fontWeight = FontWeight.Bold,
-                                    fontSize = 14.sp
-                                )
-                                Text(
-                                    "${alert.lat}, ${alert.lon}",
-                                    fontSize = 12.sp,
-                                    color = Color.Gray
-                                )
-                                if (alert.details.isNotBlank()) {
-                                    Text(
-                                        alert.details.take(50) + if (alert.details.length > 50) "..." else "",
-                                        fontSize = 11.sp,
-                                        maxLines = 1,
-                                        color = Color.DarkGray,
-                                        modifier = Modifier.padding(top = 4.dp)
-                                    )
-                                }
-                            }
-                            Column(
-                                horizontalAlignment = Alignment.End,
-                                modifier = Modifier.padding(start = 8.dp)
-                            ) {
-                                if (alert.pingCount >= 3) {
-                                    Badge(
-                                        modifier = Modifier
-                                            .background(Color.Red, shape = CircleShape)
-                                            .padding(6.dp)
-                                    ) {
-                                        Text(
-                                            "🔴 ${alert.pingCount}",
-                                            color= Color.White,
-                                            fontSize = 11.sp
-                                        )
-                                    }
-                                } else {
-                                    Text(
-                                        "📍 ${alert.pingCount}",
-                                        fontSize = 11.sp,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                }
-                                Text(
-                                    alert.userName ?: "Unknown",
-                                    fontSize = 10.sp,
-                                    color = Color.Gray,
-                                    modifier = Modifier.padding(top = 4.dp)
-                                )
-                            }
+                            Text(
+                                alert.type,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 14.sp
+                            )
+                            Text(
+                                "${String.format("%.4f", alert.lat)}, ${String.format("%.4f", alert.lon)}",
+                                fontSize = 12.sp,
+                                color = Color.Gray,
+                                modifier = Modifier.padding(top = 4.dp)
+                            )
+                            Text(
+                                alert.userName ?: "Unknown User",
+                                fontSize = 11.sp,
+                                color = Color.DarkGray,
+                                modifier = Modifier.padding(top = 6.dp)
+                            )
                         }
                     }
                 }
@@ -3386,21 +3564,98 @@ fun HomeScreen(navController: NavController) {
         }
     }
 
+    // Responder Approaching Modal - Show when responder is navigating to alert
+    if (showResponderApproachingModal && !responderDistance.isEmpty()) {
+        ResponderApproachingModal(
+            distance = responderDistance,
+            onDismiss = { showResponderApproachingModal = false }
+        )
+    }
+
+    // Face Verification Modal
+    if (showFaceVerificationModal) {
+        FaceVerificationModal(
+            onDismiss = {
+                showFaceVerificationModal = false
+            },
+            onFaceVerified = { embedding, bitmap ->
+                // Save face embedding to Firestore
+                val userId = auth.currentUser?.uid
+                if (userId != null) {
+                    scope.launch {
+                        try {
+                            // Upload face image
+                            val storageRef = FirebaseStorage.getInstance()
+                                .reference.child("face_verifications/$userId.jpg")
+                            
+                            val baos = java.io.ByteArrayOutputStream()
+                            bitmap.compress(Bitmap.CompressFormat.JPEG, 85, baos)
+                            val imageData = baos.toByteArray()
+                            
+                            storageRef.putBytes(imageData).await()
+                            val facePhotoUrl = storageRef.downloadUrl.await().toString()
+                            
+                            // Update Firestore user document
+                            Firebase.firestore.collection("users").document(userId).update(
+                                mapOf(
+                                    "faceVerified" to true,
+                                    "faceEmbedding" to embedding,
+                                    "faceVerifiedAt" to System.currentTimeMillis(),
+                                    "facePhotoUrl" to facePhotoUrl
+                                )
+                            ).await()
+                            
+                            isFaceVerified = true
+                            showFaceVerificationModal = false
+                            Toast.makeText(
+                                context,
+                                "✅ Face verification successful! You are now fully verified.",
+                                Toast.LENGTH_LONG
+                            ).show()
+                            
+                            Log.d("FaceVerification", "✅ Face verification completed for user $userId")
+                        } catch (e: Exception) {
+                            Log.e("FaceVerification", "Failed to save face verification: ${e.message}")
+                            Toast.makeText(
+                                context,
+                                "Failed to save face verification: ${e.message}",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                    }
+                }
+            },
+            onError = { error ->
+                Toast.makeText(context, "❌ $error", Toast.LENGTH_SHORT).show()
+                showFaceVerificationModal = false
+            }
+        )
+    }
+
     // Alert Details Modal
     if (showAlertDetails && selectedAlert != null) {
         ModalBottomSheet(
-            onDismissRequest = { showAlertDetails = false },
+            onDismissRequest = {
+                showAlertDetails = false
+                if (isPreSendAlertFlow) {
+                    isPreSendAlertFlow = false
+                    selectedAlert = null
+                }
+            },
             containerColor = Color.White,
             shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp),
             dragHandle = { BottomSheetDefaults.DragHandle() }
         ) {
             val alert = selectedAlert!!
             val currentUserId = auth.currentUser?.uid
-            val isOwner = alert.userId != null && alert.userId == currentUserId
+            val isDraftAlert = isPreSendAlertFlow && alert.id == preSendAlertId
+            // LGU admins are never "owners" for editing - they always see read-only view
+            val isOwner = isDraftAlert || (alert.userId != null && alert.userId == currentUserId && userRole != "lgu_admin")
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(start = 20.dp, end = 20.dp, bottom = 40.dp),
+                    .padding(start = 20.dp, end = 20.dp, bottom = 40.dp)
+                    .verticalScroll(rememberScrollState()),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 // Address (moved under alert type)
@@ -3426,7 +3681,7 @@ fun HomeScreen(navController: NavController) {
 
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
-                    color = Color(0xFFF7F7F7),
+                    color = Color.White,
                     shape = RoundedCornerShape(16.dp)
                 ) {
                     Row(
@@ -3536,6 +3791,15 @@ fun HomeScreen(navController: NavController) {
                         var localDetailsText by remember(alert.id) {
                             mutableStateOf(alert.details)
                         }
+                        var phoneValidationError by remember(alert.id) {
+                            mutableStateOf(false)
+                        }
+                        var detailsValidationError by remember(alert.id) {
+                            mutableStateOf(false)
+                        }
+                        var photoValidationError by remember(alert.id) {
+                            mutableStateOf(false)
+                        }
 
                         Text(
                             text = "Contact",
@@ -3546,7 +3810,7 @@ fun HomeScreen(navController: NavController) {
 
                         Surface(
                             modifier = Modifier.fillMaxWidth(),
-                            color = Color(0xFFF7F7F7),
+                            color = Color.White,
                             shape = RoundedCornerShape(12.dp)
                         ) {
                             Column(modifier = Modifier.padding(12.dp)) {
@@ -3559,7 +3823,12 @@ fun HomeScreen(navController: NavController) {
 
                                 OutlinedTextField(
                                     value = phoneNumberText,
-                                    onValueChange = { phoneNumberText = it },
+                                    onValueChange = {
+                                        phoneNumberText = it
+                                        if (isDraftAlert && phoneValidationError) {
+                                            phoneValidationError = it.isBlank()
+                                        }
+                                    },
                                     modifier = Modifier.fillMaxWidth(),
                                     placeholder = {
                                         Text(
@@ -3570,19 +3839,27 @@ fun HomeScreen(navController: NavController) {
                                     singleLine = true,
                                     shape = RoundedCornerShape(10.dp),
                                     colors = OutlinedTextFieldDefaults.colors(
-                                        focusedBorderColor = Color(0xFFE0E0E0),
-                                        unfocusedBorderColor = Color(0xFFE0E0E0),
+                                        focusedBorderColor = if (isDraftAlert && phoneValidationError) Color(0xFFD32F2F) else Color(0xFFE0E0E0),
+                                        unfocusedBorderColor = if (isDraftAlert && phoneValidationError) Color(0xFFD32F2F) else Color(0xFFE0E0E0),
                                         focusedContainerColor = Color.White,
                                         unfocusedContainerColor = Color.White
                                     )
                                 )
+                                if (isDraftAlert && phoneValidationError) {
+                                    Text(
+                                        text = "Phone number is required",
+                                        color = Color(0xFFD32F2F),
+                                        fontSize = 12.sp,
+                                        modifier = Modifier.padding(top = 6.dp)
+                                    )
+                                }
                             }
                         }
 
                         Spacer(modifier = Modifier.height(10.dp))
 
                         Text(
-                            text = "Details (Optional)",
+                            text = if (isDraftAlert) "Details *" else "Details (Optional)",
                             style = MaterialTheme.typography.bodySmall,
                             color = Color.Gray,
                             modifier = Modifier.padding(bottom = 6.dp)
@@ -3590,9 +3867,15 @@ fun HomeScreen(navController: NavController) {
 
                         OutlinedTextField(
                             value = localDetailsText,
-                            onValueChange = { localDetailsText = it },
+                            onValueChange = {
+                                localDetailsText = it
+                                if (isDraftAlert && detailsValidationError) {
+                                    detailsValidationError = it.isBlank()
+                                }
+                            },
                             modifier = Modifier
                                 .fillMaxWidth()
+                                .padding(horizontal = 12.dp)
                                 .height(100.dp),
                             placeholder = {
                                 Text(
@@ -3603,12 +3886,20 @@ fun HomeScreen(navController: NavController) {
                             maxLines = 4,
                             shape = RoundedCornerShape(12.dp),
                             colors = OutlinedTextFieldDefaults.colors(
-                                focusedBorderColor = Color(0xFFE0E0E0),
-                                unfocusedBorderColor = Color(0xFFE0E0E0),
-                                focusedContainerColor = Color(0xFFF7F7F7),
-                                unfocusedContainerColor = Color(0xFFF7F7F7)
+                                focusedBorderColor = if (isDraftAlert && detailsValidationError) Color(0xFFD32F2F) else Color(0xFFE0E0E0),
+                                unfocusedBorderColor = if (isDraftAlert && detailsValidationError) Color(0xFFD32F2F) else Color(0xFFE0E0E0),
+                                focusedContainerColor = Color.White,
+                                unfocusedContainerColor = Color.White
                             )
                         )
+                        if (isDraftAlert && detailsValidationError) {
+                            Text(
+                                text = "Details is required",
+                                color = Color(0xFFD32F2F),
+                                fontSize = 12.sp,
+                                modifier = Modifier.padding(top = 6.dp)
+                            )
+                        }
 
                         if (alert.photoBase64.isNotBlank()) {
                             Spacer(modifier = Modifier.height(12.dp))
@@ -3630,6 +3921,7 @@ fun HomeScreen(navController: NavController) {
                                 Box(
                                     modifier = Modifier
                                         .fillMaxWidth()
+                                        .padding(horizontal = 12.dp)
                                         .height(84.dp)
                                         .clip(RoundedCornerShape(12.dp))
                                         .background(Color(0xFFEDEDED))
@@ -3647,7 +3939,7 @@ fun HomeScreen(navController: NavController) {
                         Spacer(modifier = Modifier.height(10.dp))
 
                         Text(
-                            text = "Photos (Optional)",
+                            text = if (isDraftAlert) "Photos *" else "Photos (Optional)",
                             style = MaterialTheme.typography.bodySmall,
                             color = Color.Gray,
                             modifier = Modifier.padding(bottom = 6.dp)
@@ -3657,6 +3949,7 @@ fun HomeScreen(navController: NavController) {
                             Box(
                                 modifier = Modifier
                                     .fillMaxWidth()
+                                    .padding(horizontal = 12.dp)
                                     .height(104.dp)
                                     .clip(RoundedCornerShape(12.dp))
                                     .background(Color(0xFFEDEDED))
@@ -3710,10 +4003,17 @@ fun HomeScreen(navController: NavController) {
                                         ).show()
                                     }
                                 },
-                                modifier = Modifier.fillMaxWidth(),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 12.dp)
+                                    .border(
+                                        width = if (isDraftAlert && photoValidationError) 1.5.dp else 0.dp,
+                                        color = if (isDraftAlert && photoValidationError) Color(0xFFD32F2F) else Color.Transparent,
+                                        shape = RoundedCornerShape(12.dp)
+                                    ),
                                 shape = RoundedCornerShape(12.dp),
                                 colors = ButtonDefaults.outlinedButtonColors(
-                                    containerColor = Color(0xFFF7F7F7)
+                                    containerColor = Color.White
                                 )
                             ) {
                                 Icon(Icons.Rounded.PhotoCamera, contentDescription = null)
@@ -3721,11 +4021,30 @@ fun HomeScreen(navController: NavController) {
                                 Text("Upload")
                             }
                         }
+                        if (isDraftAlert && photoValidationError) {
+                            Text(
+                                text = "Photo is required",
+                                color = Color(0xFFD32F2F),
+                                fontSize = 12.sp,
+                                modifier = Modifier.padding(top = 6.dp)
+                            )
+                        }
 
                         Spacer(modifier = Modifier.height(12.dp))
 
                         Button(
                             onClick = {
+                                val trimmedPhone = phoneNumberText.trim()
+                                val trimmedDetails = localDetailsText.trim()
+                                if (isDraftAlert) {
+                                    phoneValidationError = trimmedPhone.isBlank()
+                                    detailsValidationError = trimmedDetails.isBlank()
+                                    photoValidationError = capturedBitmap == null
+                                    if (phoneValidationError || detailsValidationError || photoValidationError) {
+                                        return@Button
+                                    }
+                                }
+
                                 var photoBase64: String? = null
                                 if (capturedBitmap != null) {
                                     val outputStream = ByteArrayOutputStream()
@@ -3737,24 +4056,111 @@ fun HomeScreen(navController: NavController) {
                                     val byteArray = outputStream.toByteArray()
                                     photoBase64 = Base64.encodeToString(byteArray, Base64.DEFAULT)
                                 }
-                                updateAlert(
-                                    alert.id,
-                                    localDetailsText,
-                                    photoBase64,
-                                    phoneNumberText
-                                )
+
+                                if (isDraftAlert) {
+                                    sendAlertWithDetails(
+                                        type = selectedAlertType,
+                                        phone = trimmedPhone,
+                                        details = trimmedDetails,
+                                        photoBase64 = photoBase64
+                                    )
+                                    showAlertDetails = false
+                                    isPreSendAlertFlow = false
+                                    selectedAlert = null
+                                    capturedBitmap = null
+                                    capturedImageUri = null
+                                } else {
+                                    updateAlert(
+                                        alert.id,
+                                        trimmedDetails,
+                                        photoBase64,
+                                        trimmedPhone
+                                    )
+                                }
                             },
-                            modifier = Modifier.fillMaxWidth(),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp),
                             shape = RoundedCornerShape(12.dp),
                             colors = ButtonDefaults.buttonColors(containerColor = Color.Black)
                         ) {
-                            Text("Submit Details")
+                            Text(if (isDraftAlert) "Send Alert" else "Submit Details")
                         }
                     }
 
                 }
 
-                Spacer(modifier = Modifier.height(32.dp))
+                // Display read-only details for non-owners
+                if (!isOwner && alert.details.isNotBlank()) {
+                    Text(
+                        text = "Details",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color.Gray,
+                        modifier = Modifier.padding(bottom = 6.dp)
+                    )
+                    
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        color = Color.White,
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Text(
+                            text = alert.details,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(12.dp),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = Color.Black
+                        )
+                    }
+                    
+                    Spacer(modifier = Modifier.height(12.dp))
+                }
+                
+                // Display photos for non-owners (read-only)
+                if (!isOwner && alert.photoBase64.isNotBlank()) {
+                    Text(
+                        text = "Photos",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color.Gray,
+                        modifier = Modifier.padding(bottom = 6.dp)
+                    )
+                    
+                    val imageBitmap = remember(alert.photoBase64) {
+                        try {
+                            val decodedBytes =
+                                Base64.decode(alert.photoBase64, Base64.DEFAULT)
+                            BitmapFactory.decodeByteArray(
+                                decodedBytes,
+                                0,
+                                decodedBytes.size
+                            )?.asImageBitmap()
+                        } catch (e: Exception) {
+                            null
+                        }
+                    }
+                    
+                    if (imageBitmap != null) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(150.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(Color(0xFFEDEDED))
+                        ) {
+                            androidx.compose.foundation.Image(
+                                bitmap = imageBitmap,
+                                contentDescription = "Attached Photo",
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        }
+                    }
+                    
+                    Spacer(modifier = Modifier.height(12.dp))
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
 
                 // Navigation Button (Only for non-owners)
                 if (!isOwner) {
@@ -3776,6 +4182,20 @@ fun HomeScreen(navController: NavController) {
 
                                     if (points.isNotEmpty()) {
                                         navigationService?.startNavigation(steps, points, end)
+                                        
+                                        // 🚨 START RESPONDER TRACKING
+                                        Log.d("ResponderTracking", "🟢 Starting responder tracking for alert ${alert.id}")
+                                        responderTrackingService.startTracking(
+                                            context = context,
+                                            alertId = alert.id,
+                                            alertLat = alert.lat,
+                                            alertLon = alert.lon,
+                                            onError = { error ->
+                                                Log.e("ResponderTracking", "❌ Tracking error: $error")
+                                                Toast.makeText(context, "Tracking error: $error", Toast.LENGTH_SHORT).show()
+                                            }
+                                        )
+                                        
                                         mapLibreMap?.getStyle { style ->
                                             // Remove existing route layer and source if any
                                             if (style.getLayer("route-layer") != null) style.removeLayer(
@@ -3866,11 +4286,13 @@ fun HomeScreen(navController: NavController) {
                     }
                 }
 
-                if (isOwner && alert.status != "resolved") {
-                    Spacer(modifier = Modifier.height(12.dp))
+                if (isOwner && !isDraftAlert && alert.status != "resolved") {
+                    Spacer(modifier = Modifier.height(8.dp))
                     Button(
                         onClick = { resolveAlert(alert.id) },
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp),
                         shape = RoundedCornerShape(12.dp),
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))
                     ) {
@@ -4571,8 +4993,7 @@ fun HomeScreen(navController: NavController) {
             isNavigating = isNavigating,
             onDismiss = { showLocationModal = false },
             onCancelNavigation = {
-                showLocationModal = false
-                navigationService?.stopNavigation()
+                cancelNavigationAndClearDestination()
             },
             onGetDirections = {
                 showLocationModal = false
@@ -6421,8 +6842,12 @@ fun HomeScreen(navController: NavController) {
                 currentLocation = currentUserAddress,
                 isPhoneVerified = false, // Not using full auth flow here to save space, user should edit in Profile
                 userRole = userRole, // NEW: Pass user role for password change feature
+                isFaceVerified = isFaceVerified, // NEW: Pass face verification status
                 onChangePhoto = {
                     pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                },
+                onFaceVerificationStart = {
+                    showFaceVerificationModal = true
                 },
                 onSave = { newName, newPhone ->
                     userPhoneNumber = newPhone
